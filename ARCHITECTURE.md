@@ -1,0 +1,361 @@
+# Architecture
+
+This document exists for one reader: the maintainer who has new evidence and
+needs to know what to revisit. Every contract below is traced to the invariant
+that forced it. When an invariant stops being true, this tells you what was
+built on it.
+
+Contracts are stated in `src/indexer/core/stages.py` and made executable in
+`src/indexer/eval/checks.py`. This document says *why* they are what they are.
+
+---
+
+## The shape
+
+```
+                     ingestion (paid once)
+   corpus ──▶ parse ──▶ segment ──▶ enrich ──▶ index
+                 │          │          │          │
+             ParsedDoc    Unit    EnrichedUnit   ...indexes
+                                                    │
+   query ──▶ route ──▶ retrieve ──▶ fuse ──▶ rerank ┘
+                          query (paid forever)
+```
+
+Eight stages. Each is a `Protocol` with a contract; each has at least two
+implementations selected by config; no stage imports another's internals.
+
+The types crossing each boundary are in `indexer.core` and are dependency-free
+by policy. A project that adopts this frame inherits the types and none of the
+choices.
+
+---
+
+## Invariant 1 — retrieval is the bottleneck, not generation
+
+> Retrieval failures drive 11–46% of end-to-end errors while utilization
+> failures stay at 4–8% regardless of configuration. Precision@5 predicts answer
+> accuracy at r=0.98.
+
+**What it forced.**
+
+*The library stops at retrieval.* `RetrievalResponse` carries passages, a route
+decision and a trace — not an answer. Generation is the caller's. Spending the
+frame's complexity budget on the 4–8% would be spending it in the wrong place,
+and a library that owns generation inevitably starts optimising for it.
+
+*Precision@5 is not optional.* `EvalConfig.k_values` is validated to include 5,
+and a config omitting it produces a warning. When there is room for one number
+on a dashboard, r=0.98 says which one.
+
+*Retrieval failure rate is reported separately from recall.* `RunReport` carries
+both because they answer different questions. Recall@20 averages coverage;
+`retrieval_failure_rate` counts the queries with **nothing** relevant in the top
+k — the ones that cannot be answered however good generation is. A change that
+lifts mean recall while leaving the failure rate flat has improved nothing this
+invariant cares about.
+
+**Revisit when:** the utilisation number climbs — long-context models that
+genuinely use the middle of their window would move it. The frame would then
+need to own more of the answer path, and `RetrievalResponse` is where that
+starts.
+
+---
+
+## Invariant 2 — ingestion cost is paid once, query cost forever
+
+**What it forced.**
+
+*Content addressing at every stage boundary.* `cache_key()` is
+`H(stage, impl, version, params_hash, input_hash, scope_hash)`. Not a
+convenience: it is what makes "once" really once, across runs and machines.
+
+*A hard purity rule.* A stage must be a pure function of its declared inputs.
+Not enforceable by types, so it is stated in every protocol docstring and it is
+the first thing to suspect when a cache misbehaves.
+
+*Version honesty.* `Registration.version` is a **behavioural** version, not a
+package version. Any change that can change output must bump it or change
+`params_hash`. An edited prompt without a bump serves stale cache entries
+forever, and the symptom — the change appearing to do nothing — reads as
+evidence against the change.
+
+*A ledger, separate from the cache.* `indexer.core.ledger`. A cache knows
+whether a computation has been done; it cannot know a document was **deleted**
+from the corpus, so its units answer queries forever. The ledger holds
+per-document state and turns a build into a diff: ADDED / CHANGED / RESTAGED /
+UNCHANGED / REMOVED.
+
+*Per-stage fingerprints in that ledger, not one build hash.* This is what makes
+RESTAGED possible. Changing the reranker reprocesses nothing; changing the
+segmenter reprocesses segment onward; changing one enricher reruns that enricher
+only. A single build-wide hash collapses all three into "rebuild everything",
+and the invariant is lost.
+
+*Position out of unit identity.* `make_unit_id(document_id, content_hash,
+occurrence)` — no ordinal. Inserting a paragraph on page 1 must not change the
+id of every unit after it, or a one-line edit re-embeds the document. Tested in
+`TestUnitIdentityIsPositionIndependent`.
+
+**Revisit when:** embedding becomes near-free. Much of this machinery is
+amortising a cost that a step change in inference price would make negligible —
+though `enrich` would still dominate, and the ledger would still be needed for
+deletions.
+
+---
+
+## Invariant 3 — chunks must carry their context
+
+> An LLM-written 50–100 token summary prepended before both embedding and
+> lexical indexing cuts top-20 retrieval failure from 5.7% to 2.9%; reranking
+> takes it to 1.9%.
+
+This is the invariant with the most structural consequence, because of the word
+**both**.
+
+**What it forced.**
+
+*`EnrichedUnit.indexing_text()` — one retrieval surface, computed once.* The
+failure mode is mundane and near-invisible: the dense index gets the
+contextualised string, the lexical index gets the raw one, because two
+implementations each decided what to index. Retrieval still works, just worse,
+and the ablation shows contextualisation earning about half of what it should.
+
+So implementations do not decide. The string is computed on the unit, and every
+`Index` is contractually required to use it as its retrieval surface. It is also
+checked: `check_index_surface()` finds a unit whose *context* contains a term
+absent from its body, searches for that term, and requires the unit back.
+
+*Contextualisation off degrades cleanly.* With no `context` enrichments,
+`indexing_text()` returns `unit.text` and every index follows automatically.
+That is the ablation arm, and it costs one config key.
+
+*`enrich` is a chain of independent enrichers, not one step.* Each writes its
+own key in `EnrichedUnit.enrichments` and never mutates another's. That is what
+makes them individually disableable.
+
+*`ContextScope` is declared per enricher.* It states what the enricher reads,
+and the cache key includes exactly that. A `UNIT`-scoped enricher survives edits
+elsewhere in its document; a `DOCUMENT`-scoped one — contextualisation, by
+nature — does not. This is the honest cost of document-level context, stated in
+config rather than discovered during a rebuild.
+
+*Enrichers receive batches, not units.* `Enricher.enrich` takes a sequence and
+`EnrichContext` carries the whole parent document, because the reference
+approach is a small fast model with prompt caching over the parent. That only
+pays if units arrive batched by document.
+
+*Overlap defaults to 0.* `SegmentConfig.overlap_tokens` exists only as an
+ablation arm. Overlap is a chunking-era workaround for lost context; this
+invariant says the fix is contextualisation. Worth a number on a new corpus,
+not worth a default.
+
+**Revisit when:** the numbers move on your corpus. They are published figures,
+not laws. `configs/reference.yaml` encodes them as `sanity_checks`, so a corpus
+that disagrees says so on the first ablation run.
+
+---
+
+## Invariant 4 — hybrid beats either half
+
+**What it forced.**
+
+*Several indexes over the same units, fanned out over uniformly.* `Index` has
+one shape; `Retriever` calls `search` on each target; nothing enumerates kinds.
+
+*`IndexKind` is a plain string and nothing branches on it.* The requirement was
+"adding a fourth kind must not require touching the other three". An enum would
+have to be widened; a union would need a member; a dispatch table would need a
+row. A string with no dispatch needs none of that. `configs/full.yaml` adds a
+visual index as four lines of YAML.
+
+*Capabilities instead of a fat interface.* A structured index answers
+`StructuredQuery`, which a dense index cannot. Putting that on `Index` would
+force every vector store to stub it, and each new capability would widen the
+interface every index must satisfy. So `StructuredCapable` is a separate
+protocol and the frame asks `isinstance`. A fifth kind with its own capability
+adds a protocol and touches no existing index.
+
+*Rank, not score, is the fusion currency.* `Hit.rank` is mandatory and 1-based;
+`Hit.score` is documented as index-local and non-comparable. BM25 scores and
+cosine similarities are not on a common scale, and a fuser that adds them
+asserts a calibration it does not have. `RankedList` rejects sparse ranks at
+construction — a gap would silently distort every RRF score.
+
+*Retrieval failures are isolated.* One index erroring degrades the candidate set
+and records the error; it does not fail the query. A reranker over three lists
+works with two.
+
+**Revisit when:** a single retriever genuinely dominates on your corpus. The
+frame does not require hybrid — `dense-only` and `lexical-only` are two of the
+six arms in `configs/reference.yaml` precisely so this can be checked rather
+than assumed.
+
+---
+
+## Invariant 5 — structured, numeric and temporal questions must never reach vector search
+
+**What it forced.**
+
+*`route` as a first-class stage with at least three paths.* `RouteConfig`
+validation rejects a config missing `structured`, `lookup` or `iterative`.
+
+*Structural enforcement, not just router good behaviour.* `RouteDecision`
+raises if a `STRUCTURED` decision carries no `structured_query` — otherwise it
+falls through to vector search and violates the invariant silently. `LOOKUP`
+raises if `step_budget != 1`, so "one retrieval pass" is a guarantee.
+
+*Config-level enforcement too.* `Config._coherent` rejects a config whose
+structured path targets no structured index. The router cannot honour this
+invariant if the configuration makes it impossible, and the failure would be a
+silent quality problem rather than an error.
+
+*A predicate AST.* `indexer.core.predicate` — small enough to compile to SQL, to
+vector-store filters, and to a pure-Python evaluator (which is the test of
+whether it is small enough). Structured questions need somewhere to go, and it
+has to be vendor-neutral or the invariant buys a vendor lock.
+
+*`Exists` distinct from `Compare(field, EQ, None)`.* "No governing-law clause
+found" and "governing law is explicitly none" are different answers. An
+extraction pipeline that cannot tell them apart will confidently report the
+wrong one.
+
+*Typed field extraction in `enrich`.* `Enrichment.fields` with a narrow
+`FieldValue` union. The structured path can only answer from fields that were
+extracted; without extraction there is nowhere for a numeric question to go.
+
+*Per-type metric slices.* `RunReport.by_query_type`. Aggregates hide this
+failure mode entirely: structured questions are a minority of most golden sets,
+so routing them all to vector search costs a couple of points overall and is
+invisible — while being catastrophic for that slice.
+
+*Every decision logged, including the non-decisions.* When routing is disabled
+the pipeline still records a decision with `reason="stage_disabled"`. Routing
+errors are invisible in aggregate retrieval metrics, because the misrouted
+queries are exactly the ones whose gold the retriever never saw — the metrics
+blame the retriever.
+
+**Revisit when:** retrieval models start handling numeric and temporal
+constraints natively. The seam is `RoutePath`, which is open: a fourth path
+costs a config entry.
+
+---
+
+## Invariant 6 — nothing is optimized without a before/after number
+
+**What it forced.**
+
+*The eval harness first, before implementations.* Which is why
+`src/indexer/eval` exists in round 1 and `src/indexer/impls` does not.
+
+*Gold anchored to document spans, not unit ids.* The single most consequential
+decision in the eval design. Unit ids are content-derived, so changing the
+segmenter changes all of them and a unit-id-anchored golden set silently reports
+zero recall — which looks like a catastrophic regression rather than a broken
+harness. Span anchoring means one golden set survives re-segmentation,
+re-chunking and re-parsing, which is what makes ablation arms comparable at all.
+
+*Accounting is mandatory, not opt-in.* Every stage call goes through
+`Accountant.measure`. A number that is expensive to obtain is a number nobody
+obtains, and the invariant quietly stops being followed.
+
+*Failures are recorded, not just successes.* A stage that fails fast on 30% of
+documents is cheap and useless; an accounting layer that only sees successes
+reports it as cheap.
+
+*A manifest per build.* Every version and setting, including the resolved
+config, the environment, and which stages were disabled. Six months later,
+"what produced this index?" has an answer that is not a bisect.
+
+*Ablation arms as override lists, not separate config files.* `AblationSpec
+.overrides` are dotted paths. Two arms then provably differ in exactly the
+stated keys, and each row of the delta table is attributable to one change.
+
+*List elements addressable by name.* `indexes[lexical].enabled` rather than
+`indexes.0.enabled`, because an index's position in a list is not a stable thing
+to write into an ablation spec.
+
+*Rebuild vs reuse is derived.* `requires_rebuild()` — arms touching `ingestion`,
+`corpus`, `paths` or `cache` rebuild; arms touching only `query` reuse the
+index. Otherwise every ablation pays full ingestion cost and nobody runs them.
+
+*The published expectations are asserted.* `SanityCheck` encodes the two from
+the brief: contextualisation ≈ −⅓ on retrieval failures, reranking ≈ −½ again.
+`SanityVerdict.diagnosis` lists the usual causes in order, because "something is
+wired wrong, investigate" is much more useful with a checklist attached.
+
+---
+
+## Decisions not forced by an invariant
+
+Choices made on general grounds. These are the ones to argue with first, because
+nothing in the evidence pins them.
+
+**Protocols, not ABCs.** Structural typing means an implementation need not
+import the frame to satisfy it — useful for wrapping an existing retriever you
+want to benchmark against, which is usually the first thing asked for.
+
+**Frozen dataclasses for data, pydantic for config only.** Config is where
+validation earns a dependency; the contract types must stay dependency-free so
+adopting the frame imports nothing. `indexer.core` has no third-party imports
+and there is a test that will eventually enforce it.
+
+**Bytes in the cache, not objects.** A pickle cache makes every dataclass change
+a silent corpus-wide invalidation or an unpickling error.
+
+**`ArtifactStore` separate from `CacheStore`.** Different lifetimes. A cache
+entry may be evicted and recomputed; an artifact is referenced by a `MediaRef`
+held in an index, and evicting it breaks provenance. Conflating them makes a
+cache clear corrupt the corpus.
+
+**Canonical text as the provenance coordinate system.** Byte offsets into a PDF
+are meaningless and into HTML point at markup. `ParsedDocument.text` with
+`text[span] == block.text` is checkable, which turns provenance from a promise
+into a test.
+
+**`reading_order_confidence` on every parse.** So a parser that cannot recover
+order declares it rather than emitting stream order and letting the segmenter
+build nonsense from it. Also an early warning that a corpus has acquired scans.
+
+**The iterative loop lives inside `Retriever`, not a ninth stage.** A separate
+stage would give the agentic path a different pipeline shape from the simple
+path, and every downstream stage would need to know which it was in.
+
+**`Hit.matched_text` distinct from `unit.text`.** The retrieval surface includes
+LLM-written context. Showing it as if it were the document is a fabricated
+citation.
+
+---
+
+## Seams left open
+
+Out of scope, with the place each would attach.
+
+| Deferred | Where it attaches |
+|---|---|
+| UI | `RetrievalResponse` carries everything a citation view needs: provenance with page and bbox, the full trace, per-stage timings. |
+| Agent framework | `Retriever` on the `ITERATIVE` path, under `step_budget`. `Query.context` already carries prior turns; the frame does not manage dialogue but will not drop it. |
+| Vendor coupling | Every vendor sits behind `Registration` and an extra. `indexer.core` imports nothing third-party. |
+| Distributed indexing | `Ledger` and `CacheStore` are protocols; a distributed build needs a shared ledger with per-document locking and a shared cache. `PlannedChange` is already a partitionable work list. |
+| Quantization | Inside a dense `Index` implementation. `IndexStatsView.detail` carries the knobs; the Matryoshka note in `configs/full.yaml` is there so the two-stage option is not foreclosed. |
+| Multi-tenancy | `Predicate` filters push down to every index, and `SourceSpec.namespace` scopes document ids. What is missing is per-tenant index isolation, which is an `Index` implementation concern. |
+
+---
+
+## What would falsify this design
+
+Written down so it is checkable rather than a matter of taste.
+
+1. **Adding a fifth index kind requires editing `indexer/core`.** Then the
+   registry indirection failed at its one job.
+2. **Two arms of an ablation differ in a way the override list does not
+   state.** Then the delta table is not attributable and invariant 6 is
+   unsupported.
+3. **A golden set stops working after a segmenter change.** Then span anchoring
+   failed and no two arms are comparable.
+4. **The sanity checks fail on a real corpus and the cause is in the frame
+   rather than the corpus.** Most likely: an index indexing `unit.text` instead
+   of `indexing_text()`. `check_index_surface()` exists to catch exactly this.
+5. **A new project needs a fork.** Then the config schema is too closed, and the
+   place to look is phase-1 validation having grown an enumeration of
+   implementations.

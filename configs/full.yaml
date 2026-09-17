@@ -1,0 +1,189 @@
+# A production-shaped configuration, as an overlay on the reference path.
+#
+# This file exists to demonstrate the claim: everything below is a config
+# change. No implementation named here requires a frame edit to introduce --
+# each registers itself and is resolved by name.
+#
+# Nothing here is a recommendation for your corpus. These are the reference
+# starting points from the brief, and each is expected to be replaced once the
+# ablation table on a real corpus says something different.
+
+extends: reference.yaml
+
+project:
+  name: full
+  description: Hybrid retrieval with LLM contextualisation, visual index and reranking.
+
+corpus:
+  sources:
+    - impl: filesystem
+      namespace: docs
+      params:
+        root: ./data
+        include: ["**/*.pdf", "**/*.docx", "**/*.md", "**/*.html"]
+
+ingestion:
+  parse:
+    routes:
+      # Classify per document. A text-native PDF is an order of magnitude
+      # cheaper to parse than a scan and there is no reason to pay scan prices
+      # for the 80% of a corpus that does not need it.
+      - when: { media_type: "application/pdf", text_layer: true }
+        impl: pymupdf4llm
+      - when: { media_type: "application/pdf", text_layer: false }
+        impl: docling              # layout-aware, self-hosted, slower
+        params:
+          ocr: true
+      - when: { media_type: "application/pdf", complexity: high }
+        impl: llamaparse           # managed API; complex tables and scans
+        params:
+          api_key: ${env:LLAMAPARSE_API_KEY}
+      - when: { media_type: "text/markdown" }
+        impl: markdown
+    default:
+      impl: pymupdf4llm
+
+  enrich:
+    enabled: true
+    batch_size: 24
+    max_concurrency: 8
+    enrichers:
+      # Invariant 3. A small fast model, prompt-cached over the parent document
+      # so the document is sent once rather than once per chunk -- which is what
+      # makes this affordable at corpus scale.
+      #
+      # scope: document means any edit to the parent invalidates every unit's
+      # context. That is the honest cost of document-level context, and it is
+      # stated here rather than discovered during a rebuild.
+      - impl: llm_contextualizer
+        scope: document
+        params:
+          model: claude-haiku-4-5-20251001
+          prompt_cache: true
+          target_tokens: 75        # the 50-100 band from the published numbers
+          max_tokens: 128
+
+      # Invariant 5. Extracted fields are what the structured path answers from;
+      # without them a numeric or temporal question has nowhere to go but the
+      # vector index.
+      - impl: llm_field_extractor
+        scope: unit
+        params:
+          model: claude-haiku-4-5-20251001
+          schema:
+            effective_date: date
+            expiry_date: date
+            contract_value: float
+            currency: str
+            counterparty: str
+            governing_law: str
+
+      - impl: llm_classifier
+        scope: unit
+        params:
+          model: claude-haiku-4-5-20251001
+          labels:
+            doc_section: [recitals, definitions, obligations, termination, schedules]
+
+  index:
+    indexes:
+      - name: lexical
+        kind: lexical
+        impl: bm25              # SPLADE-v3 where the extra cost is earned
+      - name: dense
+        kind: dense
+        impl: qdrant
+        params:
+          url: ${env:QDRANT_URL:http://localhost:6333}
+          collection: ${project.name}
+          # Matryoshka-capable, so two-stage search stays available without
+          # re-embedding the corpus later. Choosing a non-Matryoshka model here
+          # is a decision that costs a full re-index to undo.
+          model: matryoshka-embed-v1
+          dims: [256, 1024]
+          prefetch_dim: 256
+      - name: fields
+        kind: structured
+        impl: sqlite
+        params:
+          path: ${paths.store}/fields.db
+      # The fourth kind. Adding it touched no other index, no dispatch table and
+      # no frame code -- which was the requirement.
+      #
+      # Off by default: decisive on slides, decks and scans, a loss on dense
+      # scientific prose. Enable per corpus, and let the ablation decide.
+      - name: visual
+        kind: visual
+        enabled: false
+        impl: colqwen
+        params:
+          model: colqwen2.5
+          batch_size: 4
+
+query:
+  route:
+    impl: llm_router
+    params:
+      model: claude-haiku-4-5-20251001
+      fallback: rules            # rules router on timeout or low confidence
+    min_confidence: 0.6
+    fallback_path: lookup
+    paths:
+      structured:
+        targets: [fields]
+      lookup:
+        targets: [lexical, dense]
+        top_k: { lexical: 50, dense: 50 }
+        step_budget: 1
+        # Cross-encoder, not an LLM. The majority of traffic takes this path and
+        # an LLM reranker here spends the latency budget on the queries that
+        # least need it.
+        rerank: cross_encoder
+      iterative:
+        targets: [lexical, dense]
+        top_k: { lexical: 30, dense: 30 }
+        step_budget: 4
+        rerank: cross_encoder
+
+  fuse:
+    impl: rrf
+    k: 60
+    weights:
+      lexical: 1.0
+      dense: 1.0
+
+  rerank:
+    enabled: true
+    impl: bge_reranker
+    params:
+      model: BAAI/bge-reranker-v2-m3
+    input_top_k: 50
+    output_top_k: 10
+
+accounting:
+  enabled: true
+  prices:
+    claude-haiku-4-5-20251001: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+
+eval:
+  judge:
+    impl: hybrid_judge
+    params:
+      # Exact comparison for numbers and dates: cheaper, deterministic, and
+      # strictly more reliable than asking a model whether two dates match.
+      exact_types: [number, date, boolean]
+      model: claude-haiku-4-5-20251001
+  bootstrap:
+    impl: llm_bootstrap
+    params:
+      model: claude-haiku-4-5-20251001
+      target_size: 300
+      # Reject questions a cheap lexical baseline already answers from the wrong
+      # unit: items no system can distinguish measure nothing.
+      specificity_filter: true
+      type_distribution:
+        factual: 0.4
+        structured: 0.2
+        temporal: 0.1
+        comparative: 0.1
+        multi_hop: 0.2

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "indexer"
+version = "0.1.0"
+description = "A document indexing and retrieval frame: stage contracts, config schema, and an evaluation harness."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# indexer.core carries the contracts and MUST stay dependency-free, so that a
+# project adopting the frame never inherits a transitive choice it has to undo.
+# Config validation is the one place strict runtime validation earns a dependency.
+dependencies = [
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Every concrete choice lives behind an extra. None are installed by default;
+# the reference path (extra: `reference`) is the deliberately simple one.
+reference = []
+dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5", "types-PyYAML"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/indexer"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["indexer"]
+mypy_path = "src"
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

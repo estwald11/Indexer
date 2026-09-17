@@ -1,0 +1,184 @@
+"""Contract conformance checks.
+
+A contract stated only in a docstring is a suggestion. These functions make the
+stage contracts executable, so a new implementation is tested against the same
+rules as the reference one, and a violation is a failed check with a message
+rather than a mysterious quality regression three stages downstream.
+
+Every check takes real stage output and returns a list of violations. They are
+used three ways: in the conformance test suite that every implementation is
+expected to pass, as optional runtime assertions during a build
+(``--strict-contracts``), and by the eval harness before a run -- because a
+golden set scored against a corpus whose provenance is broken produces numbers
+that look fine and mean nothing.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+
+from indexer.core.document import BlockKind, ParsedDocument
+from indexer.core.results import RankedList
+from indexer.core.stages import Index, IndexQuery, StageContext
+from indexer.core.unit import EnrichedUnit, Unit
+
+__all__ = [
+    "check_index_surface",
+    "check_parsed_document",
+    "check_ranked_list",
+    "check_unit_stability",
+    "check_units",
+]
+
+
+def check_parsed_document(parsed: ParsedDocument) -> list[str]:
+    """The parse contract: span integrity, reading order, table structure."""
+    problems: list[str] = []
+    prev_end = 0
+    for i, b in enumerate(parsed.blocks):
+        span = b.provenance.span
+        actual = parsed.text[span.start : span.end]
+        if actual != b.text:
+            problems.append(
+                f"block[{i}] {b.block_id}: span {span.start}..{span.end} yields "
+                f"{actual[:40]!r} but block.text is {b.text[:40]!r}. Every citation "
+                f"this document ever produces descends from this equality."
+            )
+        if span.start < prev_end:
+            problems.append(
+                f"block[{i}] {b.block_id}: span starts at {span.start}, before the "
+                f"previous block ended at {prev_end}. Blocks must be ascending and "
+                f"non-overlapping -- reading order is the list order."
+            )
+        prev_end = max(prev_end, span.end)
+        if b.provenance.document_id != parsed.document_id:
+            problems.append(f"block[{i}]: provenance names a different document")
+        if str(b.kind) == BlockKind.TABLE and b.table is None:
+            problems.append(
+                f"block[{i}] {b.block_id}: kind is 'table' but no Table payload. "
+                f"Rendering a table to a string and dropping the grid destroys the "
+                f"structured path at the first stage; no later stage recovers it."
+            )
+        if str(b.kind) == BlockKind.HEADING and b.level is None:
+            problems.append(f"block[{i}]: heading without a level; section paths need it")
+    if not 0.0 <= parsed.reading_order_confidence <= 1.0:
+        problems.append("reading_order_confidence must be in [0, 1]")
+    return problems
+
+
+def check_units(units: Sequence[Unit], parsed: ParsedDocument) -> list[str]:
+    """The segment contract: addressability, ordering, coverage."""
+    problems: list[str] = []
+    seen: set[str] = set()
+    for i, u in enumerate(units):
+        if u.unit_id in seen:
+            problems.append(f"unit[{i}]: duplicate unit_id {u.unit_id}")
+        seen.add(u.unit_id)
+        if u.document_id != parsed.document_id:
+            problems.append(f"unit[{i}]: belongs to a different document")
+        span = u.provenance.span
+        if span.end > len(parsed.text):
+            problems.append(
+                f"unit[{i}]: span {span.start}..{span.end} runs past the document "
+                f"({len(parsed.text)} chars)"
+            )
+            continue
+        if u.text and u.text not in parsed.text[span.start : span.end]:
+            # `in` rather than `==`: a segmenter may legitimately normalise
+            # whitespace or repeat table headers, but the unit's text must still
+            # be locatable in the span it claims, or a citation points elsewhere.
+            problems.append(
+                f"unit[{i}]: text is not found within its own span -- the passage "
+                f"would cite the wrong location"
+            )
+    ordinals = [u.ordinal for u in units]
+    if ordinals != sorted(ordinals):
+        problems.append("units are not in reading order by ordinal")
+    return problems
+
+
+def check_unit_stability(before: Sequence[Unit], after: Sequence[Unit]) -> list[str]:
+    """The incremental contract: unchanged content keeps its id.
+
+    Run by editing one paragraph of a document and re-segmenting. Units whose
+    text did not change must keep their ids, or an incremental rebuild rewrites
+    the whole document and "adding 10 documents to 500 reprocesses 10" is false
+    for every document that is ever edited.
+    """
+    problems: list[str] = []
+    by_text_before: dict[str, list[str]] = {}
+    for u in before:
+        by_text_before.setdefault(u.text, []).append(u.unit_id)
+    for u in after:
+        prior = by_text_before.get(u.text)
+        if prior and u.unit_id not in prior:
+            problems.append(
+                f"unit with unchanged text changed id ({prior[0]} -> {u.unit_id}); "
+                f"position is leaking into unit identity"
+            )
+    return problems
+
+
+def check_index_surface(
+    index: Index, units: Sequence[EnrichedUnit], ctx: StageContext
+) -> list[str]:
+    """The index contract: every index searches ``indexing_text()``.
+
+    This is the check that catches invariant 3's most likely failure -- the
+    lexical half indexing raw text while the dense half gets the contextualised
+    string. It is nearly invisible otherwise: retrieval still works, just worse,
+    and the ablation shows contextualisation earning about half of what it
+    should.
+
+    Method: pick a unit whose prepended context contains a term absent from its
+    own text, search for that term, and require the unit to come back.
+    """
+    problems: list[str] = []
+    probe: EnrichedUnit | None = None
+    term = ""
+    for u in units:
+        ctx_text = u.indexing_text()[: -len(u.unit.text)] if u.unit.text else u.indexing_text()
+        body_words = {w.lower().strip(".,;:()") for w in u.unit.text.split()}
+        for w in ctx_text.split():
+            w = w.strip(".,;:()")
+            if len(w) > 5 and w.lower() not in body_words:
+                probe, term = u, w
+                break
+        if probe:
+            break
+    if probe is None:
+        return ["cannot verify the retrieval surface: no enrichment adds a distinctive term"]
+
+    result = index.search(IndexQuery(text=term, top_k=50), ctx)
+    if probe.unit_id not in result.unit_ids():
+        problems.append(
+            f"index {index.name!r} did not return the unit whose *context* contains "
+            f"{term!r}. It is indexing unit.text rather than indexing_text(); the "
+            f"contextualisation benefit is being lost on this index."
+        )
+    return problems
+
+
+def check_ranked_list(rl: RankedList) -> list[str]:
+    """The retrieval contract: dense 1-based ranks, provenance on every hit."""
+    problems: list[str] = []
+    for i, h in enumerate(rl.hits, start=1):
+        if h.rank != i:
+            problems.append(f"{rl.source}: hit at position {i} claims rank {h.rank}")
+        if not h.provenance.document_id:
+            problems.append(f"{rl.source}: hit {h.unit_id} has no document in its provenance")
+    ids = [h.unit_id for h in rl.hits]
+    if len(set(ids)) != len(ids):
+        problems.append(f"{rl.source}: duplicate unit ids in one ranked list")
+    return problems
+
+
+def summarise(named: Mapping[str, Sequence[str]]) -> str:
+    total = sum(len(v) for v in named.values())
+    if not total:
+        return "all contract checks passed"
+    lines = [f"{total} contract violation(s):"]
+    for name, problems in named.items():
+        for p in problems:
+            lines.append(f"  [{name}] {p}")
+    return "\n".join(lines)
