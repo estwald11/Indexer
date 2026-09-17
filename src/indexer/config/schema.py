@@ -221,7 +221,15 @@ class RouteConfig(_Base):
     params: dict[str, Any] = Field(default_factory=dict)
     paths: dict[str, PathSpec] = Field(default_factory=dict)
     #: Where decisions are written. Invariant: every decision is logged.
-    decision_log: str | None = "${paths.store}/route-decisions.jsonl"
+    #:
+    #: ``None`` means the assembler's default, ``<paths.store>/route-decisions
+    #: .jsonl``. It deliberately does *not* default to an interpolated string:
+    #: interpolation runs over the config file before validation, so a token in
+    #: a schema default is never expanded and would be taken literally -- which
+    #: creates a directory named "${paths.store}".
+    decision_log: str | None = None
+    #: Set false to write no decision log. Distinct from leaving the path unset.
+    log_decisions: bool = True
     #: Below this confidence, fall back to this path rather than commit to a
     #: guess. Misrouting is expensive precisely because it is invisible in
     #: aggregate retrieval metrics.
@@ -434,9 +442,14 @@ class Config(_Base):
                         f"route.paths.{name} targets unknown or disabled indexes: {sorted(unknown)}"
                     )
 
-        unknown_weights = set(self.query.fuse.weights) - index_names
-        if unknown_weights:
-            raise ValueError(f"fuse.weights names unknown indexes: {sorted(unknown_weights)}")
+        # A weight naming an index that does not exist is a typo and does
+        # nothing -- an error. A weight naming a *disabled* index is an ablation
+        # arm mid-flight, where the weight is simply inert. Conflating the two
+        # makes every "turn this index off" arm unexpressible.
+        all_index_names = {i.name for i in self.ingestion.index.indexes}
+        misspelled = set(self.query.fuse.weights) - all_index_names
+        if misspelled:
+            raise ValueError(f"fuse.weights names indexes that do not exist: {sorted(misspelled)}")
 
         return self
 
@@ -470,6 +483,13 @@ class Config(_Base):
             out.append(
                 "rerank is off: published numbers put it at 2.9% -> 1.9% top-20 "
                 "retrieval failure once units are contextualised."
+            )
+        enabled_names = {i.name for i in self.ingestion.index.indexes if i.enabled}
+        inert = set(self.query.fuse.weights) - enabled_names
+        if inert and self.query.fuse.enabled:
+            out.append(
+                f"fuse.weights sets weights for disabled indexes {sorted(inert)}; "
+                f"they have no effect."
             )
         if 5 not in self.eval.k_values:
             out.append(

@@ -57,3 +57,47 @@ def test_core_does_not_name_a_concrete_implementation() -> None:
                 if hits:
                     offenders.setdefault(py.name, []).extend(hits)
     assert not offenders, f"indexer.core imports vendor code: {offenders}"
+
+
+EVAL = Path(__file__).resolve().parent.parent / "src" / "indexer" / "eval"
+
+
+def test_eval_does_not_depend_on_any_implementation() -> None:
+    """The harness must be able to evaluate a system this library did not build.
+
+    That is usually the first comparison anyone wants -- "is the new pipeline
+    better than what we already have?" -- and a harness that imports a specific
+    index implementation cannot answer it. It also closed an import cycle:
+    pipeline -> eval (for contract checks) -> impls -> pipeline.
+    """
+    offenders: dict[str, list[str]] = {}
+    for py in sorted(EVAL.glob("*.py")):
+        tree = ast.parse(py.read_text())
+        for node in ast.walk(tree):
+            mod = None
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mod = node.module
+            elif isinstance(node, ast.Import):
+                mod = node.names[0].name
+            if mod and mod.startswith("indexer.impls"):
+                offenders.setdefault(py.name, []).append(mod)
+    assert not offenders, (
+        f"indexer.eval imports implementation modules: {offenders}. "
+        f"Shared helpers belong in indexer.textutil, indexer.io or indexer.plugin."
+    )
+
+
+def test_no_import_cycles_in_the_package() -> None:
+    """Importing any subpackage first must work. A cycle makes order matter."""
+    import importlib
+    import subprocess
+    import sys
+
+    for first in ("indexer.eval", "indexer.impls", "indexer.pipeline", "indexer.config"):
+        r = subprocess.run(
+            [sys.executable, "-c", f"import {first}"],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, f"importing {first} first fails:\n{r.stderr[-800:]}"
+    assert importlib  # keep the import meaningful to linters

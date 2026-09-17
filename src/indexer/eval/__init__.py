@@ -5,6 +5,7 @@ correct answer is, metrics define how it is scored, checks define what a valid
 pipeline is, and the harness runs them.
 """
 
+from indexer.eval.bootstrap import HeuristicBootstrapper
 from indexer.eval.checks import (
     check_index_surface,
     check_parsed_document,
@@ -29,6 +30,7 @@ from indexer.eval.harness import (
     SanityVerdict,
     requires_rebuild,
 )
+from indexer.eval.judge import ContainmentJudge, ExactJudge
 from indexer.eval.metrics import (
     Judge,
     Matcher,
@@ -40,15 +42,23 @@ from indexer.eval.metrics import (
     reciprocal_rank,
     retrieval_failed,
 )
+from indexer.eval.runner import AblationRunner as DefaultAblationRunner
+from indexer.eval.runner import EvalRunner as DefaultEvalRunner
+from indexer.eval.runner import default_answer
 
 __all__ = [
     "AblationResult",
     "AblationRunner",
     "Bootstrapper",
+    "ContainmentJudge",
+    "DefaultAblationRunner",
+    "DefaultEvalRunner",
     "EvalRunner",
+    "ExactJudge",
     "GoldOrigin",
     "GoldenQuery",
     "GoldenSet",
+    "HeuristicBootstrapper",
     "Judge",
     "Matcher",
     "QueryEngineLike",
@@ -61,6 +71,7 @@ __all__ = [
     "check_ranked_list",
     "check_unit_stability",
     "check_units",
+    "default_answer",
     "load_golden_set",
     "ndcg_at_k",
     "precision_at_k",

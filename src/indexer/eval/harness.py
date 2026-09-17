@@ -48,7 +48,13 @@ __all__ = [
 ]
 
 #: Config prefixes whose change invalidates a built index.
-_REBUILD_PREFIXES = ("corpus", "ingestion", "paths", "cache")
+#:
+#: ``paths`` is deliberately absent: the ablation runner rewrites ``paths.store``
+#: per arm so that each distinct ingestion configuration gets its own index, and
+#: treating that rewrite as a content change would force a rebuild for every arm
+#: -- defeating the reuse it exists to enable. What is actually in an index is
+#: decided by ``corpus`` and ``ingestion``, which is what the runner fingerprints.
+_REBUILD_PREFIXES = ("corpus", "ingestion", "cache")
 
 
 def requires_rebuild(overrides: Mapping[str, Any]) -> bool:

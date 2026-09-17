@@ -96,6 +96,16 @@ class Unit:
     next_unit_id: UnitId | None = None
     #: Structure preserved from the parsed block, when the unit is one table.
     table_ref: str | None = None
+    #: Whether ``text`` is the document's canonical text at ``span``, verbatim.
+    #:
+    #: Almost always true, and the frame checks it, because a unit whose text
+    #: is not at the span it claims produces a citation pointing at the wrong
+    #: place. The documented exception is a table split by row groups with its
+    #: header rows repeated into each piece: the text is then a *derivation* of
+    #: the span rather than a copy of it. Making that a declared flag rather
+    #: than a tolerance in the checker means the exception is visible in the
+    #: data, auditable, and cannot quietly widen to cover real bugs.
+    verbatim: bool = True
     #: Document-level metadata copied down so an index can filter without a
     #: join. Scanner-supplied facts only; inferred fields live in enrichments.
     metadata: Mapping[str, Any] = field(default_factory=dict)

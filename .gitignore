@@ -11,3 +11,6 @@ build/
 # Local index stores, caches and eval output are build products, never sources.
 /var/
 /.indexer/
+# The evaluation corpus is fetched, not vendored: scripts/fetch_corpus.py pins
+# each package version in data/pypi-docs/_corpus.json so it is reproducible.
+/data/pypi-docs/

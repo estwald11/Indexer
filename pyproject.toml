@@ -23,6 +23,8 @@ dependencies = [
 # the reference path (extra: `reference`) is the deliberately simple one.
 reference = []
 dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5", "types-PyYAML"]
+# Optional accelerator for the reference dense index: same arithmetic, vectorised.
+fast = ["numpy>=1.26"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/indexer"]
@@ -44,3 +46,10 @@ warn_unreachable = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Optional integrations are imported lazily inside their implementations, so the
+# type checker cannot see them unless they are installed. Ignoring them here
+# keeps `mypy --strict` meaningful for everything that is not optional.
+[[tool.mypy.overrides]]
+module = ["anthropic", "sentence_transformers"]
+ignore_missing_imports = true

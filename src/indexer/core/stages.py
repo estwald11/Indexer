@@ -51,6 +51,7 @@ __all__ = [
     "CorpusScanner",
     "EnrichContext",
     "Enricher",
+    "Flushable",
     "Fuser",
     "Index",
     "IndexKind",
@@ -428,6 +429,24 @@ class Index(Protocol):
     def stats(self) -> IndexStatsView: ...
 
     def fingerprint(self) -> StageFingerprint: ...
+
+
+@runtime_checkable
+class Flushable(Protocol):
+    """Capability: an index that batches durability and commits on demand.
+
+    Persisting on every ``upsert`` makes ingestion quadratic for any index that
+    rewrites a whole file or reindexes on commit -- a cost that is invisible on
+    a ten-document test and fatal on a real corpus. So indexes are permitted to
+    buffer, and the pipeline commits once per build.
+
+    The contract: after ``flush`` returns, everything upserted is durable and
+    searchable. Before it, results may be stale on disk but must already be
+    correct in memory -- a query between batches must never see a partial
+    index. An implementation with nothing to commit simply omits the capability.
+    """
+
+    def flush(self) -> None: ...
 
 
 @runtime_checkable

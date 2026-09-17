@@ -342,6 +342,54 @@ Out of scope, with the place each would attach.
 
 ---
 
+## What implementing it changed
+
+The contracts were proposed before any implementation existed. Building the
+reference path found five places where they were wrong or incomplete. They are
+recorded because the corrections are the evidence that the contracts are load-
+bearing rather than decorative.
+
+**`Unit.verbatim` did not exist.** The segment contract said a unit's text must
+be locatable in its span, and permitted a split table to repeat its header rows
+into each piece. Those two are contradictory: a repeated header is text that is
+not at the span. The checker caught it on the first real corpus. The fix is a
+declared flag rather than a tolerance in the checker -- a derived unit says so,
+and non-verbatim units are still checked (their text must plausibly come from
+their span), so the exception cannot quietly widen to cover real bugs.
+
+**`_split_long_block` returned strings.** Splitting an oversized block at
+sentence boundaries and re-joining with `" "` discards the original newlines,
+so the unit no longer matched the text it cited. It now returns offsets and the
+caller slices. The general lesson, which applies to any parser or segmenter
+added later: **derive text from the canonical text, never rebuild it.**
+
+**`Flushable` did not exist.** Indexes persisted on every `upsert`, which is
+quadratic for any implementation that rewrites a file or reindexes on commit --
+invisible on a ten-document test, fatal at 10,000 units. The capability lets an
+index buffer and the pipeline commit once per build. It is a capability rather
+than a method on `Index` for the same reason `StructuredCapable` is: an index
+with nothing to commit should not have to stub it.
+
+**Ablation arms shared one store.** Arms that "reuse the index" were reading
+whatever the previous arm left behind, so reuse depended on the order the arms
+ran in. The runner now keys each store by a fingerprint of the arm's `corpus`
+and `ingestion` sections, which makes reuse a fact about the configuration
+rather than about the loop. This was a correctness bug in the measurement
+apparatus, which is the worst place to have one.
+
+**A schema default carried an interpolation token.** `decision_log` defaulted to
+`"${paths.store}/route-decisions.jsonl"`, but interpolation runs over the config
+file *before* validation, so a default is never expanded -- and the literal
+string created a directory named `${paths.store}`. Defaults now resolve in the
+assembler. The general rule: **anything interpolated must come from the file.**
+
+Two contract checks earned their place by catching bugs in the implementation
+that proposed them: `check_parsed_document` and `check_units` found all of the
+first two class of failures, on real documents, before any of it reached an
+index.
+
+---
+
 ## What would falsify this design
 
 Written down so it is checkable rather than a matter of taste.

@@ -83,18 +83,42 @@ def check_units(units: Sequence[Unit], parsed: ParsedDocument) -> list[str]:
                 f"({len(parsed.text)} chars)"
             )
             continue
-        if u.text and u.text not in parsed.text[span.start : span.end]:
-            # `in` rather than `==`: a segmenter may legitimately normalise
-            # whitespace or repeat table headers, but the unit's text must still
-            # be locatable in the span it claims, or a citation points elsewhere.
+        slice_ = parsed.text[span.start : span.end]
+        if u.verbatim:
+            if u.text and u.text not in slice_:
+                problems.append(
+                    f"unit[{i}]: text is not the document's text at its own span -- "
+                    f"a citation from this unit would point at the wrong place. If the "
+                    f"text is a deliberate derivation (a split table with repeated "
+                    f"headers), set Unit.verbatim=False so it is declared rather than "
+                    f"silently tolerated."
+                )
+        elif u.text and not _shares_substance(u.text, slice_):
+            # A derived unit still has to come from its span. Without this,
+            # `verbatim=False` would be a licence to attach any text to any
+            # location, which is exactly the failure the flag exists to bound.
             problems.append(
-                f"unit[{i}]: text is not found within its own span -- the passage "
-                f"would cite the wrong location"
+                f"unit[{i}]: declared non-verbatim, but its text has little in common "
+                f"with the span it claims to derive from"
             )
     ordinals = [u.ordinal for u in units]
     if ordinals != sorted(ordinals):
         problems.append("units are not in reading order by ordinal")
     return problems
+
+
+def _shares_substance(text: str, source: str, threshold: float = 0.6) -> bool:
+    """Whether a derived unit plausibly came from its span.
+
+    Word-level containment: a split table chunk repeats its header and carries a
+    subset of the rows, so nearly all of its words come from the span. A unit
+    attached to the wrong span would not.
+    """
+    words = [w for w in text.split() if len(w) > 2]
+    if not words:
+        return True
+    pool = set(source.split())
+    return sum(1 for w in words if w in pool) / len(words) >= threshold
 
 
 def check_unit_stability(before: Sequence[Unit], after: Sequence[Unit]) -> list[str]:

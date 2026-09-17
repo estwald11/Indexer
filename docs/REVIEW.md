@@ -79,42 +79,44 @@ targets exist), not the type system.
   `sqlite`, no reranker). It works as a test fixture with no API key, and every
   piece of it is a real ablation baseline rather than a placeholder.
 
-## Open questions where your answer changes the build
+## Decisions (ruled, 2026-09-17)
 
-**Q1. What is the real corpus for deliverable 3?**
-The ablation report needs one. Without it I will build against a public corpus
-(candidates: a slice of arXiv for dense prose, EDGAR filings for tables and
-temporal questions, a set of slide decks if you want the visual index exercised
-— these stress different halves of the frame). If you have a corpus in mind, its
-shape should drive which reference implementations I wire first.
+| Question | Ruling |
+|---|---|
+| Corpus for the ablation report | No preference — my pick, constrained by the environment (see below). |
+| Reference path fidelity | **Offline only.** No model downloads, no credentials. Absolute numbers from the reference dense index are not meaningful; only the deltas are. |
+| End-to-end correctness | **Caller-supplied answer function**, defaulting to top-k concatenation. Generation stays out of the library. |
+| `ContextScope` enforcement | **Contract only.** No runtime guard. The risk is accepted: an enricher that declares `unit` while reading the document serves stale results through cache clears. `Enricher` docstrings state it; `check_scope_honesty` is *not* being built. |
 
-**Q2. Is the offline reference path acceptable as "the simple end-to-end path",
-or should it use a real embedding model?**
-Offline means the whole thing runs in CI, and the ablation sanity checks are
-reproducible on any machine. But `hash_embedding` is not a real dense retriever,
-so the *absolute* numbers from the reference path are meaningless — only the
-deltas are informative. I lean offline for the reference path plus one
-`sentence-transformers` implementation for real numbers. Tell me if you would
-rather the reference path be honest end-to-end from the start.
+Not ruled, so built as proposed: the shared retrieval surface stays mandatory
+for every index, and the iterative loop stays inside `Retriever`.
 
-**Q3. How much should the frame own the answer step?**
-Right now: nothing. `RetrievalResponse` carries passages. But end-to-end
-correctness is a required metric, which means the harness needs *something* to
-judge. My plan is for the harness to take a caller-supplied answer function and
-default to a trivial one (concatenate top-k) for retrieval-only evaluation —
-keeping generation out of the library while making the metric computable.
-Confirm, or say you want a thin generation seam in the frame.
+## Environment constraints on deliverable 3
 
-**Q4. SQLite or Postgres for the structured store in the reference path?**
-The brief says SQLite by default, Postgres when concurrency demands. I will do
-SQLite and put the concurrency note in the docs, unless your first project
-already needs Postgres.
+Discovered after the rulings, and they change what the ablation report can
+prove. Stated here rather than worked around quietly.
 
-**Q5. Do you want a CLI in round 2?**
-`indexer build`, `indexer query`, `indexer eval`, `indexer ablate`. Not in the
-brief, and it is the obvious thing to skip if you would rather see the reference
-implementations land first. It is maybe half a day and it is what makes the
-ablation runner usable by someone who is not reading the source.
+The session's network policy allows package registries and `api.anthropic.com`
+only. `huggingface.co` and `www.sec.gov` are refused at the proxy (403 on
+CONNECT), and no `ANTHROPIC_API_KEY` is set — the API answers 401.
+
+| Wanted | Available | Consequence |
+|---|---|---|
+| A real corpus | PyPI sdists: README, `docs/**`, changelogs across many packages | Fine. Genuinely heterogeneous (md/rst/txt), real structure, and it carries version, date and requirement facts, so the structured path is exercised rather than stubbed. |
+| LLM contextualiser | None | `llm_contextualizer` is written and registered but cannot run here. The ablation measures an **extractive** contextualiser instead. |
+| Cross-encoder reranker | None (HF blocked) | `bge_reranker` is written against the contract but cannot run. The ablation measures a **lexical-overlap** reranker instead. |
+
+So the two sanity checks are calibrated for LLM-written summaries and a real
+cross-encoder, and this run has neither. The honest expectation is that both
+deltas come out **smaller** than the published figures, and a result matching
+them exactly would be more suspicious than a result falling short.
+
+What the run can still establish, and what the report will claim: that the
+wiring is correct (contextualisation reaches both indexes, reranking reorders
+the right candidate set), that the deltas point the right way, and the relative
+ordering of the arms. Validating the published magnitudes needs a run with
+credentials and model access; the config for it is `configs/full.yaml` and
+nothing else has to change.
 
 ## What round 2 looks like, assuming this is approved
 
