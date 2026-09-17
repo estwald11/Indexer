@@ -188,11 +188,30 @@ eval:
         ingestion.enrich.enabled: false
 
     - name: 4-hybrid-sectionpath
-      description: Adds the heading trail only. The control for "does any prefix help?".
+      description: Heading trail only. The control for "does any prefix help?".
       overrides:
+        # regex_fields must stay. Overrides replace lists wholesale, so dropping
+        # it here would also empty the router's field lexicon and send every
+        # structured question to vector search -- confounding a context arm with
+        # an invariant-5 regression. The first run of this ablation made exactly
+        # that mistake, and route_acc falling to 0.0 is what exposed it.
         ingestion.enrich.enrichers:
           - impl: section_prefix
             scope: unit
+          - impl: regex_fields
+            scope: unit
+            params:
+              from_metadata: [package]
+              fields:
+                version:
+                  pattern: '\b(?:version|release)\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+                  type: str
+                version_major:
+                  pattern: '\b(?:version|release)\s+([0-9]+)\.[0-9]+'
+                  type: int
+                release_date:
+                  pattern: '\b(\d{4}-\d{2}-\d{2})\b'
+                  type: date
 
     - name: 5-hybrid-context
       description: Adds document-aware context. Invariant 3's arm.
@@ -202,6 +221,50 @@ eval:
       description: Adds the reranker. Invariant 3's second number.
       overrides:
         query.rerank.enabled: true
+
+    # --- diagnostic arms -------------------------------------------------
+    # Added after the first run, where two published expectations failed to
+    # reproduce. Each encodes one hypothesis about why, so the explanation is
+    # measured rather than asserted.
+
+    - name: 9-hybrid-weighted
+      description: >-
+        Hypothesis: equal RRF weights let a weak dense half outvote a strong
+        lexical one. If so, down-weighting dense should recover hybrid past
+        lexical-only.
+      overrides:
+        query.rerank.enabled: true
+        query.fuse.weights: { lexical: 1.0, dense: 0.25 }
+
+    - name: 10-context-lean
+      description: >-
+        Hypothesis: the context hurts because it is ~76% identical across a
+        document's units -- dilution, not signal. Dropping the document-level
+        parts leaves only chunk-specific context (subject + section path).
+      overrides:
+        query.rerank.enabled: true
+        ingestion.enrich.enrichers:
+          - impl: extractive_context
+            scope: document
+            params:
+              max_chars: 120
+              lead_sentences: 0      # identical for every unit in a document
+              distinctive_terms: 0   # likewise
+              include_section_path: true
+          - impl: regex_fields
+            scope: unit
+            params:
+              from_metadata: [package]
+              fields:
+                version:
+                  pattern: '\b(?:version|release)\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+                  type: str
+                version_major:
+                  pattern: '\b(?:version|release)\s+([0-9]+)\.[0-9]+'
+                  type: int
+                release_date:
+                  pattern: '\b(\d{4}-\d{2}-\d{2})\b'
+                  type: date
 
     - name: 7-no-router
       description: Everything takes LOOKUP. Measures what invariant 5 is worth.

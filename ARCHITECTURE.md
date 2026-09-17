@@ -154,6 +154,31 @@ not worth a default.
 not laws. `configs/reference.yaml` encodes them as `sanity_checks`, so a corpus
 that disagrees says so on the first ablation run.
 
+**What measuring it added to the contract.** The published framing says "an
+LLM-written 50-100 token summary". Running the ablation with an *extractive*
+contextualiser made retrieval measurably worse (13.8% → 18.9% top-20 failure),
+and the diagnosis sharpens what the invariant actually requires.
+
+Measured on the corpus: the prepended context was **75.6% identical (token
+Jaccard) between adjacent units of the same document**, and occupied **27% of
+the indexed surface**. So a quarter of every unit's retrieval surface was text
+its neighbours also carried. That cannot help distinguish one unit from another
+inside a document — which is exactly the discrimination retrieval needs — while
+it does inflate length (BM25 penalises it) and pull every unit's dense vector
+toward the document centroid.
+
+The requirement the published number leaves implicit, and that this frame should
+state:
+
+> **Context must be chunk-specific, not document-level.** A summary that
+> situates *this chunk* is discriminative. Boilerplate describing the document
+> is dilution wearing the same shape.
+
+`Enricher` contracts now say so, and `ContextScope.DOCUMENT` means "reads the
+document", never "writes the same thing for every unit in it". The distinction
+is not checkable from a type, so `indexer.eval.checks.check_context_specificity`
+measures it and the ablation report prints it.
+
 ---
 
 ## Invariant 4 — hybrid beats either half

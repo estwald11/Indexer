@@ -16,18 +16,47 @@ route -> retrieve -> fuse -> rerank      (query, paid forever)
 
 ## Status
 
-**Round 1: contracts and config schema, for review.** No implementations yet —
-that is deliberate, and the review gate is the point. What exists:
+Contracts, reference implementations and the evaluation harness are in. Every
+stage has at least two implementations selected by config; nothing in the frame
+names one.
 
 | | |
 |---|---|
 | `src/indexer/core/` | The eight stage protocols and the types that cross them. Dependency-free. |
-| `src/indexer/config/` | The config schema, overlays, interpolation, and two-phase validation. |
-| `src/indexer/eval/` | Golden-set format, metrics, the ablation delta table, contract checks. |
-| `configs/reference.yaml` | The deliberately simple path, plus the ablation ladder. |
-| `configs/full.yaml` | The same frame with production-shaped choices — as an overlay, to show that it is only config. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Which invariant drove which contract, and what to revisit when the evidence changes. |
-| [`docs/REVIEW.md`](docs/REVIEW.md) | The decisions worth arguing about before implementations get written. |
+| `src/indexer/config/` | Config schema, overlays, interpolation, two-phase validation. |
+| `src/indexer/pipeline/` | Ingestion and query orchestrators. Where the contracts are enforced. |
+| `src/indexer/impls/` | Reference implementations, two or more per stage. |
+| `src/indexer/eval/` | Golden-set format, metrics, bootstrapper, ablation runner, contract checks. |
+| `configs/reference.yaml` | The deliberately simple path. Runs offline, no credentials. |
+| `configs/full.yaml` | Production-shaped choices, as an overlay — to show it is only config. |
+| `configs/pypi-docs.yaml` | The ablation corpus and its eight-arm ladder. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Which invariant drove which contract, and what implementing it changed. |
+| [`docs/ABLATION.md`](docs/ABLATION.md) | The ablation report on a real corpus, and what it does and does not establish. |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | Decisions taken, and the environment constraints on the report. |
+
+```
+                     ingestion (paid once)
+   corpus ──▶ parse ──▶ segment ──▶ enrich ──▶ index
+                 │          │          │          │
+             ParsedDoc    Unit    EnrichedUnit   ...indexes
+                                                    │
+   query ──▶ route ──▶ retrieve ──▶ fuse ──▶ rerank ┘
+                          query (paid forever)
+```
+
+## Quick start
+
+```bash
+uv venv && uv pip install -e ".[dev,fast]"
+python scripts/fetch_corpus.py                        # 686 docs from 50 PyPI packages
+python -m indexer.config.check configs/pypi-docs.yaml # validate without importing impls
+python scripts/run_ablation.py configs/pypi-docs.yaml # build, bootstrap, ablate, report
+```
+
+Everything runs offline: no API keys, no model downloads. See
+[`docs/REVIEW.md`](docs/REVIEW.md) for what that costs — in short, the reference
+dense index is a hashing trick rather than a semantic model, so absolute numbers
+from it are not comparable to published figures. The deltas are the point.
 
 ## The six invariants
 
@@ -54,11 +83,14 @@ assume, what it must preserve, and what its minimal implementation looks like.
 ## Development
 
 ```bash
-uv venv && uv pip install -e ".[dev]"
-pytest                                    # contract tests
-ruff check src tests && mypy              # lint and types
-python -m indexer.config.check configs/reference.yaml   # validate a config
+pytest                       # 100 tests: contracts, config, pipeline, SQL conformance, layering
+ruff check src tests && mypy # lint and strict types
 ```
+
+Three layering rules are enforced by tests rather than convention:
+`indexer.core` imports nothing third-party and names no implementation, and
+`indexer.eval` depends on no implementation — so the harness can evaluate a
+system this library did not build.
 
 ## Out of scope
 

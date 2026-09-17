@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping, MutableMapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -134,8 +135,15 @@ def with_overrides(raw: MutableMapping[str, Any], overrides: Mapping[str, Any]) 
     List elements are addressed by index (``indexes.0.enabled``) or, more
     usefully, by name (``indexes[dense].enabled``), because an index's position
     in a list is not a stable thing to write in an ablation spec.
+
+    **Pure**: the input is deep-copied. A shallow copy leaves nested mappings
+    and lists shared, so writing through a dotted path mutates the caller's
+    config -- and an ablation runner applying arms to one snapshot would leak
+    each arm's overrides into the next. The arms would then differ in ways the
+    override lists do not state, which is precisely the property the delta table
+    depends on.
     """
-    out: dict[str, Any] = dict(raw)
+    out: dict[str, Any] = deepcopy(dict(raw))
     for dotted, value in overrides.items():
         cur: Any = out
         parts = _split_path(dotted)

@@ -221,7 +221,13 @@ class AblationRunner:
         arms: Sequence[AblationSpec],
         sanity_checks: Sequence[SanityCheck] = (),
     ) -> AblationResult:
-        from indexer.pipeline.build import assemble
+        from indexer.config.loader import load_mapping
+        from indexer.pipeline.build import assemble_mapping
+
+        # One snapshot for the whole run. Every arm is derived from it, so the
+        # arms provably differ only in their stated overrides even if the file
+        # changes underneath a long run.
+        snapshot = load_mapping(self.config_path)
 
         t0 = time.perf_counter()
         result = AblationResult(baseline_arm=self.baseline_arm)
@@ -237,14 +243,14 @@ class AblationRunner:
             # read whatever the previous arm left behind. Keying the store by
             # the ingestion configuration makes reuse a fact about the config
             # rather than about the loop.
-            probe = assemble(self.config_path, overrides=overrides)
+            probe = assemble_mapping(snapshot, overrides=overrides)
             ing_fp = _ingestion_fingerprint(probe.resolved)
             if self.reuse_index:
                 overrides = {
                     **overrides,
                     "paths.store": str(Path(probe.paths.store) / "arms" / ing_fp[:16]),
                 }
-            assembly = assemble(self.config_path, overrides=overrides)
+            assembly = assemble_mapping(snapshot, overrides=overrides)
 
             prior = built.get(ing_fp)
             if prior is not None and self.reuse_index:

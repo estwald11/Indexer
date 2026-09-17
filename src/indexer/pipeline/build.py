@@ -28,7 +28,7 @@ from indexer.pipeline.ingest import IngestionPipeline
 from indexer.pipeline.query import QueryEngine
 from indexer.pipeline.stores import FileArtifactStore, FileCache, JsonLedger, UnitStore
 
-__all__ = ["Assembly", "assemble", "build_indexes"]
+__all__ = ["Assembly", "assemble", "assemble_mapping", "build_indexes"]
 
 
 class Assembly:
@@ -346,4 +346,27 @@ class _MultiScanner:
 
 def assemble(config_path: str | Path, *, overrides: Mapping[str, Any] | None = None) -> Assembly:
     cfg, resolved = load(config_path, overrides=overrides)
+    return Assembly(cfg, resolved)
+
+
+def assemble_mapping(
+    raw: Mapping[str, Any], *, overrides: Mapping[str, Any] | None = None
+) -> Assembly:
+    """Assemble from a config mapping already read from disk.
+
+    The ablation runner uses this so that every arm is derived from **one**
+    snapshot of the config. Re-reading the file per arm means a config edited
+    while a run is in flight produces a report whose arms came from different
+    configurations -- with nothing in the output saying so. For a measurement
+    tool that is the worst possible failure: the numbers still look fine.
+    """
+    from indexer.config.loader import interpolate, with_overrides
+    from indexer.core.errors import ConfigError
+
+    merged = with_overrides(dict(raw), overrides) if overrides else dict(raw)
+    resolved = interpolate(merged, merged)
+    try:
+        cfg = Config.model_validate(resolved)
+    except Exception as exc:
+        raise ConfigError(str(exc)) from exc
     return Assembly(cfg, resolved)

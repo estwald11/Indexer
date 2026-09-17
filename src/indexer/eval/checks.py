@@ -16,6 +16,7 @@ that look fine and mean nothing.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 
 from indexer.core.document import BlockKind, ParsedDocument
 from indexer.core.results import RankedList
@@ -23,6 +24,7 @@ from indexer.core.stages import Index, IndexQuery, StageContext
 from indexer.core.unit import EnrichedUnit, Unit
 
 __all__ = [
+    "check_context_specificity",
     "check_index_surface",
     "check_parsed_document",
     "check_ranked_list",
@@ -206,3 +208,56 @@ def summarise(named: Mapping[str, Sequence[str]]) -> str:
         for p in problems:
             lines.append(f"  [{name}] {p}")
     return "\n".join(lines)
+
+
+def check_context_specificity(
+    units: Sequence[EnrichedUnit], *, max_overlap: float = 0.6
+) -> list[str]:
+    """Is the prepended context chunk-specific, or document-level boilerplate?
+
+    Invariant 3's benefit comes from context that distinguishes one chunk from
+    another. Context that is near-identical across a document's units is
+    dilution wearing the same shape: it cannot help rank one unit above its
+    sibling, while it does inflate length (BM25 penalises that) and pull every
+    unit's dense vector toward the document centroid.
+
+    Measured on a real corpus, an extractive contextualiser produced context
+    that was 76% identical between adjacent units and occupied 27% of the
+    indexed surface -- and retrieval got measurably worse. This check exists so
+    that failure mode is a number rather than a mystery, because the symptom
+    (contextualisation not helping) looks identical to the enricher being
+    mis-wired, and the two have completely different fixes.
+    """
+    from indexer.textutil import tokenize
+
+    by_doc: dict[str, list[EnrichedUnit]] = {}
+    for eu in units:
+        by_doc.setdefault(str(eu.document_id), []).append(eu)
+
+    overlaps: list[float] = []
+    shares: list[float] = []
+    for group in by_doc.values():
+        if len(group) < 2:
+            continue
+        contexts = []
+        for eu in group:
+            full, body = eu.indexing_text(), eu.unit.text
+            ctx = full[: max(0, len(full) - len(body))]
+            contexts.append(set(tokenize(ctx)))
+            shares.append(len(ctx) / max(1, len(full)))
+        for a, b in pairwise(contexts):
+            if a or b:
+                overlaps.append(len(a & b) / max(1, len(a | b)))
+
+    if not overlaps:
+        return []
+    mean_overlap = sum(overlaps) / len(overlaps)
+    mean_share = sum(shares) / len(shares) if shares else 0.0
+    if mean_overlap <= max_overlap:
+        return []
+    return [
+        f"context is {mean_overlap:.0%} identical between adjacent units of the same "
+        f"document and occupies {mean_share:.0%} of the indexed surface. That portion "
+        f"carries no signal for ranking one unit above its sibling, and it dilutes the "
+        f"terms that do. Make the context describe the chunk, not the document."
+    ]

@@ -36,9 +36,9 @@ from indexer.core.results import Hit, RankedList
 from indexer.core.stages import IndexQuery, IndexStatsView, IndexWriteReceipt, StageContext
 from indexer.core.unit import EnrichedUnit
 from indexer.impls.index_lexical import _jsonable, _passes
-from indexer.textutil import tokenize
 from indexer.io import atomic_write
 from indexer.plugin import StageImpl, dataclass_params
+from indexer.textutil import tokenize
 
 __all__ = ["HashEmbeddingIndex"]
 

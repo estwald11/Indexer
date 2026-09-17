@@ -189,3 +189,42 @@ class TestOpenParams:
 
         cfg = Config.model_validate(raw)
         assert cfg.ingestion.index.indexes[-1].params["hops"] == 3
+
+
+class TestOverridePurity:
+    """An ablation runner applies many arms to one snapshot of a config.
+
+    If applying an arm mutates that snapshot, every later arm inherits the
+    earlier one's overrides -- so the arms differ in ways their override lists
+    do not state, and every row of the delta table becomes unattributable. The
+    failure is silent: the numbers still look like numbers.
+    """
+
+    def test_overrides_do_not_mutate_the_input(self) -> None:
+        raw = load_mapping(REFERENCE)
+        before = json_snapshot(raw)
+        with_overrides(
+            raw,
+            {
+                "ingestion.index.indexes[lexical].enabled": False,
+                "query.route.paths.lookup.targets": ["dense"],
+                "ingestion.segment.max_tokens": 99,
+            },
+        )
+        assert json_snapshot(raw) == before
+
+    def test_two_arms_from_one_snapshot_are_independent(self) -> None:
+        raw = load_mapping(REFERENCE)
+        arm_a = with_overrides(raw, {"ingestion.index.indexes[dense].enabled": False})
+        arm_b = with_overrides(raw, {"ingestion.segment.max_tokens": 128})
+        a_dense = next(i for i in arm_a["ingestion"]["index"]["indexes"] if i["name"] == "dense")
+        b_dense = next(i for i in arm_b["ingestion"]["index"]["indexes"] if i["name"] == "dense")
+        assert a_dense["enabled"] is False
+        assert b_dense.get("enabled", True) is True  # arm A did not leak into arm B
+        assert arm_a["ingestion"]["segment"]["max_tokens"] != 128
+
+
+def json_snapshot(obj: object) -> str:
+    import json
+
+    return json.dumps(obj, sort_keys=True, default=str)
