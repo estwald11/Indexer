@@ -54,6 +54,22 @@ def main() -> int:
             f"cache_hits={st['cache_hits']:.0f} errors={st['errors']:.0f}"
         )
 
+    # ---- 1b. contract checks on the built corpus ------------------------
+    # Run before evaluating, because a golden set scored against a corpus whose
+    # provenance is broken produces numbers that look fine and mean nothing.
+    from indexer.eval.checks import check_context_specificity  # noqa: PLC0415
+
+    built_units = [
+        eu for uid in base.unit_store.all_ids() if (eu := base.unit_store.get(uid)) is not None
+    ]
+    ctx_problems = check_context_specificity(built_units)
+    say("== contract checks")
+    if ctx_problems:
+        for c in ctx_problems:
+            say(f"   WARN  {c}")
+    else:
+        say("   context specificity: OK")
+
     # ---- 2. golden set --------------------------------------------------
     if golden_path.exists() and not args.regenerate_golden:
         golden = load_golden_set(golden_path)
@@ -127,6 +143,7 @@ def main() -> int:
                     "bytes": res.manifest.corpus.bytes_parsed,
                 },
                 "golden": golden.stats(),
+                "contract_warnings": ctx_problems,
                 "wall_s": time.perf_counter() - t0,
                 "arms": [
                     {

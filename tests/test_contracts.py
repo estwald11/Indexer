@@ -223,3 +223,74 @@ class TestScopeDeclaration:
     def test_scopes_are_ordered_by_blast_radius(self) -> None:
         assert ContextScope.UNIT != ContextScope.DOCUMENT
         assert {s.value for s in ContextScope} == {"unit", "neighbors", "document", "corpus"}
+
+
+class TestContextSpecificity:
+    """Invariant 3's benefit needs context that distinguishes one chunk from another.
+
+    Context that repeats across a document's units cannot help rank one above
+    another, while it does dilute the terms that can. The symptom --
+    contextualisation not helping -- looks exactly like the enricher being
+    mis-wired, and the two have different fixes, so this is measured.
+    """
+
+    def _units(self, contexts: list[str], bodies: list[str]) -> list[EnrichedUnit]:
+        did = DocumentId("d1")
+        out = []
+        for i, (ctx, body) in enumerate(zip(contexts, bodies, strict=True)):
+            u = Unit(
+                unit_id=make_unit_id(did, hash_text(body), occurrence=i),
+                document_id=did,
+                text=body,
+                provenance=Provenance(document_id=did, span=Span(0, len(body))),
+            )
+            out.append(
+                EnrichedUnit(unit=u).with_enrichment(
+                    Enrichment(enricher="ctx", fingerprint="1", context=ctx)
+                )
+            )
+        return out
+
+    def test_identical_context_is_flagged(self) -> None:
+        from indexer.eval.checks import check_context_specificity
+
+        boiler = "The Acme Toolkit is a library for widgets. Topics: widgets, gears, bolts."
+        units = self._units(
+            [boiler] * 4,
+            ["alpha content here", "beta content here", "gamma content", "delta content"],
+        )
+        problems = check_context_specificity(units)
+        assert problems
+        assert "identical between adjacent units" in problems[0]
+
+    def test_chunk_specific_context_passes(self) -> None:
+        from indexer.eval.checks import check_context_specificity
+
+        units = self._units(
+            [
+                "Acme Toolkit, installation on Windows",
+                "Acme Toolkit, configuring the scheduler",
+                "Acme Toolkit, migration from version two",
+                "Acme Toolkit, troubleshooting network timeouts",
+            ],
+            ["alpha content here", "beta content here", "gamma content", "delta content"],
+        )
+        assert check_context_specificity(units) == []
+
+    def test_no_context_is_not_an_error(self) -> None:
+        """Contextualisation off is an ablation arm, not a violation."""
+        from indexer.eval.checks import check_context_specificity
+
+        did = DocumentId("d1")
+        units = [
+            EnrichedUnit(
+                unit=Unit(
+                    unit_id=make_unit_id(did, hash_text(t)),
+                    document_id=did,
+                    text=t,
+                    provenance=Provenance(document_id=did, span=Span(0, len(t))),
+                )
+            )
+            for t in ("one body", "two body", "three body")
+        ]
+        assert check_context_specificity(units) == []

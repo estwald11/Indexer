@@ -227,6 +227,15 @@ eval:
     # reproduce. Each encodes one hypothesis about why, so the explanation is
     # measured rather than asserted.
 
+    - name: 3b-hybrid-rerank
+      description: >-
+        No context, reranking on. The missing cell of the context x rerank 2x2:
+        without it, comparing a context arm that reranks against a no-context arm
+        that does not attributes the difference to the wrong stage.
+      overrides:
+        ingestion.enrich.enabled: false
+        query.rerank.enabled: true
+
     - name: 9-hybrid-weighted
       description: >-
         Hypothesis: equal RRF weights let a weak dense half outvote a strong
@@ -280,12 +289,26 @@ eval:
         ingestion.segment.params: { window_tokens: 400, overlap_tokens: 64 }
 
   sanity_checks:
-    - name: contextualisation cuts retrieval failures by ~1/3
+    # As originally written: verbose document-level context against no context,
+    # both without reranking. Kept, and expected to fail, because the failure is
+    # the finding -- see docs/ABLATION.md. Deleting a check that caught something
+    # would be deleting the evidence.
+    - name: contextualisation cuts retrieval failures by ~1/3 (verbose context)
       metric: retrieval_failure_rate
       baseline_arm: 3-hybrid-rrf
       treatment_arm: 5-hybrid-context
       expected_reduction: 0.33
       tolerance: 0.5
+
+    # The same question asked correctly: chunk-specific context, and holding
+    # reranking constant so the comparison isolates one stage.
+    - name: contextualisation cuts retrieval failures by ~1/3 (chunk-specific)
+      metric: retrieval_failure_rate
+      baseline_arm: 3b-hybrid-rerank
+      treatment_arm: 10-context-lean
+      expected_reduction: 0.33
+      tolerance: 0.5
+
     - name: reranking roughly halves them again
       metric: retrieval_failure_rate
       baseline_arm: 5-hybrid-context
