@@ -361,4 +361,10 @@ def _diagnose(observed: float, check: SanityCheck, baseline_value: float) -> str
             "indexer.eval.checks.check_index_surface against each index. Also check that "
             "gold spans still line up with the corpus (RelevantSpan.snippet)."
         )
-    return "larger than expected -- check the golden set is not leaking the treatment's own signal"
+    if abs(observed) > check.expected_reduction * (1 + check.tolerance):
+        return (
+            "larger than expected -- check the golden set is not leaking the treatment's own signal"
+        )
+    # Within tolerance: a passing check carries no diagnosis. Returning one here
+    # made every PASS in the JSON report read as a warning.
+    return ""

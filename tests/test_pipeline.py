@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import pytest
 
@@ -121,10 +123,10 @@ class TestEndToEnd:
         assert top.provenance.span.length > 0
         assert top.unit is not None
         # And the span really resolves to the text.
-        assert (
-            top.unit.unit.text in Path(top.provenance.source_uri.replace("file://", "")).read_text()
-            or top.unit.unit.text
-        )
+        # file:// URIs need url2pathname to round-trip on Windows, where a naive
+        # prefix strip leaves a leading slash in front of the drive letter.
+        source_path = Path(url2pathname(urlparse(top.provenance.source_uri).path))
+        assert top.unit.unit.text in source_path.read_text(encoding="utf-8")
 
     def test_manifest_records_what_built_the_index(self, workspace: Path) -> None:
         _, res = _build(workspace)

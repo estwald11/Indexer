@@ -27,10 +27,13 @@ Why retrieval failure rate is separate from recall
 --------------------------------------------------
 Recall@20 averages coverage. Retrieval failure rate counts the queries with
 **nothing** relevant in the top k -- the ones that cannot be answered no matter
-how good generation is. Invariant 1 is about those: retrieval failures drive
-11-46% of end-to-end errors while utilisation failures stay at 4-8%. A change
-that lifts mean recall from 0.71 to 0.74 while leaving the failure rate flat has
-improved nothing that matters, and only reporting both makes that visible.
+how good generation is. Invariant 1 is about those. The figures usually quoted
+(retrieval failures 11-46% of questions, utilisation failures 4-8%) come from
+one 2026 agent-memory study on LoCoMo (arXiv 2603.02473); the direction is
+confirmed by oracle-versus-retrieved gaps of 7-30 points across 2025-26 document
+benchmarks. A change that lifts mean recall from 0.71 to 0.74 while leaving the
+failure rate flat has improved nothing that matters, and only reporting both
+makes that visible.
 """
 
 from __future__ import annotations
@@ -104,9 +107,11 @@ def recall_at_k(grades: Sequence[int], total_relevant: int, k: int) -> float:
 def precision_at_k(grades: Sequence[int], k: int) -> float:
     """Fraction of the top k that is relevant.
 
-    ``precision_at_k(g, 5)`` is the headline: Precision@5 predicts answer
-    accuracy at r=0.98, which makes it the one retrieval number worth watching
-    when there is only room for one.
+    ``precision_at_k(g, 5)`` is the headline: in the invariant-1 study
+    (arXiv 2603.02473) it tracked answer accuracy at r=0.98 across nine
+    configurations. That is one study, not a law, but it is cheap and it points
+    the right way, which makes it the one retrieval number worth watching when
+    there is only room for one. nDCG@10 is what the 2025-26 benchmarks report.
 
     The denominator is ``k``, not ``len(grades[:k])``: a system returning three
     results of which two are relevant has not earned P@5 = 0.67.

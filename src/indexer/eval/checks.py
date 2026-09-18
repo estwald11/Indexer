@@ -155,25 +155,45 @@ def check_index_surface(
     should.
 
     Method: pick a unit whose prepended context contains a term absent from its
-    own text, search for that term, and require the unit to come back.
+    own text **and rare across the corpus**, search for that term, and require
+    the unit to come back.
+
+    Rarity is not optional. On a real corpus the first context-only term is
+    usually the document title or a section name shared by every unit of that
+    document -- on the PyPI-docs corpus it was "Changelog", present in 2,181 of
+    10,283 retrieval surfaces -- and no correct index can be expected to return
+    one particular unit in its top 50 for a term that common. The first run of
+    this check on that corpus reported both indexes as broken when both were
+    fine. So the probe is the context-only term with the lowest document
+    frequency over the retrieval surface, and the search depth is at least that
+    frequency.
     """
     problems: list[str] = []
+
+    def words(text: str) -> set[str]:
+        return {w.lower().strip(".,;:()") for w in text.split()}
+
+    # Document frequency over the surface every index is required to index.
+    df: dict[str, int] = {}
+    for u in units:
+        for w in words(u.indexing_text()):
+            df[w] = df.get(w, 0) + 1
+
     probe: EnrichedUnit | None = None
     term = ""
+    best_df = 0
     for u in units:
         ctx_text = u.indexing_text()[: -len(u.unit.text)] if u.unit.text else u.indexing_text()
-        body_words = {w.lower().strip(".,;:()") for w in u.unit.text.split()}
-        for w in ctx_text.split():
-            w = w.strip(".,;:()")
-            if len(w) > 5 and w.lower() not in body_words:
-                probe, term = u, w
-                break
-        if probe:
+        body_words = words(u.unit.text)
+        for w in words(ctx_text):
+            if len(w) > 5 and w not in body_words and (probe is None or df[w] < best_df):
+                probe, term, best_df = u, w, df[w]
+        if probe is not None and best_df == 1:
             break
     if probe is None:
         return ["cannot verify the retrieval surface: no enrichment adds a distinctive term"]
 
-    result = index.search(IndexQuery(text=term, top_k=50), ctx)
+    result = index.search(IndexQuery(text=term, top_k=max(50, best_df)), ctx)
     if probe.unit_id not in result.unit_ids():
         problems.append(
             f"index {index.name!r} did not return the unit whose *context* contains "

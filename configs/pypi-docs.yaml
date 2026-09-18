@@ -190,9 +190,28 @@ eval:
     - name: 4-hybrid-sectionpath
       description: Adds the heading trail only. The control for "does any prefix help?".
       overrides:
+        # Lists replace on overlay, so the field extractor has to be restated
+        # or this arm silently also removes the structured path -- which is
+        # what the first run of this ladder measured (route accuracy 0, every
+        # structured question failing). The arm must differ from arm 3 in the
+        # context enricher and nothing else.
         ingestion.enrich.enrichers:
           - impl: section_prefix
             scope: unit
+          - impl: regex_fields
+            scope: unit
+            params:
+              from_metadata: [package]
+              fields:
+                version:
+                  pattern: '\b(?:version|release)\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+                  type: str
+                version_major:
+                  pattern: '\b(?:version|release)\s+([0-9]+)\.[0-9]+'
+                  type: int
+                release_date:
+                  pattern: '\b(\d{4}-\d{2}-\d{2})\b'
+                  type: date
 
     - name: 5-hybrid-context
       description: Adds document-aware context. Invariant 3's arm.

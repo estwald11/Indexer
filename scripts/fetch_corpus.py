@@ -120,9 +120,7 @@ def wanted(name: str) -> bool:
     rest = "/".join(parts[1:])  # strip the sdist's top-level directory
     if any(rest.startswith(d) for d in DOC_DIRS):
         return True
-    if "/" not in rest and any(rest.startswith(r) for r in ROOT_DOCS):
-        return True
-    return False
+    return "/" not in rest and any(rest.startswith(r) for r in ROOT_DOCS)
 
 
 def extract(

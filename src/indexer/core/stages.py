@@ -646,12 +646,17 @@ class Reranker(Protocol):
         arm, or the ablation table has two rows that should agree and might not.
 
     Reference guidance
-        A cross-encoder (the BGE reranker family). Invariant 3's numbers put
-        reranking at 2.9% -> 1.9% top-20 failure after contextualisation.
-        **Avoid LLM-as-reranker on the simple path**: the majority of traffic
-        takes LOOKUP, and an LLM there spends the latency budget on the queries
-        that least need it. The seam is open (a reranker is just a reranker) but
-        the config's default binds an LLM reranker to the ITERATIVE path only.
+        A small pointwise reranker (a classic cross-encoder such as the BGE
+        family, or a sub-1B LLM-based pointwise model such as Qwen3-Reranker).
+        Invariant 3's numbers put reranking at 2.9% -> 1.9% top-20 failure after
+        contextualisation. **Keep listwise and reasoning rerankers off the
+        simple path**: the majority of traffic takes LOOKUP, they show no gain
+        over small rerankers on ordinary queries (ReasonRank, 2026: parity on
+        BEIR, large gains only on BRIGHT), and they spend the latency budget on
+        the queries that least need it. The seam is open (a reranker is just a
+        reranker) but the config's default binds them to the ITERATIVE path
+        only. On width: gains grow to roughly ``input_top_k=100`` and flatten
+        or reverse beyond it, so the width is tuned, not defaulted.
     """
 
     def rerank(self, query: Query, candidates: RankedList, ctx: StageContext) -> RankedList: ...

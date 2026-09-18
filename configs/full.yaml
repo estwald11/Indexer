@@ -28,6 +28,14 @@ ingestion:
       # Classify per document. A text-native PDF is an order of magnitude
       # cheaper to parse than a scan and there is no reason to pay scan prices
       # for the 80% of a corpus that does not need it.
+      #
+      # 2026 note (docs/STATE_OF_THE_ART.md §1): every top-ten entry on
+      # OmniDocBench v1.6 is an end-to-end vision-language parser under 2B
+      # parameters (PaddleOCR-VL-1.6, MinerU2.5-Pro, GLM-OCR). Docling's value
+      # is its lossless document model and table structure (Granite-Docling,
+      # TEDS 0.97 at 258M), not raw OCR; run one of those VLMs behind it for
+      # scans. Score a parser change on the golden set, not on character error
+      # rate: OCR accuracy does not predict retrieval accuracy (InduOCRBench).
       - when: { media_type: "application/pdf", text_layer: true }
         impl: pymupdf4llm
       - when: { media_type: "application/pdf", text_layer: false }
@@ -35,9 +43,9 @@ ingestion:
         params:
           ocr: true
       - when: { media_type: "application/pdf", complexity: high }
-        impl: llamaparse           # managed API; complex tables and scans
-        params:
-          api_key: ${env:LLAMAPARSE_API_KEY}
+        impl: llamaparse           # managed API; complex tables and scans.
+        params:                    # Mistral OCR 4 batch ($2/1k pages) is the
+          api_key: ${env:LLAMAPARSE_API_KEY}   # 2026 price point to compare.
       - when: { media_type: "text/markdown" }
         impl: markdown
     default:
@@ -89,7 +97,9 @@ ingestion:
     indexes:
       - name: lexical
         kind: lexical
-        impl: bm25              # SPLADE-v3 where the extra cost is earned
+        impl: bm25              # BM25 stays the always-on lexical leg; it beat
+                                # text-embedding-3-large outright on 23k financial
+                                # queries (Akarsu et al., 2026).
       - name: dense
         kind: dense
         impl: qdrant
@@ -99,9 +109,27 @@ ingestion:
           # Matryoshka-capable, so two-stage search stays available without
           # re-embedding the corpus later. Choosing a non-Matryoshka model here
           # is a decision that costs a full re-index to undo.
-          model: matryoshka-embed-v1
+          #
+          # 2026 open-weights value point: Qwen3-Embedding-4B (Apache-2.0, 32K
+          # context, MRL). Managed: voyage-4 / voyage-context-4, Gemini
+          # Embedding 2. int8 storage with float rescoring of the top 100 is
+          # lossless in practice (HAKARI-Bench). See STATE_OF_THE_ART.md §4.1.
+          model: Qwen/Qwen3-Embedding-4B
           dims: [256, 1024]
           prefetch_dim: 256
+          quantization: int8
+          rescore_top_k: 100
+      # A learned-sparse third leg. Off by default: fusion is only as good as
+      # its weakest leg ("Balancing the Blend", 2025), so this earns its place
+      # on the ablation table or not at all. Inference-free document-side
+      # models (OpenSearch neural-sparse v3-gte) make it near-free at query
+      # time; SPLADE-v3 is the reference where a query encoder is acceptable.
+      - name: sparse
+        kind: lexical
+        enabled: false
+        impl: neural_sparse
+        params:
+          model: opensearch-neural-sparse-encoding-doc-v3-gte
       - name: fields
         kind: structured
         impl: sqlite
@@ -112,13 +140,34 @@ ingestion:
       #
       # Off by default: decisive on slides, decks and scans, a loss on dense
       # scientific prose. Enable per corpus, and let the ablation decide.
+      #
+      # 2026 (ViDoRe v3): route per page rather than per corpus -- prose pages
+      # get text embeddings, table/figure/scan pages get page images, or both;
+      # fuse with the text legs and rerank with a *text* reranker, which is the
+      # largest single gain measured. Budget storage: late-interaction vectors
+      # are 100-2000x a single vector at full width; truncate to 128 dims,
+      # binarise, or use MUVERA encodings with MaxSim rescoring.
       - name: visual
         kind: visual
         enabled: false
         impl: colqwen
         params:
-          model: colqwen2.5
-          batch_size: 4
+          model: colqwen2.5          # ColModernVBERT (250M, CPU) or Nemotron
+          batch_size: 4              # ColEmbed V2 are the 2026 alternatives
+          token_dim: 128
+          binarize: true
+      # The fifth kind. A table-of-contents tree per long document with LLM
+      # node summaries (PageIndex-style, ~$0.001/page), for the long
+      # single-document analytical questions that chunk retrieval answers
+      # poorly. Vendor evidence only so far; the seam is here so that testing it
+      # is a config change.
+      - name: tree
+        kind: tree
+        enabled: false
+        impl: toc_tree
+        params:
+          model: claude-haiku-4-5-20251001
+          summary_tokens: 60
 
 query:
   route:
@@ -156,8 +205,16 @@ query:
     enabled: true
     impl: bge_reranker
     params:
+      # Small pointwise reranker on the simple path. bge-reranker-v2-m3 is the
+      # reference; Qwen3-Reranker-4B (Apache-2.0, 32K context) and
+      # jina-reranker-v3.5 are the 2026 open alternatives, Voyage rerank-2.5 and
+      # Cohere Rerank 4 the managed ones. Listwise / reasoning rerankers
+      # (ReasonRank) show no gain on ordinary queries and belong on the
+      # iterative path only. See STATE_OF_THE_ART.md §7.
       model: BAAI/bge-reranker-v2-m3
-    input_top_k: 50
+    # 100, not 50: reranking gains grow to about k=100 and flatten or reverse
+    # beyond it (compute-allocation study, 2026; "Drowning in Documents").
+    input_top_k: 100
     output_top_k: 10
 
 accounting:
