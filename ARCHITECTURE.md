@@ -216,6 +216,26 @@ frame does not require hybrid — `dense-only` and `lexical-only` are two of the
 six arms in `configs/reference.yaml` precisely so this can be checked rather
 than assumed.
 
+**What measuring it added to the contract.** On the ablation corpus, hybrid was
+*worse* than its lexical half alone: 7.5% top-20 failure for BM25, 47.4% for the
+dense index, 13.8% fused with equal RRF weights. Down-weighting dense to 0.25
+recovered it to 12.0%, but never past lexical alone.
+
+This does not refute the invariant — the dense arm here is a hashing trick, not
+an embedding model, so it contributes noise rather than complementary semantics.
+What it shows is the mechanism, and the mechanism generalises: **RRF assumes the
+lists it fuses are of comparable quality.** With `k=60` and 50 candidates per
+list, an irrelevant document at rank 1 of the weak list scores `1/61 = 0.0164`,
+which outranks a relevant document at rank 10 of the strong list (`1/70 =
+0.0143`). A bad retriever does not merely fail to help; it actively displaces a
+good one's mid-ranked hits.
+
+So the contract note on `Fuser`: **weights are not a tuning nicety, they are how
+a hybrid survives one half being worse than the other.** Equal weights are a
+claim that both halves are equally trustworthy, and that claim should be checked
+before it is made. `configs/*.yaml` ship equal weights because that is the right
+*prior*; the ablation is how a corpus corrects it.
+
 ---
 
 ## Invariant 5 — structured, numeric and temporal questions must never reach vector search
