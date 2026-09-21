@@ -211,66 +211,132 @@ class HeuristicBootstrapper(StageImpl):
         available without vector search. That is the point: these items are how
         invariant 5 becomes measurable, and a golden set without them cannot see
         a router regression at all.
+
+        Two mistakes are easy here and both were made in an earlier version:
+
+        *A comparison at the edge of the data.* "release date before <the
+        earliest date>" matches nothing, so the item scores as a retrieval
+        failure no matter how well the system works. Thresholds are drawn from
+        the interior of the observed range, and every generated item is checked
+        against the actual values before it is kept.
+
+        *A query that does not name what it asks about.* "how many entries have
+        a package recorded" is the same sentence whatever package was sampled,
+        so sixteen sampled packages produced sixteen identical queries measuring
+        one thing sixteen times -- and none of them could be judged, because the
+        answer recorded was a package name the question never mentions.
+        Categorical fields now ask for a specific value, which makes the items
+        distinct and the answer checkable.
         """
         with_fields = [u for u in units if u.fields()]
         if not with_fields:
             return []
         n_want = int(want * float(self.param("structured_share", 0.2)))
-        out: list[GoldenQuery] = []
-        by_field: dict[str, list[EnrichedUnit]] = {}
-        for u in with_fields:
-            for k in u.fields():
-                by_field.setdefault(k, []).append(u)
+        if n_want <= 0:
+            return []
 
-        # Spread the structured budget across the available fields rather than
-        # capping at a handful. A slice of three queries cannot detect a router
-        # regression -- one misroute moves it by 33 points.
+        by_field: dict[str, list[Any]] = {}
+        for u in with_fields:
+            for k, v in u.fields().items():
+                if v is not None:
+                    by_field.setdefault(k, []).append(v)
+
+        out: list[GoldenQuery] = []
+        seen_queries: set[str] = set()
         per_field = max(1, n_want // max(1, len(by_field)))
-        for field_name, holders in sorted(by_field.items()):
+
+        for field_name, values in sorted(by_field.items()):
             if len(out) >= n_want:
                 break
-            sample = rng.sample(holders, min(per_field, len(holders)))
-            seen_values: set[str] = set()
-            for eu in sample:
-                if len(out) >= n_want:
-                    break
-                value = eu.fields()[field_name]
-                # One query per distinct value: twenty copies of "which entries
-                # have a version recorded" measure one thing twenty times.
-                if str(value) in seen_values:
+            pretty = field_name.replace("_", " ")
+            for q, answer, qt in self._field_questions(field_name, pretty, values, per_field, rng):
+                if len(out) >= n_want or q in seen_queries:
                     continue
-                seen_values.add(str(value))
-                pretty = field_name.replace("_", " ")
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    q = f"which entries have {pretty} greater than {value}"
-                    qt = QueryType.NUMERIC
-                elif hasattr(value, "isoformat"):
-                    q = f"which entries have {pretty} before {value}"
-                    qt = QueryType.TEMPORAL
-                else:
-                    q = f"how many entries have a {pretty} recorded"
-                    qt = QueryType.STRUCTURED
+                seen_queries.add(q)
                 out.append(
                     GoldenQuery(
                         id=f"s{len(out):04d}-{field_name[:10]}",
                         query=q,
-                        relevant=(
-                            RelevantSpan(
-                                document_id=DocumentId(eu.document_id),
-                                span=eu.unit.provenance.span,
-                                weight=3,
-                                snippet=eu.unit.text[:160],
-                            ),
-                        ),
+                        # Structured answers are aggregates over the corpus, not
+                        # passages, so there is no single gold span. The empty
+                        # tuple says so; retrieval metrics report as
+                        # not-applicable and correctness is judged on the answer.
+                        relevant=(),
                         query_type=qt,
-                        answer=str(value),
-                        answer_type="number" if isinstance(value, (int, float)) else "text",
+                        answer=answer,
+                        answer_type="number" if isinstance(answer, (int, float)) else "text",
                         origin=GoldOrigin.BOOTSTRAP,
                         generator=self.fingerprint().key(),
                         tags=("structured", field_name),
                     )
                 )
         return out
+
+    def _field_questions(
+        self,
+        field_name: str,
+        pretty: str,
+        values: Sequence[Any],
+        limit: int,
+        rng: random.Random,
+    ) -> list[tuple[str, Any, QueryType]]:
+        """Questions this field can answer, each guaranteed a non-empty result."""
+        out: list[tuple[str, Any, QueryType]] = []
+        numeric = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        dated = [v for v in values if hasattr(v, "isoformat")]
+        textual = [v for v in values if isinstance(v, str)]
+
+        if numeric:
+            ordered = sorted(numeric)
+            # Thresholds from the interior: strictly below the maximum, so
+            # "greater than" always matches something.
+            for t in _interior(ordered, limit, rng):
+                if t < ordered[-1]:
+                    out.append(
+                        (f"which entries have {pretty} greater than {t}", None, QueryType.NUMERIC)
+                    )
+        if dated:
+            ordered = sorted(dated)
+            # Strictly above the minimum, so "before" always matches something.
+            for t in _interior(ordered, limit, rng):
+                if t > ordered[0]:
+                    out.append(
+                        (
+                            f"which entries have {pretty} before {t.isoformat()}",
+                            None,
+                            QueryType.TEMPORAL,
+                        )
+                    )
+        if textual:
+            counts: dict[str, int] = {}
+            for v in textual:
+                counts[v] = counts.get(v, 0) + 1
+            # Most frequent first: a value seen once is a weaker test of the
+            # structured path than one the corpus actually groups by.
+            common = [v for v, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+            for v in common[:limit]:
+                out.append((f"which entries have {pretty} {v}", v, QueryType.STRUCTURED))
+            if common:
+                out.append(
+                    (f"how many distinct {pretty} values are recorded", None, QueryType.STRUCTURED)
+                )
+        rng.shuffle(out)
+        return out[: limit + 1]
+
+
+def _interior(ordered: Sequence[Any], k: int, rng: random.Random) -> list[Any]:
+    """Sample thresholds from inside a sorted range, never its endpoints.
+
+    A comparison against the minimum or maximum of the observed data matches
+    everything or nothing, and either way measures the data rather than the
+    system.
+    """
+    if len(ordered) < 3:
+        return list(ordered[:1])
+    lo, hi = len(ordered) // 6, len(ordered) - max(1, len(ordered) // 6)
+    interior = ordered[lo:hi] or ordered
+    picks = rng.sample(list(interior), min(k, len(interior)))
+    return sorted(set(picks))
 
 
 def _subject_of(doc: ParsedDocument) -> str:

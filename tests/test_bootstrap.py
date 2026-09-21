@@ -253,3 +253,86 @@ class TestGoldenRoundTrip:
         back = load_golden_set(path)
         assert back.queries[0].lexical_overlap is None
         assert back.queries[0].overlap() == pytest.approx(2 / 3)  # read, timeout of 3 terms
+
+
+class TestStructuredItemQuality:
+    """The structured slice is how invariant 5 is measured. Items that cannot
+    distinguish a working router from a broken one make the headline finding
+    rest on nothing."""
+
+    def _units(self):
+        from datetime import date
+
+        from indexer.core.ids import DocumentId, hash_text, make_unit_id
+        from indexer.core.provenance import Provenance, Span
+        from indexer.core.unit import EnrichedUnit, Enrichment, Unit
+
+        out = []
+        packages = ["flask"] * 4 + ["click"] * 3 + ["attrs"] * 2 + ["six"]
+        for i, pkg in enumerate(packages):
+            text = f"unit {i} about {pkg} configuration and behaviour"
+            did = DocumentId(f"d{i}")
+            u = Unit(
+                unit_id=make_unit_id(did, hash_text(text), occurrence=i),
+                document_id=did,
+                text=text,
+                provenance=Provenance(document_id=did, span=Span(0, len(text))),
+            )
+            out.append(
+                EnrichedUnit(unit=u).with_enrichment(
+                    Enrichment(
+                        enricher="f",
+                        fingerprint="1",
+                        fields={
+                            "package": pkg,
+                            "version_major": i,
+                            "release_date": date(2015 + i, 1, 1),
+                        },
+                    )
+                )
+            )
+        return out
+
+    def _items(self):
+        import random
+
+        from indexer.eval.bootstrap import HeuristicBootstrapper
+
+        boot = HeuristicBootstrapper({"structured_share": 1.0})
+        return boot._structured_items(self._units(), random.Random(7), want=24)
+
+    def test_queries_are_distinct(self) -> None:
+        """Sixteen copies of one sentence measure one thing sixteen times."""
+        items = self._items()
+        texts = [q.query for q in items]
+        assert len(set(texts)) == len(texts), f"duplicate queries: {texts}"
+
+    def test_comparisons_are_never_at_the_edge_of_the_data(self) -> None:
+        """A threshold at the min or max matches nothing or everything, and
+        scores the data rather than the system."""
+        import re
+        from datetime import date
+
+        items = self._items()
+        majors = [i for i in range(10)]
+        dates = [date(2015 + i, 1, 1) for i in range(10)]
+        for q in items:
+            m = re.search(r"greater than (\d+)", q.query)
+            if m:
+                assert int(m.group(1)) < max(majors), q.query
+            m = re.search(r"before (\d{4}-\d{2}-\d{2})", q.query)
+            if m:
+                assert date.fromisoformat(m.group(1)) > min(dates), q.query
+
+    def test_categorical_questions_name_the_value_they_ask_for(self) -> None:
+        """Otherwise the item cannot be judged: the recorded answer is a value
+        the question never mentions."""
+        items = [q for q in self._items() if q.answer is not None]
+        assert items
+        for q in items:
+            assert str(q.answer) in q.query, (q.query, q.answer)
+
+    def test_structured_items_carry_no_gold_span(self) -> None:
+        """An aggregate over the corpus has no single passage to cite, so span
+        metrics report not-applicable rather than a fabricated zero."""
+        assert all(q.relevant == () for q in self._items())
