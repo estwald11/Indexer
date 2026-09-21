@@ -115,8 +115,9 @@ assume, what it must preserve, and what its minimal implementation looks like.
 ## Development
 
 ```bash
-pytest                       # 149 tests: contracts, config, pipeline, embedders, golden sets, SQL conformance, layering
-ruff check src tests && mypy # lint and strict types
+pytest                       # contracts, config, pipeline, durability, embedders,
+                             # golden sets, SQL conformance, layering
+ruff check src tests scripts && mypy   # lint and strict types
 ```
 
 Three layering rules are enforced by tests rather than convention:

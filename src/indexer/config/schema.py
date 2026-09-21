@@ -192,6 +192,13 @@ class IngestionConfig(_Base):
     segment: SegmentConfig
     enrich: EnrichConfig = Field(default_factory=lambda: EnrichConfig())
     index: IndexConfig
+    #: Documents between durability checkpoints, and therefore the unit of
+    #: resumability: an interrupted build resumes at the last checkpoint, not at
+    #: the last document. Lower costs more flushes; higher risks more rework
+    #: after a crash. It is not "how often to save" -- a ledger record is only
+    #: written once the indexes holding that document are durable, so this is
+    #: exactly how much work a crash can cost.
+    checkpoint_every: Annotated[int, Field(ge=1)] = 200
 
 
 # --------------------------------------------------------------------------- #

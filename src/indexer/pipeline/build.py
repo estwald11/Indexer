@@ -225,6 +225,7 @@ class Assembly:
             parse_enabled=c.ingestion.parse.enabled,
             on_document_error=c.ingestion.parse.on_error,
             index_batch_size=c.ingestion.index.batch_size,
+            checkpoint_every=c.ingestion.checkpoint_every,
         )
 
     def query_engine(self) -> QueryEngine:

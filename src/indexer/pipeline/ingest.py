@@ -26,11 +26,11 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from indexer.core.accounting import CacheOutcome, InMemoryAccountant
+from indexer.core.accounting import Accountant, CacheOutcome, InMemoryAccountant
 from indexer.core.cache import CacheStore, cache_key
 from indexer.core.document import ParsedDocument, SourceDocument
 from indexer.core.errors import ContractViolation, DocumentError
@@ -317,11 +317,11 @@ class IngestionPipeline:
                 )
             )
             if len(pending_records) >= self.checkpoint_every:
-                self._checkpoint(pending_records)
+                self._checkpoint(pending_records, accountant)
 
         # Final checkpoint: everything still buffered becomes durable, and only
         # then are the remaining documents recorded as done.
-        self._checkpoint(pending_records)
+        self._checkpoint(pending_records, accountant)
 
         if confidences:
             stats.mean_reading_order_confidence = sum(confidences) / len(confidences)
@@ -345,7 +345,9 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------- internals
 
-    def _checkpoint(self, pending: list[DocumentRecord]) -> None:
+    def _checkpoint(
+        self, pending: list[DocumentRecord], accountant: Accountant | None = None
+    ) -> None:
         """Make index state durable, then record the documents it covers.
 
         The order is the whole point. Flushing after committing the ledger makes
@@ -353,10 +355,24 @@ class IngestionPipeline:
         first makes every committed record backed by bytes on disk. A crash in
         between costs a redundant reprocess of the checkpoint's documents, which
         is the correct failure: too much work, never too little.
+
+        The flush is measured. For most indexes it is a file write, but an index
+        that defers real work to commit time -- an SVD embedder fits its
+        projection there -- can spend more in flush than in every stage
+        combined. Leaving that outside the accounting reported such a build as
+        "6% in stages" with no indication of where the rest went.
         """
-        for idx in self.indexes.values():
-            if isinstance(idx, Flushable):
+        for name, idx in self.indexes.items():
+            if not isinstance(idx, Flushable):
+                continue
+            if accountant is None:
                 idx.flush()
+                continue
+            fp = replace(idx.fingerprint(), stage="index.flush")
+            with accountant.measure(fp) as run:
+                idx.flush()
+                run.attrs = {"index": name}
+                run.items_in = len(pending)
         self.unit_store.flush()
         for record in pending:
             self.ledger.put(record)

@@ -257,3 +257,13 @@ class TestInertStructuredPath:
         cfg, _ = load(REFERENCE)
         assembly = assemble(REFERENCE)
         assert assembly._field_lexicon() == cfg.extracted_field_names()
+
+
+def test_checkpoint_interval_is_configurable() -> None:
+    """Resumability granularity is an operational choice, not a constant."""
+    from indexer.pipeline.build import assemble
+
+    cfg, _ = load(REFERENCE)
+    assert cfg.ingestion.checkpoint_every == 200
+    a = assemble(REFERENCE, overrides={"ingestion.checkpoint_every": 25})
+    assert a.ingestion().checkpoint_every == 25

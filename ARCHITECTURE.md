@@ -465,6 +465,37 @@ file *before* validation, so a default is never expanded -- and the literal
 string created a directory named `${paths.store}`. Defaults now resolve in the
 assembler. The general rule: **anything interpolated must come from the file.**
 
+**The ledger claimed work the indexes had not made.** A record asserts a
+document is processed and the next build believes it — skipping the document,
+so its units are never written. Committing that record before flushing the
+indexes that hold the document makes the assertion a lie whenever the process
+dies in between, and killing a build mid-run proved it: a ledger asserting 493
+processed documents over indexes holding none, a resumed build that skipped all
+493, and an arm reporting a plausible 0.952 failure rate instead of an error.
+
+Builds now checkpoint — flush the indexes and unit store, *then* commit the
+buffered ledger records. The unit of resumability becomes the checkpoint rather
+than the document, which is the honest trade and is stated rather than implied.
+A crash between the two costs a redundant reprocess: too much work, never too
+little.
+
+The general rule, for anything added later that persists build state: **flush
+what holds the data, then record that you hold it.** The reverse ordering fails
+in the one shape that is hardest to notice — the next run looks like it worked.
+
+**A structured index answered text queries with arbitrary rows.** `search()`
+ignored the query text and returned the first k units by id, scored 1.0 — the
+same rows for every query, entering RRF with the weight of a genuine rank-1
+hit. Not a weak signal but a *constant* one, displacing real top hits
+identically across an entire query set. It surfaced in the no-router arm, where
+every index is asked everything.
+
+A structured index has no text ranking. With a filter it can still say which
+rows match; with none there is neither constraint nor ranking, so it now returns
+nothing. The contract note: **an index that cannot rank a query must return
+empty rather than something.** An empty list costs a fuser nothing; a confident
+wrong one costs it the top of the ranking.
+
 **Per-stage accounting had 29% coverage, and that was the bug.** The manifest
 summed 21s of stage time inside a 73s build and said nothing about the other
 52s, because accounting only measured what was inside a stage. Printing the
