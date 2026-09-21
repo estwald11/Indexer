@@ -182,13 +182,28 @@ class SqliteStructuredIndex(StageImpl):
     # ------------------------------------------------------------------- read
 
     def search(self, query: IndexQuery, ctx: StageContext) -> RankedList:
-        """Filter-only retrieval.
+        """Filter-only retrieval. **Empty when there is nothing to filter on.**
 
-        A structured index has no notion of relevance ranking -- rows either
-        match or do not -- so hits come back in a stable, documented order
-        (unit id) rather than a fabricated score order. Returning arbitrary
-        scores here would let a fuser weight them as though they meant something.
+        A structured index has no text ranking: it cannot say which of two rows
+        better answers a sentence. With a filter it can still say which rows
+        match, and those come back in a stable, documented order (unit id)
+        rather than a fabricated score order.
+
+        With *no* filter there is neither a constraint nor a ranking, and the
+        honest answer is nothing. Returning "the first k rows" instead looks
+        like a result and is not one: the rows are the same for every query, so
+        fusion receives a constant list of arbitrary units carrying the same
+        rank-1 weight as a real top hit, and it displaces genuine matches in
+        exactly the same way for every query in the set. An empty list costs a
+        fuser nothing; a confident wrong list costs it the top of the ranking.
         """
+        if query.filters is None and query.unit_ids is None:
+            return RankedList(
+                hits=(),
+                source=self.name,
+                query_text=query.text,
+                fingerprint=self.fingerprint().key(),
+            )
         where: str = ""
         params: list[Any] = []
         if query.filters is not None:
@@ -196,6 +211,18 @@ class SqliteStructuredIndex(StageImpl):
         sql = "SELECT * FROM units"
         if where:
             sql += f" WHERE unit_id IN (SELECT unit_id FROM units WHERE {where})"
+        if query.unit_ids is not None:
+            ids = list(query.unit_ids)
+            if not ids:
+                return RankedList(
+                    hits=(),
+                    source=self.name,
+                    query_text=query.text,
+                    fingerprint=self.fingerprint().key(),
+                )
+            placeholders = ", ".join("?" for _ in ids)
+            sql += (" AND " if where else " WHERE ") + f"unit_id IN ({placeholders})"
+            params = [*params, *ids]
         sql += " ORDER BY unit_id LIMIT ?"
         rows = self._conn.execute(sql, [*params, query.top_k]).fetchall()
         return RankedList(
@@ -267,6 +294,13 @@ class SqliteStructuredIndex(StageImpl):
             ),
             fingerprint=self.fingerprint().key(),
         )
+
+    def all_unit_ids(self) -> list[UnitId]:
+        """Every unit id, ascending. Used by tests and by ablation tooling."""
+        return [
+            UnitId(r["unit_id"])
+            for r in self._conn.execute("SELECT unit_id FROM units ORDER BY unit_id")
+        ]
 
     def stats(self) -> IndexStatsView:
         n = self._conn.execute("SELECT COUNT(*) c FROM units").fetchone()["c"]

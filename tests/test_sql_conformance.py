@@ -175,3 +175,39 @@ class TestInjection:
         assert rs.rows == ()
         # the table is still there
         assert index.stats().unit_count == len(ROWS)
+
+
+class TestUnfilteredSearchIsEmpty:
+    """A structured index has no text ranking, so an unfiltered text search must
+    return nothing rather than arbitrary rows.
+
+    The rows it used to return were the first k by unit id -- identical for
+    every query, each carrying rank-1 weight into fusion. That is not a weak
+    signal, it is a constant one, and it displaces real top hits the same way
+    for every query in a set. It surfaced in the no-router arm, where routing is
+    off and every index is queried for everything.
+    """
+
+    def test_unfiltered_text_search_returns_nothing(self, index: SqliteStructuredIndex) -> None:
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rl = index.search(IndexQuery(text="flask sessions cookies", top_k=10), ctx)
+        assert rl.hits == ()
+
+    def test_filtered_search_still_returns_matches(self, index: SqliteStructuredIndex) -> None:
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rl = index.search(
+            IndexQuery(text="", top_k=10, filters=Compare("version_major", Op.GT, 7)), ctx
+        )
+        assert len(rl.hits) == 2
+
+    def test_unit_id_restriction_is_honoured(self, index: SqliteStructuredIndex) -> None:
+        """The iterative path and rerank candidate sets narrow by unit id."""
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        everything = index.structured_query(
+            StructuredQuery(where=Exists("package"), select=("package",)), ctx
+        )
+        assert everything.rows
+        some = index.search(
+            IndexQuery(text="", top_k=10, unit_ids=[u for u in index.all_unit_ids()[:2]]), ctx
+        )
+        assert len(some.hits) == 2
