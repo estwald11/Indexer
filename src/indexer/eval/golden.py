@@ -108,10 +108,51 @@ class GoldenQuery:
     difficulty: str = ""
     tags: tuple[str, ...] = field(default_factory=tuple)
     notes: str = ""
+    #: Fraction of the query's content words that occur in the gold passage,
+    #: measured by the generator against the full unit text. See ``overlap``.
+    lexical_overlap: float | None = None
+    #: The query this one was rewritten from, when a generator paraphrases.
+    #: Kept because the pair is the measurement: a retriever that finds the
+    #: source form and not this one is telling you it matched words rather than
+    #: meaning, and without the source form that is invisible.
+    source_query: str = ""
 
     @property
     def verified(self) -> bool:
         return self.origin in (GoldOrigin.BOOTSTRAP_VERIFIED, GoldOrigin.HUMAN)
+
+    @property
+    def paraphrased(self) -> bool:
+        return bool(self.source_query) and self.source_query != self.query
+
+    def overlap(self) -> float:
+        """How much of this query is lifted verbatim from the passage it seeks.
+
+        The number that says what a golden set can and cannot measure. Near 1.0,
+        a lexical retriever is being scored on precisely what it does and no
+        item *requires* matching meaning -- which caps every dense arm evaluated
+        against the set, a neural bi-encoder included. Near 0, the set is asking
+        retrievers to bridge vocabulary, which is the thing dense retrieval
+        exists for.
+
+        Prefers ``lexical_overlap`` when the generator recorded it, because only
+        the generator has the full passage: ``RelevantSpan.snippet`` is
+        truncated for file size, and measuring against it understates the real
+        overlap roughly twofold. The snippet estimate is the fallback for items
+        that predate the field.
+
+        NaN when there is nothing to compare against -- zero would read as "no
+        overlap" rather than "cannot tell".
+        """
+        if self.lexical_overlap is not None:
+            return self.lexical_overlap
+        from indexer.textutil import STOPWORDS, tokenize
+
+        terms = {t for t in tokenize(self.query) if len(t) > 2 and t not in STOPWORDS}
+        gold = " ".join(r.snippet for r in self.relevant if r.snippet)
+        if not terms or not gold.strip():
+            return float("nan")
+        return len(terms & set(tokenize(gold))) / len(terms)
 
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
@@ -153,6 +194,8 @@ class GoldenQuery:
             difficulty=d.get("difficulty", ""),
             tags=tuple(d.get("tags", ())),
             notes=d.get("notes", ""),
+            source_query=d.get("source_query", ""),
+            lexical_overlap=d.get("lexical_overlap"),
         )
 
 
@@ -203,7 +246,25 @@ class GoldenSet:
                 if self.queries
                 else 0.0
             ),
+            "paraphrased": sum(1 for q in self.queries if q.paraphrased),
+            "lexical_overlap": self.mean_lexical_overlap(),
         }
+
+    def mean_lexical_overlap(self) -> float:
+        """Mean ``GoldenQuery.overlap`` over the items that have one.
+
+        Report this next to every retrieval number the set produces. A set at
+        1.0 cannot distinguish a retriever that matches words from one that
+        matches meaning, however good either is, and a dense arm losing against
+        BM25 on such a set is weak evidence about the retriever and strong
+        evidence about the set.
+        """
+        vals = [v for q in self.queries if not _isnan(v := q.overlap())]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _isnan(x: float) -> bool:
+    return x != x
 
 
 def load_golden_set(path: str | Path) -> GoldenSet:

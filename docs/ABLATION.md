@@ -50,10 +50,13 @@ matter more than expected — see the first finding.
 
 **The golden set is lexically constructed, and that caps every dense arm.**
 `_distinctive_terms` draws each query's detail terms from the target unit's own
-text, so every query is a bag of words that literally occurs in the passage it
-is looking for. BM25 is therefore scored on precisely what it does, and no query
-in the set *requires* matching meaning rather than words. This is not a flaw in
-the generator — it was built to test contextualisation, and for that the
+text. Measured: those detail terms occur verbatim in the gold passage **91%** of
+the time, the subject term **45%** (it comes from the package name, by design,
+so contextualisation has something to fix), **75%** overall, and 44% of queries
+are covered completely. `GoldenSet.mean_lexical_overlap` reports it beside every
+run. BM25 is therefore scored close to precisely what it does, and few items in
+the set *require* matching meaning rather than words. This is not a flaw in the
+generator — it was built to test contextualisation, and for that the
 construction is right — but it is a ceiling on the dense arms, and it binds a
 neural bi-encoder exactly as hard as it binds the two embedders measured here.
 
@@ -162,3 +165,60 @@ on orthography rather than topic. They are off by default for that reason.
 These sweep numbers come from a standalone harness over the same index and
 golden set rather than from ablation arms, so they are directionally comparable
 with the table above but were scored without the router in front of them.
+
+## Paraphrasing the set: what was tried, and what it cost
+
+The ceiling above is a property of the queries, so the next experiment is
+queries that ask for the passage instead of quoting it. Four surface transforms
+were tried first, because they need no model and would have been free. All four
+were applied to the same 333 items and scored dense-only against BM25 and
+against LSA at `dim=512`:
+
+| transform | bm25 fail@20 | svd fail@20 | gap | example |
+|---|---|---|---|---|
+| none | 0.165 | 0.414 | -0.249 | `sqlalchemy collection eager loader` |
+| question framing | 0.267 | 0.492 | -0.225 | `how do i sqlalchemy collection eager loader` |
+| drop rarest term | 0.532 | 0.706 | -0.174 | `sqlalchemy collection eager` |
+| re-inflect terms | 0.646 | 0.784 | -0.138 | `sqlalchemy collections eager loaders` |
+| inflect + question | 0.718 | 0.832 | -0.114 | `how do i sqlalchemy collections eager loaders` |
+
+**None of them is a paraphrase.** Each makes both arms worse, and the gap
+narrows only because everything degrades; the ordering of the arms never
+changes. The reason is structural, and it is worth stating because it rules out
+a whole family of ideas: the offline dense arms here are bag-of-words methods
+too. A word the corpus does not contain — which is what re-inflection produces,
+since neither `tokenize` nor BM25 stems — is exactly as opaque to LSA as to
+BM25. Dropping a term removes information from both. Question framing adds
+stopwords, which both discard.
+
+A useful rewrite has to substitute vocabulary the corpus *does* contain, in the
+sense the passage means. Two sources could supply that:
+
+*A human lexicon.* WordNet would do it, and it is retriever-independent, which
+matters: a substitution drawn from a distributional model would favour
+distributional retrievers by construction, and the LSA arm would win a
+comparison it had helped set up. No WordNet data is reachable here — the `wn`
+package is the library, and its data downloads from a host the egress policy
+denies.
+
+*A language model.* `LLMBootstrapper` (`eval/bootstrap.py`), registered as
+`llm_bootstrap`, which `configs/full.yaml` already named. It rewrites each
+heuristic item into the query someone would type before they knew the passage's
+vocabulary, records the literal form as `source_query`, and stores the resulting
+overlap per item. **It needs an API key and there is none in this environment,
+so no run of it appears in this report.**
+
+The ordering inside it is the part worth reviewing rather than the prompt.
+Answerability is screened on the *literal* query, before the rewrite, using the
+same lexical baseline `HeuristicBootstrapper` uses. Screening after the rewrite
+is the trap: a lexical baseline rejects a successfully paraphrased query as
+"unfindable", which is precisely the property that made it worth generating, and
+the resulting set looks carefully filtered while having discarded everything it
+existed to add. A rewrite that comes back still sharing more than `max_overlap`
+of the passage's vocabulary is tagged `paraphrase_echoed` rather than silently
+kept, for the same reason.
+
+Because the rewriter composes the heuristic generator rather than replacing it,
+the two sets share candidates, filters and gold spans exactly. The only
+difference between them is the wording of the queries, which is what makes
+"paraphrasing the set changed the arms by X" a controlled statement.

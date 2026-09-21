@@ -16,8 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import indexer.eval.bootstrap  # noqa: E402,F401  -- imported for its registrations
 from indexer.config.loader import load  # noqa: E402
-from indexer.eval.bootstrap import HeuristicBootstrapper  # noqa: E402
+from indexer.core.registry import resolve  # noqa: E402
 from indexer.eval.golden import load_golden_set, write_golden_set  # noqa: E402
 from indexer.eval.judge import ContainmentJudge  # noqa: E402
 from indexer.eval.metrics import Matcher  # noqa: E402
@@ -91,10 +92,14 @@ def main() -> int:
         ]
         say(f"   {len(docs)} parsed docs, {len(units)} units")
 
+        # Resolved by name like every other stage. Hardcoding the heuristic
+        # generator here made `eval.bootstrap.impl` a config key that silently
+        # did nothing -- including in configs/full.yaml, which names
+        # `llm_bootstrap` and was getting the heuristic one.
         spec = cfg.eval.bootstrap
-        boot = HeuristicBootstrapper(
-            HeuristicBootstrapper({}).fingerprint() and (spec.params if spec else {})
-        )
+        reg = resolve("bootstrap", spec.impl if spec else "heuristic")
+        say(f"   generator: {reg.stage}/{reg.name}")
+        boot = reg.build(spec.params if spec else {})
         golden = boot.bootstrap(docs, units, baseline=base.indexes.get("lexical"))
         write_golden_set(golden, golden_path)
         say(f"   wrote {len(golden)} queries -> {golden_path}")

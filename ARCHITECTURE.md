@@ -261,14 +261,17 @@ at all.
 
 What that leaves is a second explanation, and it is the golden set rather than
 the embedder. `HeuristicBootstrapper` draws each query's detail terms from the
-target unit's own text (`_distinctive_terms`), so every query is a bag of words
-that literally occurs in the passage it is looking for. A retriever that matches
-words is being scored on exactly what it does; a retriever that matches *meaning*
-has no query here that requires it. That ceiling binds a neural bi-encoder as
-hard as it binds LSA, and no dense implementation can be measured past it. **To
+target unit's own text (`_distinctive_terms`), and measuring it says how far
+that goes: **the detail terms occur verbatim in the gold passage 91% of the
+time**, the subject term only 45% (it comes from the package name, deliberately,
+so contextualisation has something to fix), and 44% of queries are covered
+completely. `GoldenSet.mean_lexical_overlap` now reports this, because a
+retrieval number without it cannot be read: a set this lexical scores a word
+matcher on exactly what it does, and few of its items *require* matching
+meaning. That ceiling binds a neural bi-encoder as hard as it binds LSA. **To
 test invariant 4 properly this corpus needs paraphrased queries, not a better
-embedder** — which is a bootstrapper change, and is left open rather than
-guessed at.
+embedder** — which is a bootstrapper change. `LLMBootstrapper` is that
+change; what it cost to get right is below.
 
 ---
 

@@ -27,7 +27,7 @@ names one.
 | `src/indexer/pipeline/` | Ingestion and query orchestrators. Where the contracts are enforced. |
 | `src/indexer/impls/` | Reference implementations, two or more per stage. |
 | `src/indexer/impls/embed.py` | The embedder seam: hashing, LSA, and a neural bi-encoder behind one store. |
-| `src/indexer/eval/` | Golden-set format, metrics, bootstrapper, ablation runner, contract checks. |
+| `src/indexer/eval/` | Golden-set format, metrics, bootstrappers, ablation runner, contract checks. |
 | `configs/reference.yaml` | The deliberately simple path. Runs offline, no credentials. |
 | `configs/full.yaml` | Production-shaped choices, as an overlay — to show it is only config. |
 | `configs/pypi-docs.yaml` | The ablation corpus and its eight-arm ladder. |
@@ -72,6 +72,24 @@ Swapping the first for the second cut dense-only retrieval failures by 61% with
 nothing else changed — see [the embedder section](docs/ABLATION.md#the-embedder-measured)
 for what that does and does not establish.
 
+### What a golden set can measure
+
+Every generated item records `lexical_overlap`: how much of the query is lifted
+verbatim from the passage it is looking for. Report it beside any retrieval
+number, because near 1.0 a set scores a word matcher on exactly what it does and
+contains few items that *require* matching meaning — which caps every dense arm
+evaluated against it, a neural bi-encoder included. The shipped PyPI set sits at
+0.75, and its detail terms at 0.91.
+
+| `impl` | What it generates | Needs |
+|---|---|---|
+| `heuristic` | Subject + detail terms lifted from the unit. Offline, the CI default. | — |
+| `llm_bootstrap` | The same items rewritten as questions that avoid the passage's wording. | `anthropic` |
+
+Surface transforms were tried first as a free substitute and measured: they make
+every arm worse without changing their order. The table is in
+[`docs/ABLATION.md`](docs/ABLATION.md#paraphrasing-the-set-what-was-tried-and-what-it-cost).
+
 ## The six invariants
 
 These are evidence-backed, and they shape the frame rather than sitting in a
@@ -97,7 +115,7 @@ assume, what it must preserve, and what its minimal implementation looks like.
 ## Development
 
 ```bash
-pytest                       # 131 tests: contracts, config, pipeline, embedders, SQL conformance, layering
+pytest                       # 149 tests: contracts, config, pipeline, embedders, golden sets, SQL conformance, layering
 ruff check src tests && mypy # lint and strict types
 ```
 
