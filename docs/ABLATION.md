@@ -415,12 +415,13 @@ the two sets share candidates, filters and gold spans exactly. The only
 difference between them is the wording of the queries, which is what makes
 "paraphrasing the set changed the arms by X" a controlled statement.
 
-## Seven ways the harness lied, and how each was caught
+## Eight ways the harness lied, and how each was caught
 
 The most transferable result here is not a number. Building the harness before
 the pipeline was supposed to make the pipeline measurable; what it actually did
 first was reveal that **the measurement apparatus was wrong in seven distinct
-ways**, every one of which produced output that looked like a result.
+ways** — and then the pipeline in an eighth — every one of which produced
+output that looked like a result.
 
 That shared shape is the point. None of these threw. None produced an obviously
 silly figure. Each would have been reported as a finding.
@@ -434,8 +435,19 @@ silly figure. Each would have been reported as a finding.
 | The router parsed ISO dates as integers, ignored `before`/`greater than`, and let `version` shadow `version_major` | well‑formed structured questions matching nothing | the structured slice failing at a rate the router's 100% accuracy could not explain |
 | The golden set contained 16 identical queries and comparisons at the edges of the data | a structured slice measuring the corpus rather than the system | reading the generated queries |
 | The judge returned False for items it could not assess | every arm understated by the same amount — deltas intact, absolutes meaningless | noticing that structured items had stopped carrying a gold span |
+| The router was never told the declared type of each field | 13 of 28 structured questions matched nothing, while route accuracy read 100% | the structured slice failing at a rate perfect routing could not explain |
 
-Four of the seven were caught by a **cross-check that had no reason to move**:
+The eighth is the sharpest of them, because it is the one the invariant's own
+metric cannot see. Route accuracy asks *did this question reach the structured
+index*, and the answer was yes, every time. What it does not ask is whether the
+predicate that arrived there could match anything — and "version 1.0.0" read as
+the float `1.0` compiles to a comparison against a numeric column that the
+value, a string, was never written to. **Routing to the right index with the
+wrong predicate has the same outcome as not routing at all**, and it arrives
+through a door the metric guarding invariant 5 does not watch. The fix was to
+pass along type information the config had stated all along.
+
+Four of the eight were caught by a **cross-check that had no reason to move**:
 route accuracy is not a retrieval metric, and an arm that changes only
 contextualisation has no business changing it. That is the argument for
 reporting per-slice diagnostics next to the headline rather than instead of it —
