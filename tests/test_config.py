@@ -68,10 +68,10 @@ class TestOverlays:
 
 class TestInterpolation:
     def test_env_default_is_used_when_unset(self) -> None:
-        os.environ.pop("QDRANT_URL", None)
+        os.environ.pop("EMBED_DEVICE", None)
         cfg, _ = load(FULL)
         dense = next(i for i in cfg.ingestion.index.indexes if i.name == "dense")
-        assert dense.params["url"] == "http://localhost:6333"
+        assert dense.params["device"] == "cpu"  # ${env:EMBED_DEVICE:cpu}
 
     def test_missing_secret_fails_at_load_not_mid_build(self) -> None:
         saved = os.environ.pop("LLAMAPARSE_API_KEY")
@@ -83,8 +83,8 @@ class TestInterpolation:
 
     def test_internal_reference_resolves(self) -> None:
         cfg, _ = load(FULL)
-        dense = next(i for i in cfg.ingestion.index.indexes if i.name == "dense")
-        assert dense.params["collection"] == "full"  # ${project.name}
+        fields = next(i for i in cfg.ingestion.index.indexes if i.name == "fields")
+        assert fields.params["path"] == "./var/index/fields.db"  # ${paths.store}
 
 
 class TestSecrets:

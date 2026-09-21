@@ -236,6 +236,40 @@ claim that both halves are equally trustworthy, and that claim should be checked
 before it is made. `configs/*.yaml` ship equal weights because that is the right
 *prior*; the ablation is how a corpus corrects it.
 
+**What testing that explanation added.** The paragraph above asserts a cause —
+"the dense arm is a hashing trick, not an embedding model" — and an assertion
+about why a measurement came out badly is worth no more than the measurement
+itself until it is tested. So the embedder was split out of the dense index
+(`impls/embed.py`), and `svd_embedding` was added: the same store, the same
+fusion, the same golden set, with the fixed projection replaced by one *fitted*
+on the corpus. Arms `2b-svd-only` and `3c-hybrid-svd` differ from `2-dense-only`
+and `3-hybrid-rrf` in that key and nothing else.
+
+| | dense-only fail@20 | hybrid fail@20 | hybrid nDCG@10 |
+|---|---|---|---|
+| `hash_embedding` | 47.4% | 13.8% | 0.411 |
+| `svd_embedding` | **18.3%** | **10.2%** | **0.529** |
+| lexical alone | — | 7.5% | 0.573 |
+
+The explanation held: **61% of the dense arm's failures were the embedder**, and
+they came back with no other change. Two things it did not do. It did not make
+the hybrid beat its lexical half — 10.2% against 7.5% — so invariant 4 still
+does not reproduce here, though the gap narrowed from +84% to +36%. And it did
+not make the frame move: every pre-existing arm reproduced its numbers exactly
+across the refactor, which is the only reason the two rows above are comparable
+at all.
+
+What that leaves is a second explanation, and it is the golden set rather than
+the embedder. `HeuristicBootstrapper` draws each query's detail terms from the
+target unit's own text (`_distinctive_terms`), so every query is a bag of words
+that literally occurs in the passage it is looking for. A retriever that matches
+words is being scored on exactly what it does; a retriever that matches *meaning*
+has no query here that requires it. That ceiling binds a neural bi-encoder as
+hard as it binds LSA, and no dense implementation can be measured past it. **To
+test invariant 4 properly this corpus needs paraphrased queries, not a better
+embedder** — which is a bootstrapper change, and is left open rather than
+guessed at.
+
 ---
 
 ## Invariant 5 — structured, numeric and temporal questions must never reach vector search

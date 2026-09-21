@@ -1,29 +1,35 @@
-"""Dense index: deterministic offline embeddings, exact cosine search.
+"""Dense index: a vector store with a swappable embedder, exact cosine search.
 
-An honest framing of what this is. ``hash_embedding`` is a hashed
-bag-of-n-grams projected into a fixed-dimensional space. It is a real vector
-index -- exact cosine over dense vectors, with all the same write, delete and
-filter semantics a production store needs -- but it is **not** a semantic
-embedding model. It cannot match "how do I stop a request hanging" to "timeout"
-unless the words overlap.
+This file used to be one class doing two jobs. The store half -- write, delete,
+filter, exact cosine, persistence -- is the same arithmetic whatever produces
+the vectors, and it lives here. The modelling half moved to ``impls/embed.py``,
+which is the seam the old docstring promised: *"a real dense index is this file
+with ``_embed`` replaced by a model call, and nothing else in the frame
+changes."* It now is, and nothing else in the frame changed.
 
-Why it is here anyway: the reference path must run offline, in CI, with no model
-download and no credentials. That makes the pipeline testable and the ablation
-reproducible. The cost is that **absolute** dense-retrieval numbers from this
-index mean nothing, and only the deltas between arms are informative. Reading a
-P@5 from this index as though it were a real embedding model's would be wrong.
+Three indexes are registered, differing only in their embedder:
 
-The seam: a real dense index is this file with ``_embed`` replaced by a model
-call, and nothing else in the frame changes. ``configs/full.yaml`` names Qdrant
-with a Matryoshka model for exactly that reason.
+``hash_embedding``       The hashing trick. Offline, no download, deterministic,
+                         and **not** a semantic model -- it cannot match "how do
+                         I stop a request hanging" to "timeout" unless the words
+                         overlap. Unchanged and bit-exact, because the numbers in
+                         ``docs/ABLATION.md`` were produced by it.
+``svd_embedding``        Latent Semantic Analysis. A space *fitted* on the
+                         corpus, still offline. The strongest dense index this
+                         library can run with no model download.
+``sentence_transformer`` A real neural bi-encoder. The production choice, and
+                         the only one trained on the relation retrieval needs.
+
+Search is exact -- brute-force cosine over every candidate -- at every corpus
+size, which is the accuracy ceiling rather than an approximation of it. An ANN
+index trades some of that ceiling for latency that only matters past roughly a
+hundred thousand vectors; ``configs/full.yaml`` names Qdrant for when it does.
+The seam is this file, and nothing above it changes.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import math
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,12 +41,12 @@ from indexer.core.registry import register
 from indexer.core.results import Hit, RankedList
 from indexer.core.stages import IndexQuery, IndexStatsView, IndexWriteReceipt, StageContext
 from indexer.core.unit import EnrichedUnit
+from indexer.impls.embed import Embedder, build_embedder
 from indexer.impls.index_lexical import _jsonable, _passes
 from indexer.io import atomic_write
 from indexer.plugin import StageImpl, dataclass_params
-from indexer.textutil import tokenize
 
-__all__ = ["HashEmbeddingIndex"]
+__all__ = ["HashEmbeddingIndex", "SentenceTransformerIndex", "SvdIndex", "VectorIndex"]
 
 # Optional accelerator. Exact brute-force cosine over ten thousand 384-dimension
 # vectors is ~120ms per query in pure Python, which is fine for a unit test and
@@ -60,131 +66,81 @@ except ImportError:  # pragma: no cover
     HAVE_NUMPY = False
 
 
-@dataclass(frozen=True, slots=True)
-class HashEmbeddingParams:
-    dim: int = 256
-    #: Character n-gram width. Character n-grams give some robustness to
-    #: morphology ("timeout" / "timeouts") that word hashing alone lacks.
-    char_ngram: int = 4
-    use_words: bool = True
-    use_char_ngrams: bool = True
-    path: str = ""
-    idf_weighting: bool = True
+class VectorIndex(StageImpl):
+    """A vector store over ``EnrichedUnit.indexing_text()``, embedder-agnostic.
 
+    Membership is ``_meta``, not ``_vecs``. The two are the same set for an
+    embedder that can embed on arrival, but an embedder that must be fitted on
+    the corpus first has units before it has vectors, and every count, delete
+    and emptiness check has to mean "units I hold" rather than "vectors I have
+    computed so far".
+    """
 
-@register(
-    "index",
-    "hash_embedding",
-    version="1",
-    params_model=dataclass_params(HashEmbeddingParams),
-    summary=(
-        "Deterministic hashed embeddings, exact cosine. Offline and reproducible; "
-        "NOT a semantic model -- absolute numbers are not meaningful, deltas are."
-    ),
-)
-def _make_hash_embedding(params: dict[str, Any], **kw: Any) -> HashEmbeddingIndex:
-    return HashEmbeddingIndex(params, name=kw.get("name", "dense"))
-
-
-class HashEmbeddingIndex(StageImpl):
-    STAGE, IMPL, VERSION = "index", "hash_embedding", "1"
+    STAGE, IMPL, VERSION = "index", "vector", "1"
     kind = "dense"
+    EMBEDDER = "hash"
 
-    def __init__(self, params: dict[str, Any], name: str = "dense") -> None:
+    def __init__(
+        self, params: dict[str, Any], name: str = "dense", embedder: Embedder | None = None
+    ) -> None:
         super().__init__(params)
         self.name = name
-        self.dim = int(params.get("dim", 256))
-        self.char_ngram = int(params.get("char_ngram", 4))
-        self.use_words = bool(params.get("use_words", True))
-        self.use_chars = bool(params.get("use_char_ngrams", True))
-        self.idf_weighting = bool(params.get("idf_weighting", True))
+        self.embedder = embedder or build_embedder(self.EMBEDDER, params)
         self.path = Path(params["path"]) if params.get("path") else None
         self._vecs: dict[str, list[float]] = {}
         self._meta: dict[str, dict[str, Any]] = {}
-        self._df: dict[str, int] = {}
         self._matrix: Any = None  # numpy cache, invalidated on write
         self._matrix_ids: list[str] = []
-        self._loaded = self.path is None
+        # True when vectors are missing or stale relative to `_meta`. Only a
+        # fitted embedder can set it: everything else embeds on arrival.
+        self._fit_dirty = False
         self._dirty = False
         if self.path:
             self._load()
 
+    @property
+    def dim(self) -> int:
+        return self.embedder.dim
+
     def _load(self) -> None:
-        self._loaded = True
-        if self.path and self.path.exists():
-            raw = json.loads(self.path.read_text())
-            self._vecs = raw["vecs"]
-            self._meta = raw["meta"]
-            self._df = raw.get("df", {})
+        if not (self.path and self.path.exists()):
+            return
+        raw = json.loads(self.path.read_text())
+        self._meta = raw["meta"]
+        self._vecs = raw.get("vecs", {})
+        # `df` is the pre-seam layout, where the hashing embedder's document
+        # frequencies sat at the top level. Read it so stores built before the
+        # embedder split -- including the ablation's build artifacts -- still load.
+        state = raw.get("embedder")
+        if state is None and "df" in raw:
+            state = {"df": raw["df"]}
+        if state:
+            self.embedder.load_state(state)
+        if self.embedder.needs_fit:
+            # Fitted state is not persisted; it is rederived from the surfaces,
+            # which are. See `SvdEmbedder.state`.
+            self._fit_dirty = True
 
     def _save(self) -> None:
-        if self.path:
-            atomic_write(
-                self.path,
-                json.dumps({"vecs": self._vecs, "meta": self._meta, "df": self._df}).encode(),
-            )
-
-    # -------------------------------------------------------------- embedding
-
-    def _features(self, text: str) -> dict[str, float]:
-        feats: dict[str, float] = {}
-        if self.use_words:
-            for w in tokenize(text):
-                feats[f"w:{w}"] = feats.get(f"w:{w}", 0.0) + 1.0
-        if self.use_chars:
-            norm = re.sub(r"\s+", " ", text.lower())
-            n = self.char_ngram
-            for i in range(max(0, len(norm) - n + 1)):
-                g = f"c:{norm[i : i + n]}"
-                feats[g] = feats.get(g, 0.0) + 1.0
-        return feats
-
-    def _embed(
-        self, text: str, *, use_idf: bool = True, feats: dict[str, float] | None = None
-    ) -> list[float]:
-        """Hash features into ``dim`` buckets with signed accumulation.
-
-        The sign comes from a second hash bit, which keeps collisions from
-        systematically inflating similarity -- the standard hashing-trick
-        correction, and without it every long document looks similar to every
-        other long document.
-        """
-        vec = [0.0] * self.dim
-        n_docs = max(1, len(self._vecs))
-        for feat, count in (feats if feats is not None else self._features(text)).items():
-            h = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(h[:4], "big") % self.dim
-            sign = 1.0 if h[4] & 1 else -1.0
-            weight = 1.0 + math.log(count)
-            if use_idf and self.idf_weighting:
-                df = self._df.get(feat, 0)
-                weight *= math.log(1 + n_docs / (1 + df))
-            vec[bucket] += sign * weight
-        norm = math.sqrt(sum(v * v for v in vec))
-        if not norm:
-            return vec
-        # Rounded to 5 places before storage. Cosine over unit vectors is
-        # insensitive well below this, and full repr() floats cost roughly
-        # three times the bytes for no measurable difference in ranking.
-        return [round(v / norm, 5) for v in vec]
+        if not self.path:
+            return
+        payload: dict[str, Any] = {"meta": self._meta, "embedder": self.embedder.state()}
+        # Vectors derived from a fitted embedder are not persisted: they are a
+        # function of the surfaces, which are in `meta`, and storing them would
+        # double the file for state that is refitted on load anyway.
+        payload["vecs"] = {} if self.embedder.needs_fit else self._vecs
+        atomic_write(self.path, json.dumps(payload).encode())
 
     # ------------------------------------------------------------------ write
 
     def upsert(self, units: Sequence[EnrichedUnit], ctx: StageContext) -> IndexWriteReceipt:
         written = skipped = 0
+        pending: list[tuple[str, str]] = []
         for eu in units:
             if self._meta.get(eu.unit_id, {}).get("h") == str(eu.indexing_hash):
                 skipped += 1
                 continue
             surface = eu.indexing_text()
-            feats = self._features(surface)
-            for feat in feats:
-                self._df[feat] = self._df.get(feat, 0) + 1
-            # Documents stored unweighted, queries IDF-weighted at search time.
-            # The dot product is then the standard TF-IDF scheme (one-sided
-            # weighting), and it avoids the trap of baking a document-frequency
-            # snapshot into vectors written early in a build.
-            self._vecs[eu.unit_id] = self._embed(surface, use_idf=False, feats=feats)
             self._meta[eu.unit_id] = {
                 "h": str(eu.indexing_hash),
                 "d": eu.document_id,
@@ -193,8 +149,21 @@ class HashEmbeddingIndex(StageImpl):
                 "t": surface,
                 "f": {k: _jsonable(v) for k, v in eu.fields().items()},
             }
+            pending.append((eu.unit_id, surface))
             written += 1
-        if written:
+
+        if pending:
+            if self.embedder.needs_fit:
+                # The space this unit belongs in does not exist yet; the fit
+                # happens once, at flush or at the next search.
+                self._fit_dirty = True
+            else:
+                for uid, vec in zip(
+                    (u for u, _ in pending),
+                    self.embedder.embed_documents([s for _, s in pending]),
+                    strict=True,
+                ):
+                    self._vecs[uid] = vec
             self._matrix = None
         self._dirty = True
         return IndexWriteReceipt(written=written, skipped=skipped)
@@ -202,11 +171,13 @@ class HashEmbeddingIndex(StageImpl):
     def delete(self, unit_ids: Sequence[UnitId], ctx: StageContext) -> int:
         n = 0
         for uid in unit_ids:
-            if self._vecs.pop(uid, None) is not None:
-                self._meta.pop(uid, None)
+            if self._meta.pop(uid, None) is not None:
+                self._vecs.pop(uid, None)
                 n += 1
         if n:
             self._matrix = None
+            if self.embedder.needs_fit:
+                self._fit_dirty = True
         self._dirty = True
         return n
 
@@ -214,12 +185,32 @@ class HashEmbeddingIndex(StageImpl):
         ids = [u for u, m in self._meta.items() if m["d"] == document_id]
         return self.delete([UnitId(i) for i in ids], ctx)
 
+    def _ensure_vectors(self) -> None:
+        """Materialise vectors for a fitted embedder.
+
+        Lazy, and invalidated by writes, exactly like the numpy matrix below it.
+        That is what keeps the ``Index`` contract honest: a query between
+        batches fits on what has been written so far and returns correct
+        results, rather than returning nothing until someone calls ``flush``.
+        """
+        if not self._fit_dirty:
+            return
+        ids = list(self._meta)
+        surfaces = [self._meta[u]["t"] for u in ids]
+        self.embedder.fit(surfaces)
+        self._vecs = dict(
+            zip(ids, self.embedder.embed_documents(surfaces), strict=True)
+        )
+        self._fit_dirty = False
+        self._matrix = None
+
     def flush(self) -> None:
         """Persist. Called once per build, not once per batch.
 
         Writing the whole file on every upsert is quadratic in corpus size --
         the reason this capability exists at all.
         """
+        self._ensure_vectors()
         if self._dirty:
             self._save()
             self._dirty = False
@@ -227,9 +218,10 @@ class HashEmbeddingIndex(StageImpl):
     # ------------------------------------------------------------------- read
 
     def search(self, query: IndexQuery, ctx: StageContext) -> RankedList:
-        if not self._vecs:
+        if not self._meta:
             return RankedList(hits=(), source=self.name, query_text=query.text)
-        q = self._embed(query.text)
+        self._ensure_vectors()
+        q = self.embedder.embed_query(query.text, corpus_size=len(self._meta))
         allowed = set(query.unit_ids) if query.unit_ids is not None else None
         filtered = query.filters is not None or allowed is not None
 
@@ -274,17 +266,150 @@ class HashEmbeddingIndex(StageImpl):
     def _search_numpy(self, q: list[float]) -> list[tuple[str, float]]:
         if self._matrix is None:
             self._matrix_ids = list(self._vecs)
-            self._matrix = _np.asarray([self._vecs[u] for u in self._matrix_ids], dtype=_np.float32)
+            self._matrix = _np.asarray(
+                [self._vecs[u] for u in self._matrix_ids], dtype=_np.float32
+            )
+        if not self._matrix_ids:
+            return []
         scores = self._matrix @ _np.asarray(q, dtype=_np.float32)
         return list(zip(self._matrix_ids, scores.tolist(), strict=True))
 
     def stats(self) -> IndexStatsView:
         return IndexStatsView(
-            unit_count=len(self._vecs),
+            unit_count=len(self._meta),
             detail={
-                "dim": self.dim,
-                "features": len(self._df),
+                **self.embedder.describe(),
                 "exact_search": True,
                 "accelerated": HAVE_NUMPY,
+                "pending_fit": self._fit_dirty,
             },
         )
+
+
+# ------------------------------------------------------------- registrations
+
+
+@dataclass(frozen=True, slots=True)
+class HashEmbeddingParams:
+    dim: int = 256
+    #: Character n-gram width. Character n-grams give some robustness to
+    #: morphology ("timeout" / "timeouts") that word hashing alone lacks.
+    char_ngram: int = 4
+    use_words: bool = True
+    use_char_ngrams: bool = True
+    path: str = ""
+    idf_weighting: bool = True
+
+
+@register(
+    "index",
+    "hash_embedding",
+    version="1",
+    params_model=dataclass_params(HashEmbeddingParams),
+    summary=(
+        "Deterministic hashed embeddings, exact cosine. Offline and reproducible; "
+        "NOT a semantic model -- absolute numbers are not meaningful, deltas are."
+    ),
+)
+def _make_hash_embedding(params: dict[str, Any], **kw: Any) -> HashEmbeddingIndex:
+    return HashEmbeddingIndex(params, name=kw.get("name", "dense"))
+
+
+class HashEmbeddingIndex(VectorIndex):
+    """The hashing trick. Kept at version 1 and bit-exact.
+
+    An honest framing of what this is: a hashed bag of n-grams projected into a
+    fixed-dimensional space. It is a real vector index -- exact cosine, with all
+    the write, delete and filter semantics a production store needs -- but it is
+    **not** a semantic embedding model.
+
+    Why it is still the reference path: it runs offline, in CI, with no model
+    download and no credentials, which is what makes the pipeline testable and
+    the ablation reproducible. The cost is that **absolute** dense-retrieval
+    numbers from it mean nothing. For a dense index that is offline *and*
+    learned, use ``svd_embedding``; for a real one, ``sentence_transformer``.
+    """
+
+    STAGE, IMPL, VERSION = "index", "hash_embedding", "1"
+    EMBEDDER = "hash"
+
+
+@dataclass(frozen=True, slots=True)
+class SvdEmbeddingParams:
+    dim: int = 512
+    min_df: int = 2
+    use_char_ngrams: bool = False
+    char_ngram: int = 4
+    random_state: int = 0
+    path: str = ""
+
+
+@register(
+    "index",
+    "svd_embedding",
+    version="1",
+    params_model=dataclass_params(SvdEmbeddingParams),
+    summary=(
+        "Latent Semantic Analysis: TF-IDF then truncated SVD. Offline, no download, "
+        "and a learned space rather than a fixed projection."
+    ),
+    requires=("scipy",),
+)
+def _make_svd_embedding(params: dict[str, Any], **kw: Any) -> SvdIndex:
+    return SvdIndex(params, name=kw.get("name", "dense"))
+
+
+class SvdIndex(VectorIndex):
+    """LSA. Offline, learned, and fitted once per build.
+
+    The fit is deferred: units are held until a search or a flush needs vectors,
+    then the whole corpus is factorised at once. That is not an optimisation, it
+    is the only order that works -- there is no space to embed the first unit
+    into until the last one has been seen.
+    """
+
+    STAGE, IMPL, VERSION = "index", "svd_embedding", "1"
+    EMBEDDER = "svd"
+
+
+@dataclass(frozen=True, slots=True)
+class SentenceTransformerIndexParams:
+    model: str = "BAAI/bge-small-en-v1.5"
+    batch_size: int = 32
+    device: str = "cpu"
+    max_seq_length: int | None = None
+    query_prefix: str = "Represent this sentence for searching relevant passages: "
+    document_prefix: str = ""
+    truncate_dim: int | None = None
+    dim: int = 0
+    path: str = ""
+
+
+@register(
+    "index",
+    "sentence_transformer",
+    version="1",
+    params_model=dataclass_params(SentenceTransformerIndexParams),
+    summary=(
+        "Neural bi-encoder (BGE/E5/MiniLM family). The production dense index; "
+        "needs a model download."
+    ),
+    requires=("sentence-transformers",),
+)
+def _make_sentence_transformer(params: dict[str, Any], **kw: Any) -> SentenceTransformerIndex:
+    return SentenceTransformerIndex(
+        params, name=kw.get("name", "dense"), embedder=kw.get("embedder")
+    )
+
+
+class SentenceTransformerIndex(VectorIndex):
+    """A real neural bi-encoder behind the same store.
+
+    This is the drop-in the rest of the library was shaped around. Everything
+    that makes it different from ``hash_embedding`` is inside ``_embed`` --
+    which is now an object rather than a method, and is the only thing that
+    changes.
+    """
+
+    STAGE, IMPL, VERSION = "index", "sentence_transformer", "1"
+    EMBEDDER = "sentence_transformer"

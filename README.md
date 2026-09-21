@@ -26,6 +26,7 @@ names one.
 | `src/indexer/config/` | Config schema, overlays, interpolation, two-phase validation. |
 | `src/indexer/pipeline/` | Ingestion and query orchestrators. Where the contracts are enforced. |
 | `src/indexer/impls/` | Reference implementations, two or more per stage. |
+| `src/indexer/impls/embed.py` | The embedder seam: hashing, LSA, and a neural bi-encoder behind one store. |
 | `src/indexer/eval/` | Golden-set format, metrics, bootstrapper, ablation runner, contract checks. |
 | `configs/reference.yaml` | The deliberately simple path. Runs offline, no credentials. |
 | `configs/full.yaml` | Production-shaped choices, as an overlay — to show it is only config. |
@@ -58,6 +59,19 @@ Everything runs offline: no API keys, no model downloads. See
 dense index is a hashing trick rather than a semantic model, so absolute numbers
 from it are not comparable to published figures. The deltas are the point.
 
+The dense index has three embedders behind one store, which is the seam a real
+model drops into:
+
+| `impl` | What it is | Needs |
+|---|---|---|
+| `hash_embedding` | Hashing trick. Fixed projection, offline, the CI default. | — |
+| `svd_embedding` | LSA: TF-IDF then truncated SVD. *Fitted* on the corpus, still offline. | `[dense-svd]` |
+| `sentence_transformer` | A real bi-encoder (BGE/E5/MiniLM). The production choice. | `[dense-sentence-transformer]` |
+
+Swapping the first for the second cut dense-only retrieval failures by 61% with
+nothing else changed — see [the embedder section](docs/ABLATION.md#the-embedder-measured)
+for what that does and does not establish.
+
 ## The six invariants
 
 These are evidence-backed, and they shape the frame rather than sitting in a
@@ -83,7 +97,7 @@ assume, what it must preserve, and what its minimal implementation looks like.
 ## Development
 
 ```bash
-pytest                       # 100 tests: contracts, config, pipeline, SQL conformance, layering
+pytest                       # 131 tests: contracts, config, pipeline, embedders, SQL conformance, layering
 ruff check src tests && mypy # lint and strict types
 ```
 

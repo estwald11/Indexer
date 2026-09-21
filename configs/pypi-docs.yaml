@@ -182,10 +182,35 @@ eval:
         query.route.paths.iterative.targets: [dense]
         query.fuse.enabled: false
 
+    # The embedder arms. `hash_embedding` is a fixed projection chosen before it
+    # has seen a document; `svd_embedding` is fitted on the corpus. These two
+    # arms differ in that and nothing else, so the delta between them is the
+    # cost of not having a learned space -- which is the one thing `2-dense-only`
+    # could never separate from "dense retrieval does not work here".
+    - name: 2b-svd-only
+      description: LSA alone. Same arm as 2-dense-only with a learned embedder.
+      overrides:
+        ingestion.enrich.enabled: false
+        ingestion.index.indexes[lexical].enabled: false
+        ingestion.index.indexes[dense].impl: svd_embedding
+        ingestion.index.indexes[dense].params: {dim: 512, min_df: 2}
+        query.route.paths.lookup.targets: [dense]
+        query.route.paths.iterative.targets: [dense]
+        query.fuse.enabled: false
+
     - name: 3-hybrid-rrf
       description: Both indexes fused with RRF, still no context. Invariant 4 alone.
       overrides:
         ingestion.enrich.enabled: false
+
+    # Invariant 4, asked of a dense half that is actually worth fusing. Against
+    # 1-lexical-only this is the whole claim: does hybrid beat either half?
+    - name: 3c-hybrid-svd
+      description: Hybrid RRF with the learned embedder. Invariant 4, re-asked.
+      overrides:
+        ingestion.enrich.enabled: false
+        ingestion.index.indexes[dense].impl: svd_embedding
+        ingestion.index.indexes[dense].params: {dim: 512, min_df: 2}
 
     - name: 4-hybrid-sectionpath
       description: Heading trail only. The control for "does any prefix help?".

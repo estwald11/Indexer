@@ -92,16 +92,39 @@ ingestion:
         impl: bm25              # SPLADE-v3 where the extra cost is earned
       - name: dense
         kind: dense
-        impl: qdrant
+        # A real bi-encoder, and the one part of this file that is implemented
+        # rather than aspirational: `impl: sentence_transformer` resolves, needs
+        # only the `dense-sentence-transformer` extra, and is the same store the
+        # reference path uses with its embedder swapped.
+        impl: sentence_transformer
         params:
-          url: ${env:QDRANT_URL:http://localhost:6333}
-          collection: ${project.name}
-          # Matryoshka-capable, so two-stage search stays available without
-          # re-embedding the corpus later. Choosing a non-Matryoshka model here
-          # is a decision that costs a full re-index to undo.
-          model: matryoshka-embed-v1
-          dims: [256, 1024]
-          prefetch_dim: 256
+          model: BAAI/bge-large-en-v1.5
+          # BGE is trained with an asymmetric query instruction and measurably
+          # loses quality without it. E5 wants "query: " / "passage: " instead;
+          # a symmetric model wants both empty.
+          query_prefix: "Represent this sentence for searching relevant passages: "
+          document_prefix: ""
+          batch_size: 32
+          device: ${env:EMBED_DEVICE:cpu}
+          # Matryoshka-capable models let the leading slice stand alone as a
+          # valid embedding, so two-stage search stays available without
+          # re-embedding the corpus later. Choosing a non-Matryoshka model is a
+          # decision that costs a full re-index to undo.
+          # truncate_dim: 256
+
+        # The *storage* seam is a separate decision from the model above, and a
+        # later one. Search here is exact brute-force cosine, which is the
+        # accuracy ceiling; an ANN store trades some of it for latency that only
+        # starts to matter past roughly a hundred thousand vectors. Until then
+        # the win is the embedder, not the database.
+        #
+        #   impl: qdrant
+        #   params:
+        #     url: ${env:QDRANT_URL:http://localhost:6333}
+        #     collection: ${project.name}
+        #     model: BAAI/bge-large-en-v1.5
+        #     dims: [256, 1024]
+        #     prefetch_dim: 256
       - name: fields
         kind: structured
         impl: sqlite
