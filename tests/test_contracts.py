@@ -294,3 +294,31 @@ class TestContextSpecificity:
             for t in ("one body", "two body", "three body")
         ]
         assert check_context_specificity(units) == []
+
+
+class TestErrorsAreVisible:
+    """Metrics are averaged over the queries that ran. An arm where most queries
+    raised therefore reports healthy numbers over its survivors, which reads as
+    a good result rather than a broken one."""
+
+    def test_delta_table_names_a_broken_arm(self) -> None:
+        from indexer.eval.harness import AblationResult
+        from indexer.eval.metrics import RunReport
+
+        r = AblationResult(
+            reports=[
+                RunReport(arm="ok", n_queries=100, precision={5: 0.4}, retrieval_failure_rate=0.1),
+                RunReport(
+                    arm="broken",
+                    n_queries=100,
+                    errors=93,
+                    precision={5: 0.9},  # over the 7 that ran
+                    retrieval_failure_rate=0.0,
+                ),
+            ],
+            baseline_arm="ok",
+        )
+        out = r.delta_table()
+        assert "93/100 queries raised" in out
+        assert "not comparable" in out
+        assert "err" in out.splitlines()[0]

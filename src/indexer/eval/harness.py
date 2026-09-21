@@ -194,6 +194,10 @@ class AblationResult:
             ("p50ms", 8, lambda r: r.latency_p50_ms, 0, None),
             ("p95ms", 8, lambda r: r.latency_p95_ms, 0, None),
             ("usd/q", 9, lambda r: r.cost_per_query_usd, 5, None),
+            # Errors are a column, not a footnote. Metrics are averaged over
+            # the queries that ran, so an arm where most queries raised reports
+            # healthy numbers over its survivors and looks like a good result.
+            ("err", 6, lambda r: float(r.errors), 0, True),
         ]
         head = "".join(n.ljust(w) for n, w, _, _, _ in cols)
         lines = [head, "-" * len(head)]
@@ -219,6 +223,16 @@ class AblationResult:
                         cell += f" ({d:+.{dp}f}){mark}"
                 row += cell.ljust(width)
             lines.append(row.rstrip())
+        broken = [r for r in self.reports if r.errors]
+        if broken:
+            lines.append("")
+            for r in broken:
+                share = r.errors / r.n_queries if r.n_queries else 1.0
+                lines.append(
+                    f"!! {r.arm}: {r.errors}/{r.n_queries} queries raised ({share:.0%}). "
+                    f"Its metrics are averaged over the {r.n_queries - r.errors} that ran "
+                    f"and are not comparable to the other arms."
+                )
         if self.verdicts:
             lines.append("")
             lines.extend(v.render() for v in self.verdicts)
