@@ -1,5 +1,14 @@
 # Round 1 review: interfaces and config schema
 
+> **Historical.** This is the record of the review gate before any
+> implementation existed — what was proposed, what was decided, and what the
+> environment allowed. It is kept unedited because the decisions below shaped
+> everything after them, and several turned out to be wrong in instructive ways.
+>
+> For the current state: [`ARCHITECTURE.md`](../ARCHITECTURE.md) has the
+> contracts and what implementing them changed;
+> [`ABLATION.md`](ABLATION.md) has the measurements.
+
 What to look at, what I decided unilaterally, and the open questions where your
 answer changes what gets built.
 
@@ -134,3 +143,27 @@ In this order, because each is testable against the previous:
 
 I would rather not write (2) before (1) is settled, since the orchestrators are
 what reveal whether the contracts are actually sufficient.
+
+
+## What the decisions above turned out to cost
+
+Recorded here rather than silently corrected, because a review record that
+quietly agrees with hindsight is not a record.
+
+**"Offline only" was right, and more limiting than expected.** It kept the
+whole pipeline runnable in CI with no credentials, which is why every number in
+the report is reproducible. It also meant the dense arm was a hashing trick
+until an SVD embedder was written, and that single change cut dense-only
+retrieval failures by 61% — the largest effect any one change produced. The
+conclusion "hybrid does not beat lexical here" was nearly drawn from a defect
+in a component rather than a property of hybrid retrieval.
+
+**"Contract only" for `ContextScope` has not bitten yet.** No enricher has
+misdeclared its scope, but nothing would catch it if one did, and the failure
+survives cache clears. It remains the most likely quiet bug in the frame.
+
+**The caller-supplied answer function was right and is not enough.** It kept
+generation out of the library, and it means end-to-end correctness is judged by
+lexical containment over the retrieved passages — so the r=0.91 correlation
+with P@5 is arithmetic, not evidence. Invariant 1 is the one invariant this
+work cannot test.

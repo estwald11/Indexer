@@ -19,10 +19,20 @@ than a mystery.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
-from indexer.core.predicate import Compare, Exists, Op, Predicate, StructuredQuery, all_of
+from indexer.core.predicate import (
+    Compare,
+    Exists,
+    Op,
+    Predicate,
+    StructuredQuery,
+    TextMatch,
+    all_of,
+)
 from indexer.core.query import Query, QueryType, RouteDecision, RoutePath, RouteTarget
 from indexer.core.registry import register
 from indexer.core.stages import StageContext
@@ -61,6 +71,73 @@ _SUMMARY = re.compile(
     r"\b(summar\w+|overview of|explain|what is the purpose|walk me through)\b", re.I
 )
 _DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{4})\b")
+
+#: Comparison words, longest first so "greater than or equal" beats "greater".
+#: Temporal words are comparisons too -- without them every temporal question
+#: collapses to equality and matches nothing.
+_OPERATORS: dict[str, Op] = {
+    "greater than or equal to": Op.GTE,
+    "less than or equal to": Op.LTE,
+    "at least": Op.GTE,
+    "no less than": Op.GTE,
+    "at most": Op.LTE,
+    "no more than": Op.LTE,
+    "greater than": Op.GT,
+    "more than": Op.GT,
+    "larger than": Op.GT,
+    "later than": Op.GT,
+    "less than": Op.LT,
+    "fewer than": Op.LT,
+    "smaller than": Op.LT,
+    "earlier than": Op.LT,
+    "not after": Op.LTE,
+    "not before": Op.GTE,
+    "before": Op.LT,
+    "after": Op.GT,
+    "since": Op.GTE,
+    "until": Op.LTE,
+    "above": Op.GT,
+    "below": Op.LT,
+    "over": Op.GT,
+    "under": Op.LT,
+    ">=": Op.GTE,
+    "<=": Op.LTE,
+    ">": Op.GT,
+    "<": Op.LT,
+    "=": Op.EQ,
+}
+_OP_WORDS = "|".join(re.escape(k) for k in sorted(_OPERATORS, key=len, reverse=True))
+#: Words that follow a field name without being its value.
+_FILLER = frozenset(
+    {"is", "are", "of", "the", "a", "an", "and", "or", "recorded", "values", "value"}
+)
+
+
+def _op_from(token: str | None, default: Op) -> Op:
+    return _OPERATORS.get((token or "").strip().lower(), default)
+
+
+def _fields_in(text: str, lexicon: Sequence[str]) -> list[str]:
+    """Fields the text names, longest match first and no overlaps.
+
+    "version major" contains "version", so a naive substring scan yields both
+    and conjoins a predicate on each -- and a unit carrying `version_major` but
+    no `version` then matches neither.
+    """
+    low = text.lower()
+    taken: list[tuple[int, int]] = []
+    found: list[str] = []
+    for f in sorted(lexicon, key=len, reverse=True):
+        needle = f.replace("_", " ").lower()
+        i = low.find(needle)
+        if i < 0:
+            continue
+        j = i + len(needle)
+        if any(i < b and a < j for a, b in taken):
+            continue
+        taken.append((i, j))
+        found.append(f)
+    return [f for _, f in sorted(zip([t[0] for t in taken], found, strict=True))]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,11 +179,12 @@ class RulesRouter(StageImpl):
         text = query.text
         qtype, reason = self._classify(text)
 
-        if self.enable_structured and qtype in (
+        wants_structured = qtype in (
             QueryType.STRUCTURED,
             QueryType.NUMERIC,
             QueryType.TEMPORAL,
-        ):
+        )
+        if wants_structured and self.enable_structured:
             sq = self._structured_query(text, qtype)
             if sq is not None and self._targets("structured"):
                 return RouteDecision(
@@ -120,11 +198,15 @@ class RulesRouter(StageImpl):
                     router=self.IMPL,
                     fingerprint=self.fingerprint().key(),
                 )
-            # No structured index configured, or nothing extractable from the
-            # text. Fall back to lookup, but record *why* -- an operator reading
-            # the decision log needs to see that the structured path was wanted
-            # and unavailable, not that the question looked like prose.
-            reason = f"{reason}; structured unavailable, falling back to lookup"
+            # Nothing extractable from the text. Fall back to lookup, but
+            # record *why* -- see below.
+            reason = f"{reason}; no structured predicate extractable, falling back to lookup"
+        elif wants_structured:
+            # The question wanted the structured path and the configuration does
+            # not offer one. An operator reading the decision log needs to see
+            # that, not a line saying the question looked like prose: the fix is
+            # in the config, and nothing else in the trace would point there.
+            reason = f"{reason}; structured path unavailable (no structured index), using lookup"
 
         if qtype in (QueryType.MULTI_HOP, QueryType.COMPARATIVE) or (
             len(text.split()) >= self.iterative_min_words and qtype is QueryType.SUMMARY
@@ -182,36 +264,50 @@ class RulesRouter(StageImpl):
         Returning ``None`` when nothing is confidently extractable is the right
         behaviour: a STRUCTURED route with a wrong predicate returns a confident
         wrong answer, which is worse than falling back to retrieval.
-        """
-        clauses: list[Predicate] = []
-        fields_named = [f for f in self.lexicon if f.replace("_", " ") in text.lower()]
 
+        Four things here are easy to get wrong, and all four were, until the
+        structured slice of a real golden set showed well-formed questions
+        returning nothing:
+
+        *Dates are not numbers.* "release date before 2023-06-27" read as
+        ``release_date == 2023`` compares a date column against an integer and
+        matches nothing. ISO dates are parsed before numbers.
+
+        *Temporal words are operators.* before, after, since, until carry the
+        comparison; without them every temporal question collapsed to equality.
+
+        *"greater than" is an operator too.* The lexicon knew ``>`` and "over"
+        but not the words most people actually type.
+
+        *The longest field name wins.* "version major" contains "version", so a
+        substring match produced a predicate on both fields conjoined -- and a
+        unit with a ``version_major`` but no ``version`` matched neither.
+        """
+        fields_named = _fields_in(text, self.lexicon)
+        if not fields_named:
+            return None
+
+        clauses: list[Predicate] = []
         for f in fields_named:
-            m = re.search(
-                rf"{re.escape(f.replace('_', ' '))}\D{{0,20}}"
-                rf"(>=|<=|>|<|over|under|above|below|at least|at most)?\s*"
-                rf"(\d[\d,_.]*)",
-                text,
-                re.I,
-            )
+            label = re.escape(f.replace("_", " "))
+            window = rf"{label}\s*(?:is|of|=)?\s*({_OP_WORDS})?\s*"
+            m = re.search(window + r"(\d{4}-\d{2}-\d{2})", text, re.I)
             if m:
-                op = {
-                    ">": Op.GT,
-                    ">=": Op.GTE,
-                    "<": Op.LT,
-                    "<=": Op.LTE,
-                    "over": Op.GT,
-                    "above": Op.GT,
-                    "under": Op.LT,
-                    "below": Op.LT,
-                    "at least": Op.GTE,
-                    "at most": Op.LTE,
-                }.get((m.group(1) or "").lower(), Op.EQ)
+                clauses.append(
+                    Compare(f, _op_from(m.group(1), default=Op.EQ), date.fromisoformat(m.group(2)))
+                )
+                continue
+            m = re.search(window + r"(\d[\d,_]*(?:\.\d+)?)", text, re.I)
+            if m:
                 raw = m.group(2).replace(",", "").replace("_", "")
                 value: Any = float(raw) if "." in raw else int(raw)
-                clauses.append(Compare(f, op, value))
-            else:
-                clauses.append(Exists(f))
+                clauses.append(Compare(f, _op_from(m.group(1), default=Op.EQ), value))
+                continue
+            m = re.search(rf"{label}\s+(?:is\s+|=\s*)?([A-Za-z][\w.\-]{{1,40}})", text, re.I)
+            if m and m.group(1).lower() not in _FILLER:
+                clauses.append(TextMatch(f, m.group(1), mode="exact"))
+                continue
+            clauses.append(Exists(f))
 
         if not clauses:
             return None
