@@ -24,6 +24,7 @@ becomes a wrong citation three stages later with nothing to attribute it to.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,7 +34,7 @@ from indexer.core.accounting import CacheOutcome, InMemoryAccountant
 from indexer.core.cache import CacheStore, cache_key
 from indexer.core.document import ParsedDocument, SourceDocument
 from indexer.core.errors import ContractViolation, DocumentError
-from indexer.core.ids import ContentHash, hash_obj, hash_text
+from indexer.core.ids import ContentHash, DocumentId, hash_obj, hash_text
 from indexer.core.ledger import ChangeKind, DocumentRecord, Ledger, PlannedChange, diff_units
 from indexer.core.manifest import BuildManifest, CorpusStats, IndexStats
 from indexer.core.stages import (
@@ -77,7 +78,9 @@ class BuildResult:
             f"restaged {c.documents_restaged} skip {c.documents_unchanged} "
             f"-{c.documents_removed} fail {c.documents_failed}), "
             f"{c.units_written} units written, {c.units_deleted} deleted, "
-            f"{self.manifest.total_wall_ms / 1000:.1f}s, ${self.manifest.total_cost_usd:.4f}"
+            f"{self.manifest.elapsed_wall_ms / 1000:.1f}s "
+            f"({self.manifest.accounted_fraction:.0%} in stages), "
+            f"${self.manifest.total_cost_usd:.4f}"
         )
 
 
@@ -149,9 +152,15 @@ class IngestionPipeline:
             keys[f"index:{name}"] = idx.fingerprint().key()
         return keys
 
-    def plan(self) -> list[PlannedChange]:
+    def plan(
+        self, *, scanned: Mapping[DocumentId, SourceDocument] | None = None
+    ) -> list[PlannedChange]:
         """Diff the corpus against the ledger. No work is done here."""
-        current = {d.document_id: d for d in self.scanner.scan()}
+        current = (
+            dict(scanned)
+            if scanned is not None
+            else {d.document_id: d for d in self.scanner.scan()}
+        )
         keys = self.stage_keys()
         plan: list[PlannedChange] = []
 
@@ -195,6 +204,7 @@ class IngestionPipeline:
         plan: Sequence[PlannedChange] | None = None,
         progress: Callable[[str], None] | None = None,
     ) -> BuildResult:
+        started = time.perf_counter()
         accountant = InMemoryAccountant()
         ctx = StageContext(cache=self.cache, accountant=accountant)
         manifest = BuildManifest.start(
@@ -207,8 +217,11 @@ class IngestionPipeline:
         manifest.disabled_stages = self._disabled()
         self.ledger.begin_build(manifest.build_id)
 
-        work = list(plan if plan is not None else self.plan())
-        by_id = {d.document_id: d for d in self.scanner.scan()}
+        # Scan once. `plan()` already read and hashed every document; scanning
+        # again to build this map doubles the corpus read for no new information.
+        scanned = {d.document_id: d for d in self.scanner.scan()}
+        work = list(plan if plan is not None else self.plan(scanned=scanned))
+        by_id = scanned
         stats = CorpusStats(documents_total=len(by_id))
         failures: list[DocumentError] = []
         confidences: list[float] = []
@@ -296,6 +309,7 @@ class IngestionPipeline:
         for idx in self.indexes.values():
             if isinstance(idx, Flushable):
                 idx.flush()
+        self.unit_store.flush()
 
         if confidences:
             stats.mean_reading_order_confidence = sum(confidences) / len(confidences)
@@ -313,7 +327,7 @@ class IngestionPipeline:
         ]
         manifest.stage_totals = accountant.by_stage()
         manifest.absorb(accountant.runs())
-        manifest.finish()
+        manifest.finish(elapsed_wall_ms=(time.perf_counter() - started) * 1000.0)
         self.ledger.commit_build(manifest.build_id)
         return BuildResult(manifest=manifest, plan=work, failures=failures)
 

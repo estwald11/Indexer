@@ -94,7 +94,11 @@ class BuildManifest:
     #: Aggregated from ``Accountant.by_stage()``.
     stage_totals: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     total_cost_usd: float = 0.0
+    #: Summed across measured stage runs.
     total_wall_ms: float = 0.0
+    #: Wall clock for the whole build, including work outside any stage: the
+    #: corpus scan, store writes, ledger commits.
+    elapsed_wall_ms: float = 0.0
     #: Stages configured off for this build, with the reason from config. An
     #: ablation manifest is identified by this field alone.
     disabled_stages: Mapping[str, str] = field(default_factory=dict)
@@ -135,9 +139,27 @@ class BuildManifest:
             if r.error:
                 self.errors = [*self.errors, f"{r.fingerprint.key()}: {r.error}"]
 
-    def finish(self) -> BuildManifest:
+    def finish(self, elapsed_wall_ms: float = 0.0) -> BuildManifest:
         self.finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+        self.elapsed_wall_ms = elapsed_wall_ms
         return self
+
+    @property
+    def unaccounted_wall_ms(self) -> float:
+        """Build time not attributable to any stage.
+
+        Per-stage accounting is only as useful as its coverage. A build whose
+        stages sum to 21s inside a 73s wall clock is not telling you where the
+        time goes -- and that was this pipeline, until the gap was printed and
+        turned out to be the unit store rewriting a 9MB file once per document.
+        Reporting the residual is what makes an unmeasured hot spot findable
+        instead of invisible.
+        """
+        return max(0.0, self.elapsed_wall_ms - self.total_wall_ms)
+
+    @property
+    def accounted_fraction(self) -> float:
+        return self.total_wall_ms / self.elapsed_wall_ms if self.elapsed_wall_ms else 1.0
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(asdict(self), indent=indent, sort_keys=True, default=str)

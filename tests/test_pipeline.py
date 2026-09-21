@@ -315,3 +315,96 @@ class TestDenseAccelerator:
         assert fast.unit_ids() == slow.unit_ids()
         for f, s in zip(fast.hits, slow.hits, strict=True):
             assert abs(f.score - s.score) < 1e-4
+
+
+class TestLedgerJournal:
+    """Resumability is a stated property: a build that dies at document 400 of
+    500 must resume at 401. The journal is how that survives without rewriting
+    the whole snapshot per document."""
+
+    def test_records_survive_without_a_commit(self, tmp_path: Path) -> None:
+        from indexer.core.ids import BuildId, ContentHash, DocumentId
+        from indexer.core.ledger import DocumentRecord
+        from indexer.pipeline.stores import JsonLedger
+
+        path = tmp_path / "ledger.json"
+        led = JsonLedger(path)
+        led.begin_build(BuildId("b1"))
+        for i in range(5):
+            led.put(
+                DocumentRecord(
+                    document_id=DocumentId(f"d{i}"),
+                    source_uri=f"file:///{i}",
+                    content_hash=ContentHash(f"sha256:{i:064x}"),
+                    unit_ids=(),
+                    stage_keys={"parse": "p@1"},
+                    build_id=BuildId("b1"),
+                )
+            )
+        # Process dies here: no commit_build, so no compaction happened.
+        reopened = JsonLedger(path)
+        assert reopened.document_ids() == {DocumentId(f"d{i}") for i in range(5)}
+        assert reopened.interrupted_build == "b1"
+
+    def test_commit_compacts_and_clears_the_journal(self, tmp_path: Path) -> None:
+        from indexer.core.ids import BuildId, ContentHash, DocumentId
+        from indexer.core.ledger import DocumentRecord
+        from indexer.pipeline.stores import JsonLedger
+
+        path = tmp_path / "ledger.json"
+        led = JsonLedger(path)
+        led.begin_build(BuildId("b1"))
+        led.put(
+            DocumentRecord(
+                document_id=DocumentId("d0"),
+                source_uri="file:///0",
+                content_hash=ContentHash("sha256:" + "0" * 64),
+                unit_ids=(),
+                stage_keys={},
+                build_id=BuildId("b1"),
+            )
+        )
+        assert led.journal.exists()
+        led.commit_build(BuildId("b1"))
+        assert not led.journal.exists()
+        assert JsonLedger(path).document_ids() == {DocumentId("d0")}
+
+    def test_a_torn_final_line_loses_only_that_record(self, tmp_path: Path) -> None:
+        """A process killed mid-append leaves a partial line. Everything before
+        it is intact, and the document it described is simply reprocessed."""
+        from indexer.core.ids import BuildId, ContentHash, DocumentId
+        from indexer.core.ledger import DocumentRecord
+        from indexer.pipeline.stores import JsonLedger
+
+        path = tmp_path / "ledger.json"
+        led = JsonLedger(path)
+        led.begin_build(BuildId("b1"))
+        for i in range(3):
+            led.put(
+                DocumentRecord(
+                    document_id=DocumentId(f"d{i}"),
+                    source_uri=f"file:///{i}",
+                    content_hash=ContentHash(f"sha256:{i:064x}"),
+                    unit_ids=(),
+                    stage_keys={},
+                    build_id=BuildId("b1"),
+                )
+            )
+        with led.journal.open("a", encoding="utf-8") as fh:
+            fh.write('{"document_id": "d3", "source_uri": "file:///3", "cont')
+
+        reopened = JsonLedger(path)
+        assert reopened.document_ids() == {DocumentId(f"d{i}") for i in range(3)}
+
+    def test_an_interrupted_build_resumes_where_it_stopped(self, workspace: Path) -> None:
+        """End to end: kill a build after one document, rebuild, and only the
+        unprocessed document is work."""
+        a = assemble(workspace / "c.yaml")
+        ing = a.ingestion()
+        plan = ing.plan()
+        ing.build(plan=plan[:1])  # as if the process died after document 1
+
+        a2 = assemble(workspace / "c.yaml")
+        res = a2.ingestion().build()
+        assert res.manifest.corpus.documents_unchanged == 1
+        assert res.manifest.corpus.documents_added == 1

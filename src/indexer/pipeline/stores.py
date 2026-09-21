@@ -12,6 +12,7 @@ are drop-ins; nothing above them knows the difference.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -100,21 +101,35 @@ class FileArtifactStore:
 
 
 class JsonLedger:
-    """Per-document build state as one JSON file.
+    """Per-document build state: a compacted snapshot plus an append-only journal.
 
     One file, not one per document: a build's plan reads every record, and a
     thousand small reads is slower than one. The cost is that concurrent builds
-    would race -- which is the documented seam where a distributed build needs a
-    real database, noted in ARCHITECTURE.md.
+    would race -- the documented seam where a distributed build needs a real
+    database, noted in ARCHITECTURE.md.
+
+    Why a journal. Resumability is a stated property: a build that dies after
+    400 of 500 documents must resume at 401, so a record has to be durable the
+    moment its document is done. Rewriting the whole snapshot to achieve that is
+    quadratic -- 686 documents against a 479 KB map cost 9s of a 30s build, a
+    third of it, to write 328 MB for 479 KB of data.
+
+    So each record is appended as one line (bounded, proportional to the record)
+    and the snapshot is compacted once at ``commit_build``. A load reads the
+    snapshot and replays the journal over it, so an interrupted build is
+    recovered exactly -- the durability guarantee is unchanged and only its cost
+    is different.
     """
 
-    __slots__ = ("_in_flight", "_loaded", "_records", "path")
+    __slots__ = ("_in_flight", "_journal_lines", "_loaded", "_records", "journal", "path")
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.journal = self.path.with_suffix(self.path.suffix + ".journal")
         self._records: dict[str, DocumentRecord] = {}
         self._in_flight: str | None = None
         self._loaded = False
+        self._journal_lines = 0
 
     def _load(self) -> None:
         if self._loaded:
@@ -124,7 +139,7 @@ class JsonLedger:
             return
         data = json.loads(self.path.read_text())
         self._in_flight = data.get("in_flight")
-        for d in data.get("records", []):
+        for d in [*data.get("records", []), *self._replay_journal()]:
             rec = DocumentRecord(
                 document_id=DocumentId(d["document_id"]),
                 source_uri=d["source_uri"],
@@ -137,22 +152,36 @@ class JsonLedger:
             )
             self._records[rec.document_id] = rec
 
+    def _replay_journal(self) -> list[dict[str, Any]]:
+        """Records written since the last compaction. Order matters: later wins."""
+        if not self.journal.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        for line in self.journal.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A torn final line means the process died mid-append. Everything
+                # before it is intact, and the document it described will simply
+                # be reprocessed -- which is the correct outcome, not an error.
+                break
+        return out
+
+    def _append(self, record: DocumentRecord) -> None:
+        self.journal.parent.mkdir(parents=True, exist_ok=True)
+        with self.journal.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(_record_json(record)) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        self._journal_lines += 1
+
     def _flush(self) -> None:
         payload = {
             "in_flight": self._in_flight,
-            "records": [
-                {
-                    "document_id": r.document_id,
-                    "source_uri": r.source_uri,
-                    "content_hash": r.content_hash,
-                    "unit_ids": list(r.unit_ids),
-                    "stage_keys": dict(r.stage_keys),
-                    "build_id": r.build_id,
-                    "updated_at": r.updated_at,
-                    "warnings": list(r.warnings),
-                }
-                for r in self._records.values()
-            ],
+            "records": [_record_json(r) for r in self._records.values()],
         }
         atomic_write(self.path, json.dumps(payload, indent=1).encode("utf-8"))
 
@@ -163,9 +192,10 @@ class JsonLedger:
     def put(self, record: DocumentRecord) -> None:
         self._load()
         self._records[record.document_id] = record
-        # Flushed per document rather than at the end: an interrupted build must
-        # resume at document 401, not restart. Resumability is a stated property.
-        self._flush()
+        # Appended per document, not rewritten: an interrupted build must resume
+        # at document 401, not restart, and durability per document is what buys
+        # that. The append is bounded; the snapshot is compacted at commit.
+        self._append(record)
 
     def delete(self, document_id: DocumentId) -> None:
         self._load()
@@ -189,6 +219,9 @@ class JsonLedger:
         self._load()
         self._in_flight = None
         self._flush()
+        # Compaction point: the snapshot now contains everything the journal did.
+        self.journal.unlink(missing_ok=True)
+        self._journal_lines = 0
 
     @property
     def interrupted_build(self) -> str | None:
@@ -206,12 +239,13 @@ class UnitStore:
     design promises it is not.
     """
 
-    __slots__ = ("_loaded", "_units", "path")
+    __slots__ = ("_dirty", "_loaded", "_units", "path")
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._units: dict[str, dict[str, Any]] = {}
         self._loaded = False
+        self._dirty = False
 
     def _load(self) -> None:
         if self._loaded:
@@ -226,7 +260,11 @@ class UnitStore:
         self._load()
         for u in units:
             self._units[u.unit_id] = encode_enriched_unit(u)
-        self._flush()
+        # Buffered, not written. Writing the whole map per document is quadratic
+        # in corpus size -- the same defect the indexes had, and it hid here
+        # longer because the unit store is not an Index and so was not covered
+        # by the Flushable sweep. The pipeline commits once per build.
+        self._dirty = True
 
     def get(self, unit_id: UnitId) -> EnrichedUnit | None:
         from indexer.pipeline.codec import decode_enriched_unit
@@ -239,7 +277,7 @@ class UnitStore:
         self._load()
         n = sum(1 for u in unit_ids if self._units.pop(u, None) is not None)
         if n:
-            self._flush()
+            self._dirty = True
         return n
 
     def all_ids(self) -> list[UnitId]:
@@ -250,5 +288,21 @@ class UnitStore:
         self._load()
         return len(self._units)
 
-    def _flush(self) -> None:
-        atomic_write(self.path, json.dumps(self._units).encode("utf-8"))
+    def flush(self) -> None:
+        """Persist. Called once per build by the ingestion pipeline."""
+        if self._dirty:
+            atomic_write(self.path, json.dumps(self._units).encode("utf-8"))
+            self._dirty = False
+
+
+def _record_json(r: DocumentRecord) -> dict[str, Any]:
+    return {
+        "document_id": r.document_id,
+        "source_uri": r.source_uri,
+        "content_hash": r.content_hash,
+        "unit_ids": list(r.unit_ids),
+        "stage_keys": dict(r.stage_keys),
+        "build_id": r.build_id,
+        "updated_at": r.updated_at,
+        "warnings": list(r.warnings),
+    }

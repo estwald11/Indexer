@@ -465,6 +465,28 @@ file *before* validation, so a default is never expanded -- and the literal
 string created a directory named `${paths.store}`. Defaults now resolve in the
 assembler. The general rule: **anything interpolated must come from the file.**
 
+**Per-stage accounting had 29% coverage, and that was the bug.** The manifest
+summed 21s of stage time inside a 73s build and said nothing about the other
+52s, because accounting only measured what was inside a stage. Printing the
+residual (`BuildManifest.unaccounted_wall_ms`) found it immediately: the unit
+store rewrote a 9 MB map once per document, and the ledger rewrote a 479 KB
+snapshot once per document — the same quadratic-persistence defect the indexes
+had, in two places the `Flushable` sweep did not cover because neither is an
+`Index`.
+
+Buffering the unit store took the build to 29.8s. Replacing the ledger's
+rewrite with an append-only journal, compacted at `commit_build`, took it to
+**24.8s — 2.95x faster — with accounting coverage at 86%**. The journal keeps
+the durability guarantee exactly: a record is fsync'd the moment its document is
+done, a load replays the journal over the snapshot, and a torn final line from a
+killed process costs only the document it described.
+
+The general lesson, and the reason the residual is now a manifest field: **an
+accounting layer that measures only the work it knows about will report a
+pipeline as fast while most of its time is somewhere else.** Invariant 6 asks
+for per-stage cost and latency; it is worth nothing without a coverage number
+next to it.
+
 Two contract checks earned their place by catching bugs in the implementation
 that proposed them: `check_parsed_document` and `check_units` found all of the
 first two class of failures, on real documents, before any of it reached an

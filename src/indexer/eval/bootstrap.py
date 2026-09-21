@@ -456,9 +456,17 @@ class LLMBootstrapper(StageImpl):
         spans. That is what makes "the set was paraphrased" a controlled
         comparison rather than two unrelated sets of numbers.
         """
-        shared = ("target_size", "seed", "min_unit_chars", "max_unit_chars", "detail_terms",
-                  "drop_if_baseline_rank", "drop_if_worse_than", "structured_share",
-                  "max_per_document")
+        shared = (
+            "target_size",
+            "seed",
+            "min_unit_chars",
+            "max_unit_chars",
+            "detail_terms",
+            "drop_if_baseline_rank",
+            "drop_if_worse_than",
+            "structured_share",
+            "max_per_document",
+        )
         return HeuristicBootstrapper(
             {k: self.param(k) for k in shared if self.param(k) is not None}
         ).bootstrap(documents, units, baseline=baseline, target_size=target_size)

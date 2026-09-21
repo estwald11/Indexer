@@ -541,8 +541,6 @@ def build_embedder(kind: str, params: Mapping[str, Any] | None = None) -> Embedd
     try:
         cls = _EMBEDDERS[kind]
     except KeyError:
-        raise ValueError(
-            f"unknown embedder {kind!r}; known: {sorted(_EMBEDDERS)}"
-        ) from None
+        raise ValueError(f"unknown embedder {kind!r}; known: {sorted(_EMBEDDERS)}") from None
     embedder: Embedder = cls(params)
     return embedder

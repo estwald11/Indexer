@@ -107,6 +107,181 @@ seeded, fusion breaks ties by unit id, and re-running reproduced every arm's
 numbers exactly.
 
 
+## Results
+
+Thirteen arms, 333 queries, 267s, $0.00. Reranking, routing and structure-aware
+segmentation are on in the arms marked; every row's exact override list is in
+`configs/pypi-docs.yaml`.
+
+```
+arm                     P@5     R@20    nDCG@10  fail@20  correct  p50   p95
+1-lexical-only          0.145   0.917   0.573    0.075    0.730    8ms   10ms
+2-dense-only   (hash)   0.054   0.473   0.209    0.474    0.345    5ms    5ms
+2b-svd-only    (LSA)    0.100   0.797   0.390    0.183    0.556   21ms   46ms
+3-hybrid-rrf   (hash)   0.105   0.847   0.411    0.138    0.607   17ms   38ms
+3c-hybrid-svd  (LSA)    0.136   0.887   0.529    0.102    0.688   35ms   57ms
+3b-hybrid-rerank        0.114   0.887   0.454    0.102    0.676   21ms   41ms
+4-hybrid-sectionpath    0.102   0.820   0.393    0.162    0.598   16ms   27ms
+5-hybrid-context        0.087   0.790   0.329    0.189    0.535   15ms   25ms
+6-hybrid-context-rerank 0.103   0.853   0.406    0.132    0.616   20ms   36ms
+9-hybrid-weighted       0.105   0.867   0.401    0.120    0.640   22ms   42ms
+10-context-lean         0.110   0.897   0.450    0.093    0.688   18ms   29ms
+7-no-router             0.093   0.790   0.378    0.210    0.625   20ms   32ms
+8-fixed-window          0.105   0.777   0.405    0.201    0.643   18ms   27ms
+```
+
+Query cost is $0.00 in every arm because nothing on the query path calls a
+model. That is the whole reason this run exists rather than a better one.
+
+### What reproduced, and what did not
+
+| Invariant | On this corpus | |
+|---|---|---|
+| 1. Retrieval predicts answer quality | r = 0.91 | **circular** — see below |
+| 2. Ingestion paid once | 20.7s cold, 0.0s warm, per-stage | holds |
+| 3. Context cuts failures ~⅓ | −9% chunk-specific, **+29% verbose** | falls short / inverts |
+| 4. Hybrid beats either half | 0.102 vs **0.075** lexical alone | does not hold |
+| 5. Structured never hits vector search | 100% → 0% failure on that slice | **holds, decisively** |
+| 6. Nothing optimised without a number | every row above | holds |
+
+Two of six reproduce cleanly, one holds but cannot be claimed, two fail with
+identified causes, and one fails for a reason this environment cannot fix. The
+failures were more informative than the passes, which is the argument for
+building the harness before the pipeline.
+
+### Invariant 1 reproduces numerically and must not be claimed
+
+Across the thirteen arms, Precision@5 correlates with end-to-end correctness at
+**r = 0.911** (published: 0.98). Retrieval failure rate correlates at −0.928,
+recall@20 at 0.936, nDCG@10 at 0.927.
+
+**This is not evidence.** The correctness figure comes from `ContainmentJudge`,
+which asks whether the concatenated top-5 passages contain 60% of the gold
+passage's content words. The "answer" is the retrieved text and the judge is
+lexical, so the judge and the metric are reading the same evidence — a
+correlation between them is arithmetic, not a finding. The four retrieval
+metrics correlating equally well is the tell: if P@5 were specifically
+predictive, it would separate from recall@20, and it does not.
+
+Testing invariant 1 honestly needs a generation step and a judge that reads the
+answer rather than the passages. The frame supports it — `EvalRunner.answerer`
+takes a caller-supplied function and `Judge` is a protocol — and this
+environment has no model to put behind either. The correlation is reported
+because omitting a number that looks supportive would be worse than printing it
+with its caveat.
+
+### Invariant 5 is the largest effect in the report
+
+Routing is worth more than any other single stage here, and the aggregate
+understates it. Holding everything else constant (`6-hybrid-context-rerank`
+against `7-no-router`):
+
+| slice | n | router on | router off |
+|---|---|---|---|
+| structured | 16 | **0.000** | 1.000 |
+| numeric | 4 | **0.000** | 1.000 |
+| temporal | 13 | **0.000** | 0.231 |
+| factual | 300 | 0.147 | 0.157 |
+| **all** | 333 | **0.132** | 0.210 |
+
+Every structured and numeric question fails without the router and none fails
+with it. The factual slice barely moves, which is the point: routing does
+nothing for the queries retrieval already handles and is total for the ones it
+cannot. A question like *"which entries have version major greater than 2"* has
+no passage that answers it — the answer is an aggregate over extracted fields —
+so a vector index cannot return the right thing at any depth.
+
+This is also why `RunReport.by_query_type` exists. Structured questions are 10%
+of this set; at a more typical 3% the same catastrophic failure would move the
+headline by two points and be invisible.
+
+### Structure-aware segmentation is worth about as much as reranking
+
+`8-fixed-window` (400-token windows, 64 overlap) against `6-hybrid-context-
+rerank`, which differs from it in the segmenter and nothing else: **0.201
+against 0.132**, so fixed windows are 52% worse, or structure buys a 34%
+reduction in retrieval failures. Recall@20 is 0.777 against 0.853. The cost at
+query time is zero — the work is all in `segment`.
+
+(An earlier draft of this section compared arm 8 against `10-context-lean`,
+which differs in the segmenter *and* the context enricher, and so measured
+neither. The arms' override lists in `configs/pypi-docs.yaml` are what make that
+mistake findable, and they are the reason to write arms as overrides rather than
+as separate config files.)
+
+Fixed windows also fail `check_unit_stability`: because boundaries are
+position-derived, inserting a paragraph early in a document shifts every
+subsequent boundary and changes every subsequent unit id, so a one-line edit
+re-embeds the whole document. The quality loss and the incremental-rebuild cost
+come from the same property.
+
+### Reranking works
+
+`5-hybrid-context` → `6-hybrid-context-rerank`: 0.189 → 0.132, **−30%**, inside
+the ±50% band around the published −50%, and the only sanity check that passes.
+The same change on the no-context arm (`3-hybrid-rrf` → `3b-hybrid-rerank`)
+gives 0.138 → 0.102, −26%.
+
+It is worth noting *what* is reranking: `lexical_overlap`, which scores query
+term coverage and proximity with no model at all. A cross-encoder should do
+better. That a bag-of-words reranker recovers a quarter to a third of top-20
+failures says the first-stage ranking is leaving obvious wins on the table —
+BM25 rewards a passage that repeats one query term over one containing all of
+them, and that is a large share of what reranking fixes.
+
+### Contextualisation: verbose hurts, chunk-specific helps slightly
+
+The most instructive failure in the report. Holding reranking constant:
+
+| arm | context | fail@20 | vs no context |
+|---|---|---|---|
+| `3b-hybrid-rerank` | none | 0.102 | — |
+| `6-hybrid-context-rerank` | document lead + topics + path (27% of surface) | 0.132 | **+29%** |
+| `10-context-lean` | subject + section path only | 0.093 | −9% |
+
+Verbose context made retrieval substantially *worse*. The cause is measured, not
+guessed: `check_context_specificity` reports the prepended text was **76%
+identical (token Jaccard) between adjacent units of the same document** and
+occupied **27% of the indexed surface**. A quarter of every unit's retrieval
+surface was text its neighbours also carried — which cannot rank one unit above
+its sibling, while it does inflate length (BM25 penalises that) and pull every
+unit's vector toward the document centroid.
+
+Stripping the duplicated parts recovered it and then some: 0.132 → 0.093. The
+monotone ladder without reranking says the same thing — no context 0.138,
+heading trail 0.162, full document context 0.189.
+
+This sharpened invariant 3's contract, recorded in `ARCHITECTURE.md`:
+
+> **Context must be chunk-specific, not document-level.** A summary that
+> situates *this chunk* is discriminative. Boilerplate describing the document
+> is dilution wearing the same shape.
+
+The chunk-specific arm still reaches only −9% against the published −33%, and
+the sanity check correctly flags that. The remaining gap is what an LLM-written
+summary supplies and an extractive one cannot: a restatement of what the chunk
+is about, in vocabulary the chunk does not itself use. `llm_contextualizer` is
+written and registered against the same contract; it needs an API key.
+
+### Cost and latency
+
+Ingestion: 686 documents → 10,283 units (10.2 MB of text) in **24.8s cold,
+0.1s warm**, on one core, $0.00. Per stage: index 15.4s, enrich 4.0s, parse
+1.5s, segment 0.5s — 86% of the wall clock inside a measured stage. Query: p50
+8–35ms by arm, p95 10–57ms.
+
+The warm number is the invariant-2 claim made concrete: a second build of an
+unchanged corpus writes nothing, and the ablation runner depends on it — arms
+sharing an ingestion configuration reuse the build and report `0 units written`.
+
+The cold number was 73.2s until the accounting was read rather than printed.
+Stages summed to 21s of it, and the residual turned out to be the unit store
+and the ledger each rewriting their whole file once per document. Both are now
+buffered or journalled, which is a 2.95x speedup and is recorded in
+`ARCHITECTURE.md`. The coverage figure is reported beside the total for that
+reason: per-stage timings with 29% coverage describe a different program than
+the one that ran.
+
 ## The embedder, measured
 
 `2-dense-only` and `3-hybrid-rrf` were read, when this report was first written,

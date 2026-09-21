@@ -198,9 +198,7 @@ class VectorIndex(StageImpl):
         ids = list(self._meta)
         surfaces = [self._meta[u]["t"] for u in ids]
         self.embedder.fit(surfaces)
-        self._vecs = dict(
-            zip(ids, self.embedder.embed_documents(surfaces), strict=True)
-        )
+        self._vecs = dict(zip(ids, self.embedder.embed_documents(surfaces), strict=True))
         self._fit_dirty = False
         self._matrix = None
 
@@ -266,9 +264,7 @@ class VectorIndex(StageImpl):
     def _search_numpy(self, q: list[float]) -> list[tuple[str, float]]:
         if self._matrix is None:
             self._matrix_ids = list(self._vecs)
-            self._matrix = _np.asarray(
-                [self._vecs[u] for u in self._matrix_ids], dtype=_np.float32
-            )
+            self._matrix = _np.asarray([self._vecs[u] for u in self._matrix_ids], dtype=_np.float32)
         if not self._matrix_ids:
             return []
         scores = self._matrix @ _np.asarray(q, dtype=_np.float32)
