@@ -124,6 +124,38 @@ def main() -> int:
             )
         print("```")
 
+    # Narrative figures the prose cites, so no number in the report is typed by
+    # hand. Every one of these appeared in an earlier draft transcribed from a
+    # terminal, and two of them were wrong.
+    print("\n### Figures cited in the prose\n```")
+    g = d["golden"]
+    print(
+        f"  queries                {g['total']}  "
+        f"(factual {g['by_type'].get('factual', 0)}, "
+        f"structured {g['by_type'].get('structured', 0)}, "
+        f"temporal {g['by_type'].get('temporal', 0)}, "
+        f"numeric {g['by_type'].get('numeric', 0)})"
+    )
+    print(f"  corpus                 {d['corpus']['documents']} docs, {d['corpus']['units']} units")
+    print(f"  arms                   {len(arms)}")
+    print(f"  wall                   {d['wall_s']:.0f}s")
+    lat = [a["p50_ms"] for a in arms]
+    p95 = [a["p95_ms"] for a in arms]
+    print(
+        f"  query latency          p50 {min(lat):.0f}-{max(lat):.0f}ms, "
+        f"p95 {min(p95):.0f}-{max(p95):.0f}ms"
+    )
+    best = min(arms, key=lambda a: a["fail_rate"])
+    print(f"  best arm by fail@20    {best['arm']} at {best['fail_rate']:.3f}")
+    for name in ("1-lexical-only", "3c-hybrid-svd", "6-hybrid-context-rerank", "10-context-lean"):
+        if name in by:
+            a = by[name]
+            print(
+                f"  {name:22} P@5 {a['p@5']:.3f}  R@20 {a['recall@20']:.3f}  "
+                f"nDCG@10 {a['ndcg@10']:.3f}  fail {a['fail_rate']:.3f}"
+            )
+    print("```")
+
     for w in d.get("contract_warnings", []):
         print(f"\n> **Contract check:** {w}")
     print()
