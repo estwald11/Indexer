@@ -74,7 +74,8 @@ ingestion:
 
       # Invariant 5's supply side. Without extracted fields a numeric or
       # temporal question has nowhere to go but the vector index.
-      - impl: regex_fields
+      - &extract
+        impl: regex_fields
         scope: unit
         params:
           from_metadata: [package]
@@ -167,7 +168,12 @@ eval:
     - name: 1-lexical-only
       description: BM25 alone, no context, no fusion, no rerank. The floor.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
         ingestion.index.indexes[dense].enabled: false
         query.route.paths.lookup.targets: [lexical]
         query.route.paths.iterative.targets: [lexical]
@@ -176,7 +182,12 @@ eval:
     - name: 2-dense-only
       description: Hashed dense alone. Not a semantic model -- see docs/REVIEW.md.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
         ingestion.index.indexes[lexical].enabled: false
         query.route.paths.lookup.targets: [dense]
         query.route.paths.iterative.targets: [dense]
@@ -190,7 +201,12 @@ eval:
     - name: 2b-svd-only
       description: LSA alone. Same arm as 2-dense-only with a learned embedder.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
         ingestion.index.indexes[lexical].enabled: false
         ingestion.index.indexes[dense].impl: svd_embedding
         ingestion.index.indexes[dense].params: {dim: 512, min_df: 2}
@@ -201,14 +217,24 @@ eval:
     - name: 3-hybrid-rrf
       description: Both indexes fused with RRF, still no context. Invariant 4 alone.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
 
     # Invariant 4, asked of a dense half that is actually worth fusing. Against
     # 1-lexical-only this is the whole claim: does hybrid beat either half?
     - name: 3c-hybrid-svd
       description: Hybrid RRF with the learned embedder. Invariant 4, re-asked.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
         ingestion.index.indexes[dense].impl: svd_embedding
         ingestion.index.indexes[dense].params: {dim: 512, min_df: 2}
 
@@ -258,7 +284,12 @@ eval:
         without it, comparing a context arm that reranks against a no-context arm
         that does not attributes the difference to the wrong stage.
       overrides:
-        ingestion.enrich.enabled: false
+        # Context off, extraction ON. `enrich.enabled: false` would also drop
+        # regex_fields, emptying the router's field lexicon and failing all 33
+        # structured questions -- confounding every context comparison with an
+        # invariant-5 regression. Extraction is held constant across the ladder.
+        ingestion.enrich.enrichers:
+          - *extract
         query.rerank.enabled: true
 
     - name: 9-hybrid-weighted
