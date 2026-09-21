@@ -228,3 +228,32 @@ def json_snapshot(obj: object) -> str:
     import json
 
     return json.dumps(obj, sort_keys=True, default=str)
+
+
+class TestInertStructuredPath:
+    """A structured index with nothing in it is the quietest way to lose
+    invariant 5: the config validates, but the router has no field vocabulary,
+    so every structured question is classified as prose and sent to vector
+    search. Nothing errors -- the questions just fail."""
+
+    def test_warns_when_no_enricher_extracts_fields(self) -> None:
+        from indexer.config.schema import Config
+
+        raw = load_mapping(REFERENCE)
+        raw["ingestion"]["enrich"]["enrichers"] = [{"impl": "section_prefix", "scope": "unit"}]
+        cfg = Config.model_validate(raw)
+        assert cfg.extracted_field_names() == []
+        assert any("no enabled enricher declares any field" in w for w in cfg.warnings())
+
+    def test_no_warning_once_extraction_is_configured(self) -> None:
+        cfg, _ = load(REFERENCE)
+        assert cfg.extracted_field_names()
+        assert not any("no enabled enricher declares any field" in w for w in cfg.warnings())
+
+    def test_the_lexicon_the_router_gets_is_the_one_the_check_reads(self) -> None:
+        """One derivation, so the warning and the behaviour cannot drift apart."""
+        from indexer.pipeline.build import assemble
+
+        cfg, _ = load(REFERENCE)
+        assembly = assemble(REFERENCE)
+        assert assembly._field_lexicon() == cfg.extracted_field_names()

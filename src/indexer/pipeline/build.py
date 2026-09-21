@@ -177,16 +177,9 @@ class Assembly:
         return reg.build(_accepted_params(reg, params))
 
     def _field_lexicon(self) -> list[str]:
-        names: list[str] = []
-        for spec in self.config.ingestion.enrich.enrichers:
-            if not spec.enabled:
-                continue
-            names.extend(spec.params.get("fields", {}) or {})
-            names.extend(spec.params.get("from_metadata", []) or [])
-            schema = spec.params.get("schema")
-            if isinstance(schema, dict):
-                names.extend(schema)
-        return sorted(set(names))
+        """The router's field vocabulary. One derivation, shared with the
+        validator's warning, so the check and the behaviour cannot drift."""
+        return self.config.extracted_field_names()
 
     def retriever(self) -> Any:
         r = self.config.query.retrieve

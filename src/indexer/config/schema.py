@@ -459,6 +459,25 @@ class Config(_Base):
             e.enabled for e in self.ingestion.enrich.enrichers
         )
 
+    def extracted_field_names(self) -> list[str]:
+        """Fields the enabled enrichers declare. This is the router's vocabulary.
+
+        Read from config rather than from a built index, so a misconfiguration
+        is catchable before a build rather than after one.
+        """
+        names: list[str] = []
+        if not self.ingestion.enrich.enabled:
+            return names
+        for spec in self.ingestion.enrich.enrichers:
+            if not spec.enabled:
+                continue
+            names.extend(spec.params.get("fields", {}) or {})
+            names.extend(spec.params.get("from_metadata", []) or [])
+            schema = spec.params.get("schema")
+            if isinstance(schema, dict):
+                names.extend(schema)
+        return sorted(set(names))
+
     def warnings(self) -> list[str]:
         """Configurations that are valid but probably not what was meant.
 
@@ -484,6 +503,27 @@ class Config(_Base):
                 "rerank is off: published numbers put it at 2.9% -> 1.9% top-20 "
                 "retrieval failure once units are contextualised."
             )
+        # A structured index with nothing in it is the quietest way to lose
+        # invariant 5. The config validates -- a structured index exists and the
+        # route targets it -- but no enricher extracts a field, so the router's
+        # lexicon is empty, every structured question is classified as prose, and
+        # the structured path never fires. Nothing errors; the questions just
+        # fail. This is a warning rather than an error because an index being
+        # populated later, or by a caller's own enricher, is legitimate.
+        if self.query.route.enabled and "structured" in self.query.route.paths:
+            structured_live = any(
+                i.kind == "structured" and i.enabled for i in self.ingestion.index.indexes
+            )
+            if structured_live and not self.extracted_field_names():
+                out.append(
+                    "a structured index and a structured route are configured, but no "
+                    "enabled enricher declares any field to extract. The router has no "
+                    "field vocabulary, so structured and numeric questions will be "
+                    "classified as prose and sent to vector search -- the exact failure "
+                    "invariant 5 exists to prevent. Add an extraction enricher, or "
+                    "remove the structured path."
+                )
+
         enabled_names = {i.name for i in self.ingestion.index.indexes if i.enabled}
         inert = set(self.query.fuse.weights) - enabled_names
         if inert and self.query.fuse.enabled:

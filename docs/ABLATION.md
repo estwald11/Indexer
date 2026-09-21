@@ -1,9 +1,13 @@
 # Ablation report: PyPI documentation corpus
 
 What this run establishes, what it does not, and what it changed about the
-contracts. Read the caveats before the table — two of the four published
-expectations did not reproduce, and the reasons are more useful than the
-numbers.
+contracts.
+
+Of the six invariants the frame is built on, two reproduce cleanly, one holds
+but cannot honestly be claimed from this data, two fail with identified causes,
+and one fails for a reason this environment cannot fix. **The failures were more
+informative than the passes**, which is the argument for building the harness
+before the pipeline. Read the caveats before the table.
 
 ## The corpus
 
@@ -397,3 +401,50 @@ Because the rewriter composes the heuristic generator rather than replacing it,
 the two sets share candidates, filters and gold spans exactly. The only
 difference between them is the wording of the queries, which is what makes
 "paraphrasing the set changed the arms by X" a controlled statement.
+
+## What this changes about the defaults
+
+Findings that are now encoded rather than written down, so the next project
+inherits them:
+
+| Finding | Where it lives now |
+|---|---|
+| Context must be chunk-specific | `check_context_specificity`, run by the ablation script and reported in `ablation.json` |
+| Fusion weights are not optional tuning | `Fuser` contract in `ARCHITECTURE.md`; equal weights kept as the prior, not the answer |
+| `segment.overlap_tokens` earns nothing | Stays 0 by default; kept only as an ablation arm |
+| Accounting needs a coverage number | `BuildManifest.unaccounted_wall_ms`, printed in every build summary |
+| Arms must differ only in stated keys | `AblationSpec.overrides`; two confounded comparisons were caught this way |
+
+## What is still open
+
+Ordered by how much each would change the conclusions.
+
+**1. A bi-encoder.** Every dense number here is a floor. `2-dense-only` to
+`2b-svd-only` cut failures 61% by changing the embedder alone, and LSA is the
+strongest dense index that runs with no model download — not the strongest one
+available. Invariant 4 failing on this corpus is a statement about a hashing
+trick and a truncated SVD, not about hybrid retrieval.
+
+**2. Paraphrased queries.** The golden set's queries share vocabulary with their
+gold passages, so no query here *requires* a retriever to match meaning. That
+caps what any dense arm can demonstrate. `LLMBootstrapper` is written and
+registered for exactly this and needs an API key; four model-free transforms
+were tried and none is a paraphrase (see above).
+
+**3. An LLM contextualiser.** The chunk-specific arm reaches −9% against the
+published −33%. The gap is what a written summary supplies and an extractive one
+cannot: a restatement of the chunk in vocabulary it does not itself use.
+`llm_contextualizer` implements the same contract.
+
+**4. An independent judge.** Correctness here is lexical containment over the
+retrieved passages, which is why the r=0.911 correlation with P@5 is arithmetic
+rather than evidence. A generation step and a judge that reads the answer would
+make invariant 1 testable. `EvalRunner.answerer` and the `Judge` protocol are
+the seams.
+
+**5. Human verification of the golden set.** 333 machine-generated items, zero
+verified. Every absolute number in this report inherits whatever bias the
+generator has.
+
+None of the five needs a frame change. That is the claim the whole exercise was
+meant to test, and it is the one result here that came out as hoped.

@@ -208,7 +208,7 @@ class TestSvdIndexDefersItsFit:
         )
 
     def test_search_between_batches_is_correct_without_a_flush(self) -> None:
-        """"Results may be stale on disk but must already be correct in memory."""
+        """ "Results may be stale on disk but must already be correct in memory."""
         idx = SvdIndex({"dim": 4, "min_df": 1})
         self._write(idx)
         assert idx.stats().detail["pending_fit"] is True

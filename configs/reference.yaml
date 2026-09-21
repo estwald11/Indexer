@@ -63,9 +63,31 @@ ingestion:
       # helps" from "any prefix helps".
       - impl: section_prefix
         scope: unit
-      # The real one is added by configs/full.yaml. Keeping the reference path
-      # model-free means the end-to-end path runs with no API key at all, which
-      # is what makes it usable as a test fixture.
+
+      # Invariant 5's supply side. Without an enricher that extracts fields the
+      # structured index below is inert: the router's vocabulary is empty, every
+      # numeric or temporal question is classified as prose, and the structured
+      # path never fires. Nothing errors -- the questions just quietly fail.
+      # The config validator warns about exactly this combination.
+      #
+      # Regex rather than a model because a regex gets a version string or a
+      # date exactly right, and "nearly right" on a value a query will compare
+      # against is worse than useless.
+      - impl: regex_fields
+        scope: unit
+        params:
+          from_metadata: [name]
+          fields:
+            version:
+              pattern: '\b(?:version|release)\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+              type: str
+            release_date:
+              pattern: '\b(\d{4}-\d{2}-\d{2})\b'
+              type: date
+
+      # The LLM contextualiser is added by configs/full.yaml. Keeping the
+      # reference path model-free means the end-to-end path runs with no API key
+      # at all, which is what makes it usable as a test fixture.
 
   index:
     batch_size: 128

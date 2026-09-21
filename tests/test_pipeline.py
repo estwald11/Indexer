@@ -408,3 +408,28 @@ class TestLedgerJournal:
         res = a2.ingestion().build()
         assert res.manifest.corpus.documents_unchanged == 1
         assert res.manifest.corpus.documents_added == 1
+
+
+class TestStructuredPathEndToEnd:
+    """Invariant 5, end to end: the answer comes from extracted fields, every
+    row cites its source, and no vector index is consulted at any point."""
+
+    def test_structured_query_answers_from_fields_with_citations(self, workspace: Path) -> None:
+        (workspace / "data" / "rel.md").write_text(
+            "# Releases\n\n## 1.4.0\n\nReleased 2024-03-11 with timeout=30 support.\n\n"
+            "## 1.5.0\n\nReleased 2025-07-02 with timeout=45 support.\n"
+        )
+        a, res = _build(workspace)
+        assert res.ok
+
+        resp = a.query_engine().query("how many entries have a timeout seconds recorded")
+        assert str(resp.decision.path) == RoutePath.STRUCTURED
+        assert resp.records is not None
+        assert resp.records.rows, "structured path returned no rows for data that exists"
+        # Every row is as citable as a passage.
+        assert all(src for src in resp.records.sources)
+        # And nothing went near a vector index.
+        assert resp.hits == ()
+        assert resp.skipped["retrieve"] == "structured_path"
+        assert resp.skipped["fuse"] == "structured_path"
+        assert resp.skipped["rerank"] == "structured_path"
