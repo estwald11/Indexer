@@ -107,8 +107,21 @@ python scripts/run_ablation.py configs/pypi-docs.yaml # build + bootstrap + 10 a
 ```
 
 Writes `var/pypi/eval/ablation.{json,txt}`. Deterministic: the bootstrapper is
-seeded, fusion breaks ties by unit id, and re-running reproduced every arm's
-numbers exactly.
+seeded, fusion breaks ties by unit id, and re-running reproduces every arm's
+numbers exactly — which is load-bearing rather than tidy. The one bug here that
+nothing else would have caught was found by running identical code twice and
+getting different answers.
+
+The numeric sections below are rendered from `ablation.json` by
+
+```bash
+python scripts/report_table.py var/pypi/eval/ablation.json
+```
+
+rather than transcribed. Three revisions of this report introduced two
+transcription errors and one comparison quoted from memory; the generator
+removes the first failure mode and refuses to print a comparison whose arms it
+cannot find in the artifact.
 
 
 ## Results
@@ -401,6 +414,49 @@ Because the rewriter composes the heuristic generator rather than replacing it,
 the two sets share candidates, filters and gold spans exactly. The only
 difference between them is the wording of the queries, which is what makes
 "paraphrasing the set changed the arms by X" a controlled statement.
+
+## Seven ways the harness lied, and how each was caught
+
+The most transferable result here is not a number. Building the harness before
+the pipeline was supposed to make the pipeline measurable; what it actually did
+first was reveal that **the measurement apparatus was wrong in seven distinct
+ways**, every one of which produced output that looked like a result.
+
+That shared shape is the point. None of these threw. None produced an obviously
+silly figure. Each would have been reported as a finding.
+
+| What was wrong | What it reported | What exposed it |
+|---|---|---|
+| An empty structured result scored as success | arm failure rate 0.075 against a true 0.110 | `route_acc` dropping to 0.0 in an arm with no business routing differently |
+| `enrich.enabled: false` removed field extraction as well as context | every context comparison confounded with an invariant‑5 regression | the same `route_acc` signal, in six more arms |
+| The structured index answered any text query with 50 arbitrary rows | a constant noise list entering RRF at rank‑1 weight | the no‑router arm going to 1.000 |
+| The ledger committed documents before the indexes holding them were flushed | 493 documents claimed, none held; the resumed build scored an arm at 0.952 | an arm's numbers changing between two runs of identical code |
+| The router parsed ISO dates as integers, ignored `before`/`greater than`, and let `version` shadow `version_major` | well‑formed structured questions matching nothing | the structured slice failing at a rate the router's 100% accuracy could not explain |
+| The golden set contained 16 identical queries and comparisons at the edges of the data | a structured slice measuring the corpus rather than the system | reading the generated queries |
+| The judge returned False for items it could not assess | every arm understated by the same amount — deltas intact, absolutes meaningless | noticing that structured items had stopped carrying a gold span |
+
+Four of the seven were caught by a **cross-check that had no reason to move**:
+route accuracy is not a retrieval metric, and an arm that changes only
+contextualisation has no business changing it. That is the argument for
+reporting per-slice diagnostics next to the headline rather than instead of it —
+not because anyone reads them routinely, but because they are what disagrees
+when the headline is wrong.
+
+Two were caught by **reporting a residual**: per-stage accounting that summed to
+21s inside a 73s build, and a manifest that now carries the difference. A
+coverage number beside a total is cheap and it found two bugs neither total
+would have.
+
+One was caught by **re-running identical code and getting different numbers**,
+which is the only reason the durability bug was found at all. Determinism is not
+a nicety in an evaluation harness; it is the property that makes every other
+inconsistency visible.
+
+The general lesson, and the one worth carrying to another project: **an
+evaluation harness fails silently by construction.** Its output is numbers, and
+wrong numbers look exactly like right ones. Every guard above is cheap, and
+none of them would have been added in response to a symptom, because there was
+no symptom — there was a plausible table.
 
 ## What this changes about the defaults
 
