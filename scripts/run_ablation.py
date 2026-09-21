@@ -16,14 +16,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import indexer.eval.bootstrap  # noqa: E402,F401  -- imported for its registrations
-from indexer.config.loader import load  # noqa: E402
-from indexer.core.registry import resolve  # noqa: E402
-from indexer.eval.golden import load_golden_set, write_golden_set  # noqa: E402
-from indexer.eval.judge import ContainmentJudge  # noqa: E402
-from indexer.eval.metrics import Matcher  # noqa: E402
-from indexer.eval.runner import AblationRunner, EvalRunner  # noqa: E402
-from indexer.pipeline.build import assemble  # noqa: E402
+import indexer.eval.bootstrap  # noqa: F401  -- imported for its registrations
+from indexer.config.loader import load
+from indexer.core.registry import resolve
+from indexer.eval.golden import load_golden_set, write_golden_set
+from indexer.eval.judge import ContainmentJudge
+from indexer.eval.metrics import Matcher
+from indexer.eval.runner import AblationRunner, EvalRunner
+from indexer.pipeline.build import assemble
 
 
 def say(msg: str) -> None:
@@ -58,7 +58,7 @@ def main() -> int:
     # ---- 1b. contract checks on the built corpus ------------------------
     # Run before evaluating, because a golden set scored against a corpus whose
     # provenance is broken produces numbers that look fine and mean nothing.
-    from indexer.eval.checks import check_context_specificity  # noqa: PLC0415
+    from indexer.eval.checks import check_context_specificity
 
     built_units = [
         eu for uid in base.unit_store.all_ids() if (eu := base.unit_store.get(uid)) is not None
@@ -77,9 +77,10 @@ def main() -> int:
         say(f"== golden set: {len(golden)} queries (existing) {golden.stats()}")
     else:
         say("== bootstrapping golden set")
-        from indexer.pipeline.codec import decode_parsed_document
-        from indexer.core.cache import cache_key
         import json as _json
+
+        from indexer.core.cache import cache_key
+        from indexer.pipeline.codec import decode_parsed_document
 
         parser_fp = base.parser().fingerprint()
         docs = []
@@ -120,7 +121,7 @@ def main() -> int:
         matcher=Matcher(policy=cfg.eval.match, min_overlap=cfg.eval.min_overlap),
         k_values=cfg.eval.k_values,
         failure_k=cfg.eval.failure_k,
-        top_k=max(cfg.eval.k_values + [cfg.eval.failure_k]),
+        top_k=max([*cfg.eval.k_values, cfg.eval.failure_k]),
         judge=ContainmentJudge({}),
     )
     ab = AblationRunner(

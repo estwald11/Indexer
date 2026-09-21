@@ -433,3 +433,51 @@ class TestStructuredPathEndToEnd:
         assert resp.skipped["retrieve"] == "structured_path"
         assert resp.skipped["fuse"] == "structured_path"
         assert resp.skipped["rerank"] == "structured_path"
+
+
+class TestStructuredScoring:
+    """A structured query that returns nothing has failed.
+
+    Scoring the structured path as successful merely for having been taken
+    flatters every arm whose structured index is empty -- which is every arm
+    with extraction disabled. On the ablation corpus that was the difference
+    between a 0.075 and a 0.141 failure rate for the same arm.
+    """
+
+    def test_empty_record_set_counts_as_a_failure(self) -> None:
+        from indexer.core.ids import DocumentId
+        from indexer.core.predicate import Exists, StructuredQuery
+        from indexer.core.provenance import Span
+        from indexer.core.query import Query, QueryType, RouteDecision, RoutePath
+        from indexer.core.results import RecordSet, RetrievalResponse
+        from indexer.eval.golden import GoldenQuery, RelevantSpan
+        from indexer.eval.runner import EvalRunner
+
+        item = GoldenQuery(
+            id="s1",
+            query="how many entries have a version recorded",
+            relevant=(RelevantSpan(document_id=DocumentId("d1"), span=Span(0, 10)),),
+            query_type=QueryType.STRUCTURED,
+        )
+        decision = RouteDecision(
+            path=RoutePath.STRUCTURED,
+            structured_query=StructuredQuery(where=Exists("version")),
+            query_type=QueryType.STRUCTURED,
+        )
+
+        class Engine:
+            def __init__(self, rows: tuple) -> None:
+                self.rows = rows
+
+            def execute(self, q: Query) -> RetrievalResponse:
+                return RetrievalResponse(
+                    query=q,
+                    decision=decision,
+                    records=RecordSet(columns=("version",), rows=self.rows),
+                )
+
+        runner = EvalRunner()
+        empty = runner._score_one(Engine(()), item)
+        answered = runner._score_one(Engine((("1.2.0",),)), item)
+        assert empty.failed is True, "an empty record set must count as a failure"
+        assert answered.failed is False

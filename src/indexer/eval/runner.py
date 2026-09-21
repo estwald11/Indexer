@@ -99,12 +99,19 @@ class EvalRunner:
         )
         s.route_correct = _route_correct(item.query_type, resp)
 
-        # The structured path returns records, not passages. Scoring it with
-        # span-overlap metrics would report 0 for a correct answer, so its
-        # correctness is judged on the answer and its retrieval metrics are
-        # reported as not-applicable rather than as failures.
+        # The structured path returns records, not passages. Span-overlap
+        # metrics would report 0 for a correct answer, so they are marked
+        # not-applicable rather than counted as failures.
+        #
+        # But an *empty* record set is a failure, and saying otherwise was a bug
+        # that flattered every arm with no extracted fields: those arms routed
+        # 33 structured questions to an index containing nothing, got nothing
+        # back, and were scored as having answered all 33. The failure rate that
+        # produced was 0.075 where the honest figure is 0.141. A metric that
+        # rewards a stage for being asked rather than for answering will make
+        # any ablation involving it meaningless.
         if resp.records is not None:
-            s.failed = False
+            s.failed = not resp.records.rows
             s.recall = {k: float("nan") for k in self.k_values}
             s.precision = {k: float("nan") for k in self.k_values}
             s.ndcg = {k: float("nan") for k in self.k_values}
