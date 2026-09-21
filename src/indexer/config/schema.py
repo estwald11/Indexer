@@ -485,6 +485,32 @@ class Config(_Base):
                 names.extend(schema)
         return sorted(set(names))
 
+    def extracted_field_types(self) -> dict[str, str]:
+        """Declared type per extracted field: str, int, float, bool or date.
+
+        The router needs these. Without them it must guess a value's type from
+        how it is written, and "version 1.0.0" reads as the float 1.0 -- which
+        queries a numeric column while the value lives in a text one, so a
+        well-formed question matches nothing. The types are already stated in
+        the extraction config; the only bug was not passing them along.
+        """
+        out: dict[str, str] = {}
+        if not self.ingestion.enrich.enabled:
+            return out
+        for spec in self.ingestion.enrich.enrichers:
+            if not spec.enabled:
+                continue
+            for name, decl in (spec.params.get("fields", {}) or {}).items():
+                if isinstance(decl, dict):
+                    out[name] = str(decl.get("type", "str"))
+            schema = spec.params.get("schema")
+            if isinstance(schema, dict):
+                for name, t in schema.items():
+                    out[name] = str(t)
+            for name in spec.params.get("from_metadata", []) or []:
+                out.setdefault(name, "str")
+        return out
+
     def warnings(self) -> list[str]:
         """Configurations that are valid but probably not what was meant.
 

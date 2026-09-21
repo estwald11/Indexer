@@ -149,6 +149,10 @@ class RulesRouterParams:
     #: strong structured signal, and this is how a corpus teaches the router its
     #: own vocabulary without a code change.
     field_lexicon: list[str] = field(default_factory=list)
+    #: Declared type per field (str/int/float/bool/date). Supplied from the
+    #: extraction config. Without it the router guesses from the value's
+    #: spelling, and a dotted version string reads as a float.
+    field_types: dict[str, str] = field(default_factory=dict)
     iterative_min_words: int = 14
     enable_structured: bool = True
 
@@ -171,6 +175,9 @@ class RulesRouter(StageImpl):
         super().__init__(params)
         self.paths: dict[str, dict[str, Any]] = params.get("paths", {})
         self.lexicon = [w.lower() for w in params.get("field_lexicon", [])]
+        self.field_types: dict[str, str] = {
+            k: str(v).lower() for k, v in (params.get("field_types") or {}).items()
+        }
         self.default_top_k = int(params.get("default_top_k", 50))
         self.iterative_min_words = int(params.get("iterative_min_words", 14))
         self.enable_structured = bool(params.get("enable_structured", True))
@@ -291,21 +298,39 @@ class RulesRouter(StageImpl):
         for f in fields_named:
             label = re.escape(f.replace("_", " "))
             window = rf"{label}\s*(?:is|of|=)?\s*({_OP_WORDS})?\s*"
-            m = re.search(window + r"(\d{4}-\d{2}-\d{2})", text, re.I)
-            if m:
+            declared = self.field_types.get(f)
+
+            if declared in (None, "date", "datetime"):
+                m = re.search(window + r"(\d{4}-\d{2}-\d{2})", text, re.I)
+                if m:
+                    clauses.append(
+                        Compare(
+                            f, _op_from(m.group(1), default=Op.EQ), date.fromisoformat(m.group(2))
+                        )
+                    )
+                    continue
+
+            # A field declared textual takes a textual value, however numeric
+            # the value looks. "version 1.0.0" is a string in every corpus that
+            # has ever had a patch release, and reading it as 1.0 queries a
+            # numeric column the value was never written to.
+            if declared in (None, "int", "float", "bool"):
+                m = re.search(window + r"(\d[\d,_]*(?:\.\d+)?)", text, re.I)
+                if m:
+                    raw = m.group(2).replace(",", "").replace("_", "")
+                    value: Any = float(raw) if "." in raw else int(raw)
+                    if declared == "int" and isinstance(value, float):
+                        value = int(value)
+                    clauses.append(Compare(f, _op_from(m.group(1), default=Op.EQ), value))
+                    continue
+
+            m = re.search(window + r"([A-Za-z0-9][\w.\-]{0,40})", text, re.I)
+            if m and m.group(2).lower() not in _FILLER:
                 clauses.append(
-                    Compare(f, _op_from(m.group(1), default=Op.EQ), date.fromisoformat(m.group(2)))
+                    Compare(f, _op_from(m.group(1), default=Op.EQ), m.group(2))
+                    if _op_from(m.group(1), default=Op.EQ) is not Op.EQ
+                    else TextMatch(f, m.group(2), mode="exact")
                 )
-                continue
-            m = re.search(window + r"(\d[\d,_]*(?:\.\d+)?)", text, re.I)
-            if m:
-                raw = m.group(2).replace(",", "").replace("_", "")
-                value: Any = float(raw) if "." in raw else int(raw)
-                clauses.append(Compare(f, _op_from(m.group(1), default=Op.EQ), value))
-                continue
-            m = re.search(rf"{label}\s+(?:is\s+|=\s*)?([A-Za-z][\w.\-]{{1,40}})", text, re.I)
-            if m and m.group(1).lower() not in _FILLER:
-                clauses.append(TextMatch(f, m.group(1), mode="exact"))
                 continue
             clauses.append(Exists(f))
 

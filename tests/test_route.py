@@ -157,3 +157,69 @@ class TestRouting:
         # The decision log must show the structured path was wanted, not that
         # the question looked like prose.
         assert "structured" in d.reason.lower()
+
+
+class TestDeclaredFieldTypes:
+    """The extraction config states each field's type. Without it the router
+    guesses from how a value is written, and every corpus with a patch release
+    breaks: "version 1.0.0" reads as the float 1.0, which queries a numeric
+    column the value was never written to, so the question matches nothing.
+    """
+
+    @pytest.fixture
+    def typed(self) -> RulesRouter:
+        return RulesRouter(
+            {
+                "field_lexicon": LEXICON,
+                "field_types": {
+                    "package": "str",
+                    "version": "str",
+                    "version_major": "int",
+                    "release_date": "date",
+                },
+                "paths": {
+                    "structured": {"targets": ["fields"]},
+                    "lookup": {"targets": ["lexical"]},
+                    "iterative": {"targets": ["lexical"], "step_budget": 3},
+                },
+            }
+        )
+
+    @pytest.mark.parametrize("value", ["1.0.0", "2.1", "0.9.13", "2024.1.2"])
+    def test_a_textual_field_takes_a_textual_value_however_numeric_it_looks(
+        self, typed: RulesRouter, value: str
+    ) -> None:
+        sq = typed._structured_query(f"which entries have version {value}", None)
+        assert sq is not None
+        assert sq.where == TextMatch("version", value, mode="exact")
+
+    def test_a_numeric_field_still_takes_a_number(self, typed: RulesRouter) -> None:
+        sq = typed._structured_query("which entries have version major greater than 3", None)
+        assert sq is not None
+        assert sq.where == Compare("version_major", Op.GT, 3)
+
+    def test_a_date_field_still_takes_a_date(self, typed: RulesRouter) -> None:
+        sq = typed._structured_query("which entries have release date before 2023-06-27", None)
+        assert sq is not None
+        assert sq.where == Compare("release_date", Op.LT, date(2023, 6, 27))
+
+    def test_typed_predicates_select_the_right_rows(self, typed: RulesRouter) -> None:
+        rows = [
+            {"package": "flask", "version": "3.1.0", "version_major": 3},
+            {"package": "click", "version": "8.1.7", "version_major": 8},
+        ]
+        sq = typed._structured_query("which entries have version 3.1.0", None)
+        assert sq is not None and sq.where is not None
+        got = {r["package"] for r in rows if evaluate(sq.where, r)}
+        assert got == {"flask"}, sq.where
+
+    def test_the_type_map_comes_from_the_extraction_config(self) -> None:
+        """One derivation, so the router's view cannot drift from the schema."""
+        from indexer.config import load
+
+        cfg, _ = load("configs/pypi-docs.yaml")
+        types = cfg.extracted_field_types()
+        assert types["version"] == "str"
+        assert types["version_major"] == "int"
+        assert types["release_date"] == "date"
+        assert set(types) == set(cfg.extracted_field_names())

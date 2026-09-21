@@ -169,6 +169,7 @@ class Assembly:
         # The router learns the corpus's field vocabulary from the extraction
         # config, so a new corpus teaches it without a code change.
         params.setdefault("field_lexicon", self._field_lexicon())
+        params.setdefault("field_types", self.config.extracted_field_types())
         params.setdefault(
             "enable_structured",
             any(i.kind == "structured" and i.enabled for i in self.config.ingestion.index.indexes),
