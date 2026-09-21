@@ -112,6 +112,7 @@ class IngestionPipeline:
         parse_enabled: bool = True,
         on_document_error: str = "skip",
         index_batch_size: int = 128,
+        checkpoint_every: int = 200,
     ) -> None:
         self.scanner = scanner
         self.parser = parser
@@ -130,6 +131,11 @@ class IngestionPipeline:
         self.parse_enabled = parse_enabled
         self.on_document_error = on_document_error
         self.index_batch_size = index_batch_size
+        # Documents processed between durability checkpoints. This is the unit
+        # of resumability: a build that dies resumes at the last checkpoint, not
+        # at the last document, because a document is only recorded as done once
+        # the indexes holding it are durable.
+        self.checkpoint_every = max(1, checkpoint_every)
 
     # ------------------------------------------------------------------ plan
 
@@ -225,6 +231,7 @@ class IngestionPipeline:
         stats = CorpusStats(documents_total=len(by_id))
         failures: list[DocumentError] = []
         confidences: list[float] = []
+        pending_records: list[DocumentRecord] = []
 
         for change in work:
             counter = {
@@ -292,7 +299,13 @@ class IngestionPipeline:
             stats.units_total += len(enriched)
             stats.units_reused_from_cache += len(enriched) - len(to_write)
 
-            self.ledger.put(
+            # Buffered, not committed. A ledger record claims a document is
+            # done; committing it before the indexes holding that document are
+            # durable is a lie the next build believes -- it skips the document
+            # and the units are nowhere. That is not hypothetical: killing a
+            # build mid-run left a ledger asserting 493 processed documents over
+            # indexes that held none, and the resumed build skipped all 493.
+            pending_records.append(
                 DocumentRecord(
                     document_id=doc.document_id,
                     source_uri=doc.source_uri,
@@ -303,13 +316,12 @@ class IngestionPipeline:
                     updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
                 )
             )
+            if len(pending_records) >= self.checkpoint_every:
+                self._checkpoint(pending_records)
 
-        # Commit once, not once per batch. Indexes that buffer are correct in
-        # memory throughout; this is what makes them durable.
-        for idx in self.indexes.values():
-            if isinstance(idx, Flushable):
-                idx.flush()
-        self.unit_store.flush()
+        # Final checkpoint: everything still buffered becomes durable, and only
+        # then are the remaining documents recorded as done.
+        self._checkpoint(pending_records)
 
         if confidences:
             stats.mean_reading_order_confidence = sum(confidences) / len(confidences)
@@ -332,6 +344,23 @@ class IngestionPipeline:
         return BuildResult(manifest=manifest, plan=work, failures=failures)
 
     # ------------------------------------------------------------- internals
+
+    def _checkpoint(self, pending: list[DocumentRecord]) -> None:
+        """Make index state durable, then record the documents it covers.
+
+        The order is the whole point. Flushing after committing the ledger makes
+        the ledger a claim about work that may not survive the process; flushing
+        first makes every committed record backed by bytes on disk. A crash in
+        between costs a redundant reprocess of the checkpoint's documents, which
+        is the correct failure: too much work, never too little.
+        """
+        for idx in self.indexes.values():
+            if isinstance(idx, Flushable):
+                idx.flush()
+        self.unit_store.flush()
+        for record in pending:
+            self.ledger.put(record)
+        pending.clear()
 
     def _disabled(self) -> dict[str, str]:
         out: dict[str, str] = {}

@@ -481,3 +481,72 @@ class TestStructuredScoring:
         answered = runner._score_one(Engine((("1.2.0",),)), item)
         assert empty.failed is True, "an empty record set must count as a failure"
         assert answered.failed is False
+
+
+class TestCheckpointDurability:
+    """A ledger record claims a document is done. Committing that claim before
+    the indexes holding the document are durable is a lie the next build
+    believes: it skips the document and the units are nowhere.
+
+    This is not hypothetical. Killing an ablation build mid-run left a ledger
+    asserting 493 processed documents over indexes that held none, and the
+    resumed build skipped all 493 and evaluated an empty index -- reporting a
+    plausible-looking 0.952 failure rate rather than an error.
+    """
+
+    def test_a_crash_never_leaves_the_ledger_ahead_of_the_indexes(self, workspace: Path) -> None:
+        from indexer.core.errors import DocumentError
+
+        for i in range(6):
+            (workspace / "data" / f"extra{i}.md").write_text(
+                f"# Doc {i}\n\nSection about widget {i}.\n\n## Detail\n\nMore on widget {i}.\n"
+            )
+        a = assemble(workspace / "c.yaml")
+        ing = a.ingestion(strict_contracts=False)
+        ing.checkpoint_every = 3
+
+        # Fail partway through, as a killed process would.
+        real_parse = ing.parser.parse
+        seen: list[int] = []
+
+        def exploding(doc, ctx):
+            seen.append(1)
+            if len(seen) == 5:
+                raise RuntimeError("process died")
+            return real_parse(doc, ctx)
+
+        ing.parser.parse = exploding  # type: ignore[method-assign]
+        ing.on_document_error = "fail"
+        with pytest.raises((RuntimeError, DocumentError)):
+            ing.build()
+
+        # Whatever the ledger now claims, the indexes must actually hold it.
+        a2 = assemble(workspace / "c.yaml")
+        claimed = {r.document_id for r in a2.ledger.iter_records()}
+        held = set()
+        for r in a2.ledger.iter_records():
+            for uid in r.unit_ids:
+                if a2.unit_store.get(uid) is not None:
+                    held.add(r.document_id)
+        assert claimed <= held or not claimed, (
+            f"ledger claims {len(claimed)} documents the unit store does not hold: "
+            f"{sorted(claimed - held)}"
+        )
+
+    def test_resuming_completes_the_corpus(self, workspace: Path) -> None:
+        for i in range(6):
+            (workspace / "data" / f"extra{i}.md").write_text(
+                f"# Doc {i}\n\nSection about widget {i}.\n\n## Detail\n\nMore on widget {i}.\n"
+            )
+        a = assemble(workspace / "c.yaml")
+        ing = a.ingestion()
+        ing.checkpoint_every = 3
+        plan = ing.plan()
+        ing.build(plan=plan[:4])  # partial build, as after a resume
+
+        a2 = assemble(workspace / "c.yaml")
+        res = a2.ingestion().build()
+        assert res.manifest.corpus.documents_unchanged == 4
+        assert res.manifest.corpus.documents_added == len(plan) - 4
+        # And every document is now genuinely retrievable.
+        assert len(a2.unit_store) == res.manifest.corpus.units_total
