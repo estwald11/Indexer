@@ -219,6 +219,18 @@ class Judge(Protocol):
     correctness score whose judge is unrecorded is not comparable to anything.
     """
 
-    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool: ...
+    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool | None:
+        """True, False, or **None when the item cannot be assessed**.
+
+        Abstention is not a nicety. A judge that returns False for items it
+        cannot read reports them as wrong, which understates every arm by the
+        same amount and makes the absolute correctness figure meaningless while
+        leaving the deltas intact -- the shape of error that survives review
+        because the comparison still looks sensible.
+
+        ``None`` propagates to ``QueryScore.correct``, and the aggregate
+        averages over judged items only.
+        """
+        ...
 
     def fingerprint(self) -> str: ...

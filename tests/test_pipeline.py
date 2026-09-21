@@ -550,3 +550,72 @@ class TestCheckpointDurability:
         assert res.manifest.corpus.documents_added == len(plan) - 4
         # And every document is now genuinely retrievable.
         assert len(a2.unit_store) == res.manifest.corpus.units_total
+
+
+class TestJudgeAbstention:
+    """A judge that cannot assess an item must say so, not say it is wrong.
+
+    Returning False for unassessable items understates every arm by the same
+    amount: the deltas survive, so the comparison still looks sensible, while
+    the absolute correctness figure is meaningless. That is the error shape
+    that gets past review.
+    """
+
+    def test_abstains_with_no_expected_answer_and_no_gold_passage(self) -> None:
+        from indexer.core.query import QueryType
+        from indexer.eval.golden import GoldenQuery
+        from indexer.eval.judge import ContainmentJudge, ExactJudge
+
+        item = GoldenQuery(
+            id="s1",
+            query="which entries have version major greater than 3",
+            relevant=(),  # an aggregate has no quotable span
+            query_type=QueryType.NUMERIC,
+            answer=None,
+        )
+        assert ContainmentJudge({}).judge(item, "some answer text", ()) is None
+        assert ExactJudge({}).judge(item, "some answer text", ()) is None
+
+    def test_still_judges_items_it_can_assess(self) -> None:
+        from indexer.core.ids import DocumentId
+        from indexer.core.provenance import Span
+        from indexer.eval.golden import GoldenQuery, RelevantSpan
+        from indexer.eval.judge import ContainmentJudge, ExactJudge
+
+        exact = GoldenQuery(
+            id="s2", query="which entries have package flask", relevant=(), answer="flask"
+        )
+        assert ExactJudge({}).judge(exact, "rows: flask, 3", ()) is True
+        assert ExactJudge({}).judge(exact, "rows: click, 8", ()) is False
+
+        prose = GoldenQuery(
+            id="f1",
+            query="read timeout",
+            relevant=(
+                RelevantSpan(
+                    document_id=DocumentId("d1"),
+                    span=Span(0, 20),
+                    snippet="set the read timeout to twenty seconds for slow upstreams",
+                ),
+            ),
+        )
+        judge = ContainmentJudge({})
+        assert (
+            judge.judge(prose, "set the read timeout to twenty seconds for slow upstreams", ())
+            is True
+        )
+        assert judge.judge(prose, "completely unrelated text about proxies", ()) is False
+
+    def test_unjudged_items_do_not_count_against_an_arm(self) -> None:
+        """The aggregate averages over judged items only."""
+        from indexer.eval.metrics import QueryScore, RunReport
+
+        rep = RunReport(arm="x")
+        scores = [
+            QueryScore(query_id="a", correct=True),
+            QueryScore(query_id="b", correct=False),
+            QueryScore(query_id="c", correct=None),
+        ]
+        judged = [s for s in scores if s.correct is not None]
+        rep.correctness = sum(1 for s in judged if s.correct) / len(judged)
+        assert rep.correctness == 0.5  # not 1/3

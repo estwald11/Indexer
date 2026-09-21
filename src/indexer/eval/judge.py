@@ -49,9 +49,9 @@ def _make_exact(params: dict[str, Any], **_: Any) -> ExactJudge:
 class ExactJudge(StageImpl):
     STAGE, IMPL, VERSION = "judge", "exact", "1"
 
-    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool:
+    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool | None:
         if item.answer is None:
-            return False
+            return None  # nothing to compare against; abstain rather than fail it
         expected = str(item.answer).strip()
         if item.answer_type in ("number", "float", "int"):
             want = _as_float(expected)
@@ -103,15 +103,19 @@ class ContainmentJudge(StageImpl):
         super().__init__(params)
         self._exact = ExactJudge({})
 
-    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool:
+    def judge(self, item: GoldenQuery, answer: str, hits: Sequence[Hit]) -> bool | None:
         if item.answer is not None and self.param("fall_back_to_exact", True):
             return self._exact.judge(item, answer, hits)
         gold_text = " ".join(r.snippet for r in item.relevant if r.snippet)
         if not gold_text.strip():
-            return False
+            # No expected answer and no gold passage -- typically a structured
+            # item, whose answer is an aggregate rather than a quotable span.
+            # Abstain; scoring it wrong would penalise every arm identically for
+            # the golden set's shape rather than for anything they did.
+            return None
         gold_terms = {t for t in tokenize(gold_text) if len(t) > 3}
         if not gold_terms:
-            return False
+            return None
         answer_terms = set(tokenize(answer))
         coverage = len(gold_terms & answer_terms) / len(gold_terms)
         return coverage >= float(self.param("min_coverage", 0.6))
