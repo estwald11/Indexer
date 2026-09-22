@@ -731,6 +731,8 @@ def _field_expr(
 
 def _agg_expr(agg: Aggregation, expr: Any, key: str) -> str:
     if agg.op == "count":
+        if agg.distinct and agg.field:
+            return f"COUNT(DISTINCT {expr(agg.field)})"
         return "COUNT(*)"
     if agg.field is None:
         raise ValueError(f"{agg.op} needs a field")
@@ -743,4 +745,6 @@ def _agg_expr(agg: Aggregation, expr: Any, key: str) -> str:
 
 
 def _agg_name(agg: Aggregation) -> str:
+    if agg.distinct and agg.field:
+        return f"{agg.op}_distinct_{agg.field}"
     return f"{agg.op}_{agg.field}" if agg.field else str(agg.op)

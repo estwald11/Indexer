@@ -129,6 +129,9 @@ class AggregationOp(StrEnum):
 class Aggregation:
     op: AggregationOp
     field: str | None = None  # None only for COUNT
+    #: COUNT only: count distinct values of ``field`` rather than rows --
+    #: "how many suppliers", not "how many invoices from suppliers".
+    distinct: bool = False
 
 
 @dataclass(frozen=True, slots=True)
