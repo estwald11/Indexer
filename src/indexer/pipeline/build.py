@@ -25,7 +25,7 @@ from indexer.core.errors import ConfigError
 from indexer.core.registry import Registry, resolve
 from indexer.core.stages import Index
 from indexer.pipeline.ingest import IngestionPipeline
-from indexer.pipeline.query import QueryEngine
+from indexer.pipeline.query import AccessPolicy, QueryEngine, ShapePolicy
 from indexer.pipeline.stores import CacheRefs, FileArtifactStore, FileCache, JsonLedger, UnitStore
 
 __all__ = ["Assembly", "assemble", "assemble_mapping", "build_indexes"]
@@ -198,6 +198,8 @@ class Assembly:
         params = dict(f.params)
         params.setdefault("k", f.k)
         params.setdefault("weights", f.weights)
+        if f.weights_by_type:
+            params.setdefault("weights_by_type", f.weights_by_type)
         reg = resolve("fuse", f.impl, self.registry)
         return reg.build(_accepted_params(reg, params))
 
@@ -206,6 +208,18 @@ class Assembly:
         if not r.enabled:
             return self._build("rerank", "noop", {})
         return self._build("rerank", r.impl, r.params)
+
+    def path_rerankers(self) -> dict[str, Any]:
+        """Rerankers a route path names for itself. The global reranker's params
+        apply when the path names the same implementation."""
+        r = self.config.query.rerank
+        if not r.enabled:
+            return {}
+        out: dict[str, Any] = {}
+        for name, spec in self.config.query.route.paths.items():
+            if spec.rerank and spec.rerank != r.impl:
+                out[name] = self._build("rerank", spec.rerank, {})
+        return out
 
     # ------------------------------------------------------------ pipelines
 
@@ -255,6 +269,19 @@ class Assembly:
             rerank_output_top_k=c.query.rerank.output_top_k,
             default_top_k=c.query.retrieve.default_top_k,
             decision_log=log,
+            path_rerankers=self.path_rerankers(),
+            access=AccessPolicy(
+                enabled=c.query.access.enabled,
+                field=c.query.access.field,
+                missing=c.query.access.missing,
+            ),
+            shape=ShapePolicy(
+                enabled=c.query.shape.enabled,
+                max_per_document=c.query.shape.max_per_document,
+                collapse_duplicates=c.query.shape.collapse_duplicates,
+                near_duplicate_bits=c.query.shape.near_duplicate_bits,
+                expand_neighbors=c.query.shape.expand_neighbors,
+            ),
         )
 
 

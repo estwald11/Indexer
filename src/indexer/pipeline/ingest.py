@@ -62,6 +62,7 @@ from indexer.pipeline.codec import (
     encode_units,
 )
 from indexer.pipeline.stores import CacheRefs, UnitStore, sweep_cache
+from indexer.textutil import detect_language
 
 __all__ = [
     "BuildResult",
@@ -70,6 +71,7 @@ __all__ = [
     "parse_cache_key",
     "rebind_parsed",
     "strip_identity",
+    "with_document_facts",
 ]
 
 
@@ -493,7 +495,7 @@ class IngestionPipeline:
         """Run the stages for one document. Also returns the cache keys it used,
         so that removing the document later can remove what it left behind."""
         keys: set[str] = set()
-        parsed = self._parse(doc, ctx, keys)
+        parsed = with_document_facts(self._parse(doc, ctx, keys))
         units = self._segment(parsed, ctx, keys)
         enriched = self._enrich(parsed, units, ctx, keys)
         return parsed, units, enriched, keys
@@ -666,6 +668,28 @@ class IngestionPipeline:
                 enriched[i] = enriched[i].with_enrichment(e)
                 prior.setdefault(enriched[i].unit_id, {})[e.enricher] = e
         return enriched
+
+
+def with_document_facts(parsed: ParsedDocument) -> ParsedDocument:
+    """Add what the frame knows about every document to its metadata.
+
+    Title, page count and language reach every unit -- and so every index as
+    filterable fields, and the structured index's document record as the card
+    an agent reads before opening a document. Existing keys win: a scanner's or
+    parser's title is better than a guess.
+
+    Only facts that an ordinary edit leaves alone: metadata is part of every
+    unit's record, so a fact that changes with any edit (the text's hash, its
+    length) would rewrite every unit of a document for a one-word change.
+    """
+    title = next((b.text for b in parsed.blocks if str(b.kind) == "heading"), "")
+    facts = {
+        "doc_title": title or parsed.metadata.get("title") or parsed.metadata.get("name"),
+        "doc_pages": parsed.page_count,
+        "doc_language": detect_language(parsed.text),
+    }
+    added = {k: v for k, v in facts.items() if v not in (None, "") and k not in parsed.metadata}
+    return replace(parsed, metadata={**dict(parsed.metadata), **added}) if added else parsed
 
 
 def metadata_hash(doc: SourceDocument) -> str:

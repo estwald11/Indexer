@@ -73,6 +73,12 @@ class Query:
     #: but it will not drop context a caller supplies.
     context: Sequence[str] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    #: Who is asking: the user and groups the caller has authenticated. With
+    #: access control on, only documents whose ACL names one of these (or
+    #: none, if so configured) are visible -- on every path, structured
+    #: included. ``None`` means "not stated", which access control refuses
+    #: rather than reads as "everyone".
+    principals: tuple[str, ...] | None = None
 
     @property
     def content_hash(self) -> ContentHash:
@@ -122,6 +128,10 @@ class RouteDecision:
     reason: str = ""
     router: str = ""
     fingerprint: str = ""
+    #: A standalone form of the question, when the router rewrote it -- a
+    #: follow-up ("e quella di marzo?") made self-contained from the caller's
+    #: context. Retrieval uses it; the trace keeps both.
+    rewritten_query: str | None = None
 
     def __post_init__(self) -> None:
         if self.step_budget < 1:
@@ -149,4 +159,5 @@ class RouteDecision:
             "fingerprint": self.fingerprint,
             "has_structured_query": self.structured_query is not None,
             "has_inferred_filters": self.inferred_filters is not None,
+            "rewritten_query": self.rewritten_query,
         }

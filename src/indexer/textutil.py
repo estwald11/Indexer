@@ -25,6 +25,8 @@ __all__ = [
     "WORD_RE",
     "content_words",
     "detect_language",
+    "hamming",
+    "simhash64",
     "stopwords_for",
     "tokenize",
 ]
@@ -225,6 +227,34 @@ def tokenize(text: str) -> list[str]:
     splitting them turns a precise query into a common-word query.
     """
     return [m.group(0).lower() for m in _TOKEN.finditer(text)]
+
+
+def simhash64(text: str, *, shingle: int = 3) -> int:
+    """A 64-bit SimHash of word shingles: near-identical texts, near-identical bits.
+
+    Two copies of a contract that differ by a date or a signature block land a
+    few bits apart; unrelated texts land about 32 apart. Used to collapse near
+    duplicates in results without a corpus-wide index -- comparing the few
+    dozen hits of one query is all it takes.
+    """
+    import hashlib
+
+    words = tokenize(text)
+    grams = (
+        [" ".join(words[i : i + shingle]) for i in range(len(words) - shingle + 1)]
+        if len(words) >= shingle
+        else [" ".join(words)]
+    )
+    weights = [0] * 64
+    for g in grams:
+        h = int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+        for bit in range(64):
+            weights[bit] += 1 if h >> bit & 1 else -1
+    return sum(1 << bit for bit in range(64) if weights[bit] > 0)
+
+
+def hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
 
 
 def content_words(text: str, *, min_length: int = 4, language: str = "en") -> list[str]:

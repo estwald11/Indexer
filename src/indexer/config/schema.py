@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "AblationSpec",
+    "AccessConfig",
     "AccountingConfig",
     "CacheConfig",
     "Config",
@@ -52,6 +53,7 @@ __all__ = [
     "RetrieveConfig",
     "RouteConfig",
     "SegmentConfig",
+    "ShapeConfig",
     "SourceSpec",
 ]
 
@@ -281,6 +283,9 @@ class FuseConfig(ImplSpec):
     #: Per-index weights. Absent means 1.0. Invariant 4 says hybrid beats either
     #: half; the weights are how you find out by how much, on this corpus.
     weights: dict[str, float] = Field(default_factory=dict)
+    #: Weights per query type, overriding ``weights`` for questions of that
+    #: type. ``indexer.eval.tuning`` fits them on a development split.
+    weights_by_type: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class RerankConfig(ImplSpec):
@@ -294,11 +299,53 @@ class RerankConfig(ImplSpec):
     output_top_k: int = 10
 
 
+class AccessConfig(_Base):
+    """Document-level access control, enforced on every path.
+
+    Off by default, because the reference corpora have no ACLs. On, a query
+    must state its principals, and sees only documents whose ``field`` names
+    one of them -- in every index, the structured one included, since the
+    check is a filter conjoined to the caller's own.
+    """
+
+    enabled: bool = False
+    #: The metadata field holding each document's ACL (a list of principals).
+    field: str = "acl"
+    #: What a document with no ACL means. Deny unless the archive is known to
+    #: be open by default: an omitted ACL is far more often a missing sidecar
+    #: than a decision to publish.
+    missing: Literal["deny", "allow"] = "deny"
+
+
+class ShapeConfig(_Base):
+    """What the final result list looks like to whoever reads it -- usually an agent.
+
+    Off by default to keep the published ablation's arms unchanged.
+    """
+
+    enabled: bool = False
+    #: At most this many units per document in the final list; 0 means no
+    #: limit. Five chunks of one manual crowd out the other four documents.
+    max_per_document: int = 0
+    #: Collapse hits from documents with identical text -- the same contract
+    #: saved in three folders -- into the best-ranked one, listing the others.
+    collapse_duplicates: bool = True
+    #: Also collapse documents whose text SimHashes are within this many bits.
+    #: 0 disables it, and that is the default: two invoices from one template
+    #: differ in a few words and are *not* duplicates.
+    near_duplicate_bits: int = 0
+    #: Attach the text of this many units before and after each hit, so a
+    #: reader gets the passage around a chunk without another call.
+    expand_neighbors: int = 0
+
+
 class QueryConfig(_Base):
     route: RouteConfig
     retrieve: RetrieveConfig = Field(default_factory=lambda: RetrieveConfig())
     fuse: FuseConfig = Field(default_factory=lambda: FuseConfig())
     rerank: RerankConfig = Field(default_factory=lambda: RerankConfig())
+    access: AccessConfig = Field(default_factory=lambda: AccessConfig())
+    shape: ShapeConfig = Field(default_factory=lambda: ShapeConfig())
 
 
 # --------------------------------------------------------------------------- #

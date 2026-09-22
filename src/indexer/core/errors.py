@@ -12,6 +12,7 @@ at corpus scale; a build that silently drops 8% of documents is worse. So
 from __future__ import annotations
 
 __all__ = [
+    "AccessDenied",
     "ConfigError",
     "ContractViolation",
     "DocumentError",
@@ -50,6 +51,16 @@ class StageError(IndexerError):
         super().__init__(f"{stage}/{impl}: {message}")
         self.stage = stage
         self.impl = impl
+
+
+class AccessDenied(IndexerError):
+    """A query cannot be answered under the access policy.
+
+    Raised, not degraded: with access control on, a query that states no
+    principals has asked a question whose answer depends on who is asking, and
+    guessing -- "everyone" or "no one" -- is a leak or an outage that nothing
+    in the result would explain.
+    """
 
 
 class DocumentError(IndexerError):
