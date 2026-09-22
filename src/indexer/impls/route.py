@@ -581,8 +581,10 @@ class RulesRouter(StageImpl):
         select = tuple(group_by) if group_by else ()
         if not aggregations and not group_by:
             select = tuple(f for f in fields_named if f not in group_by)[:4] or ("unit_id",)
-            if self.level == "document" and select == ("unit_id",):
-                select = ("document_id",)
+            if self.level == "document":
+                # A document-level row names its document, so whoever reads the
+                # answer -- an agent, usually -- can open what it is about.
+                select = ("document_id", *(f for f in select if f != "unit_id"))
         return StructuredQuery(
             where=all_of(clauses),
             select=select,
