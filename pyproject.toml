@@ -37,6 +37,8 @@ rerank-cross-encoder = ["sentence-transformers>=3.0"]
 # PyStemmer is used instead when installed, for speed. `stemmer: light` needs
 # neither.
 analysis = ["snowballstemmer>=2.2"]
+# Office formats: Word, Excel, text-layer PDF. All permissively licensed.
+office = ["python-docx>=1.1", "openpyxl>=3.1", "pypdf>=4.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/indexer"]
@@ -63,5 +65,26 @@ testpaths = ["tests"]
 # type checker cannot see them unless they are installed. Ignoring them here
 # keeps `mypy --strict` meaningful for everything that is not optional.
 [[tool.mypy.overrides]]
-module = ["anthropic", "scipy.*", "sentence_transformers", "Stemmer", "snowballstemmer"]
+module = [
+  "anthropic",
+  "anthropic.*",
+  "scipy.*",
+  "sentence_transformers",
+  "Stemmer",
+  "snowballstemmer",
+  "docx",
+  "docx.*",
+  "openpyxl",
+  "openpyxl.*",
+  "pypdf",
+  "pypdf.*",
+  "extract_msg",
+  "docling",
+  "docling.*",
+  "docling_core.*",
+  "pymupdf",
+  "pymupdf4llm",
+  "mcp",
+  "mcp.*",
+]
 ignore_missing_imports = true
