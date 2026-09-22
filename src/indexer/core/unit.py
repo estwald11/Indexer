@@ -37,6 +37,7 @@ __all__ = [
     "EnrichedUnit",
     "Enrichment",
     "FieldValue",
+    "FieldValues",
     "Unit",
     "UnitKind",
 ]
@@ -45,6 +46,9 @@ __all__ = [
 #: types a predicate can compare, sort and aggregate over. Anything richer
 #: belongs in ``Enrichment.extra`` and is not queryable structurally.
 FieldValue = str | int | float | bool | date | datetime | None
+#: A field may hold several values -- every VAT number a unit mentions, every
+#: group an ACL grants. Predicates over it are existential.
+FieldValues = FieldValue | tuple[FieldValue, ...]
 
 
 class UnitKind(StrEnum):
@@ -141,7 +145,7 @@ class Enrichment:
     enricher: str
     fingerprint: str
     context: str | None = None
-    fields: Mapping[str, FieldValue] = field(default_factory=dict)
+    fields: Mapping[str, FieldValues] = field(default_factory=dict)
     labels: Mapping[str, str | tuple[str, ...]] = field(default_factory=dict)
     extra: Mapping[str, Any] = field(default_factory=dict)
     #: What the enricher read. Determines the cache key, hence invalidation.
@@ -228,14 +232,14 @@ class EnrichedUnit:
             }
         )
 
-    def fields(self) -> dict[str, FieldValue]:
+    def fields(self) -> dict[str, FieldValues]:
         """All extracted fields, flattened. Later enrichers win on collision.
 
         Collisions are resolved by sorted enricher name rather than run order so
         the result is deterministic; a config with two enrichers writing the
         same field is a config smell the validator warns about.
         """
-        out: dict[str, FieldValue] = {}
+        out: dict[str, FieldValues] = {}
         for _, e in sorted(self.enrichments.items()):
             out.update(e.fields)
         return out

@@ -16,6 +16,7 @@ description of that implementation.
 from indexer.impls import (
     corpus,
     enrich,
+    enrich_entities,
     fuse,
     index_dense,
     index_lexical,
@@ -34,6 +35,7 @@ from indexer.impls import (
 __all__ = [
     "corpus",
     "enrich",
+    "enrich_entities",
     "fuse",
     "index_dense",
     "index_lexical",
