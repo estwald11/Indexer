@@ -248,6 +248,7 @@ class JsonLedger:
                 build_id=BuildId(d["build_id"]),
                 updated_at=d.get("updated_at", ""),
                 warnings=tuple(d.get("warnings", ())),
+                metadata_hash=d.get("metadata_hash", ""),
             )
             self._records[rec.document_id] = rec
 
@@ -426,4 +427,5 @@ def _record_json(r: DocumentRecord) -> dict[str, Any]:
         "build_id": r.build_id,
         "updated_at": r.updated_at,
         "warnings": list(r.warnings),
+        "metadata_hash": r.metadata_hash,
     }

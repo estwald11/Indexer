@@ -32,7 +32,7 @@ from typing import Any
 
 from indexer.core.accounting import Accountant, CacheOutcome, InMemoryAccountant
 from indexer.core.cache import CacheKey, CacheStore, cache_key
-from indexer.core.document import ParsedDocument, SourceDocument
+from indexer.core.document import ParsedDocument, SourceDocument, content_metadata
 from indexer.core.errors import ContractViolation, DocumentError
 from indexer.core.ids import ContentHash, DocumentId, hash_obj, hash_text
 from indexer.core.ledger import ChangeKind, DocumentRecord, Ledger, PlannedChange, diff_units
@@ -211,6 +211,13 @@ class IngestionPipeline:
                     PlannedChange(doc_id, ChangeKind.CHANGED, tuple(keys), "content changed", prior)
                 )
                 continue
+            if prior.metadata_hash != metadata_hash(doc):
+                plan.append(
+                    PlannedChange(
+                        doc_id, ChangeKind.CHANGED, tuple(keys), "metadata changed", prior
+                    )
+                )
+                continue
             stale = [k for k, v in keys.items() if prior.stage_keys.get(k) != v]
             if stale:
                 plan.append(
@@ -363,6 +370,7 @@ class IngestionPipeline:
                     stage_keys=self.stage_keys(),
                     build_id=manifest.build_id,
                     updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    metadata_hash=metadata_hash(doc),
                 )
             )
             pending.refs.append((doc.document_id, keys_used))
@@ -658,6 +666,11 @@ class IngestionPipeline:
                 enriched[i] = enriched[i].with_enrichment(e)
                 prior.setdefault(enriched[i].unit_id, {})[e.enricher] = e
         return enriched
+
+
+def metadata_hash(doc: SourceDocument) -> str:
+    """The part of a document's scanner metadata that can change its indexing."""
+    return hash_obj(content_metadata(doc.metadata))
 
 
 def units_signature(units: Iterable[EnrichedUnit]) -> ContentHash:

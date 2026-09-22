@@ -59,6 +59,12 @@ class DocumentRecord:
     #: Non-fatal problems seen while processing, kept so a corpus-wide quality
     #: report does not require a rebuild to produce.
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: Hash of the scanner metadata the document was built with. The bytes are
+    #: not the only input: an ACL changed in a sidecar, or a tenant rule changed
+    #: in config, changes what every index must hold for the document while its
+    #: content hash stays the same -- and the document was then skipped as
+    #: unchanged, keeping the old ACL in every index.
+    metadata_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)

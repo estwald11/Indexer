@@ -51,8 +51,13 @@ LOCATOR_KEYS = frozenset({"path"})
 
 
 def content_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Metadata minus locators: the part that can legitimately change output."""
-    return {k: v for k, v in metadata.items() if k not in LOCATOR_KEYS}
+    """Metadata minus locators: the part that can legitimately change output.
+
+    Keys starting with an underscore are a scanner's private bookkeeping (how to
+    reach an attachment inside an email, say) and are excluded for the same
+    reason as ``path``.
+    """
+    return {k: v for k, v in metadata.items() if k not in LOCATOR_KEYS and not k.startswith("_")}
 
 
 class BlockKind(StrEnum):

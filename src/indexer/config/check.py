@@ -87,9 +87,10 @@ def resolve_all(cfg: Config) -> list[Finding]:
     """Phase 2 over a whole config: every name resolves, every params block
     validates, and every optional dependency an implementation declares is
     either installed or reported."""
-    import indexer.eval.bootstrap  # noqa: F401 -- registers bootstrappers
-    import indexer.eval.judge  # noqa: F401 -- registers judges
-    import indexer.impls  # noqa: F401 -- registers the reference implementations
+    # Imported for their registrations: bootstrappers, judges, implementations.
+    import indexer.eval.bootstrap
+    import indexer.eval.judge
+    import indexer.impls  # noqa: F401
     from indexer.core.registry import resolve
 
     out: list[Finding] = []
