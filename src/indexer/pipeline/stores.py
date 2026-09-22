@@ -23,7 +23,15 @@ from indexer.core.ledger import DocumentRecord
 from indexer.core.unit import EnrichedUnit
 from indexer.io import atomic_write
 
-__all__ = ["FileArtifactStore", "FileCache", "JsonLedger", "UnitStore", "atomic_write"]
+__all__ = [
+    "CacheRefs",
+    "FileArtifactStore",
+    "FileCache",
+    "JsonLedger",
+    "UnitStore",
+    "atomic_write",
+    "sweep_cache",
+]
 
 
 class FileCache:
@@ -65,6 +73,94 @@ class FileCache:
         for p in self.root.rglob("*"):
             if p.is_file() and p.name.startswith(prefix):
                 yield p.name
+
+
+class CacheRefs:
+    """Which cache entries each document's current build uses.
+
+    The cache is content-addressed and deliberately shared -- one parse serves
+    every copy of a file -- so "delete this document's cache entries" needs to
+    know both which entries it used and whether anything else still uses them.
+    Without this, removing a document removed its units from every index and
+    left its full text, its LLM-written summaries and its extracted fields in
+    the cache indefinitely: an erasure request that could not be honoured.
+
+    SQLite rather than a column in the ledger: a document uses one entry per
+    unit per enricher, and a JSON ledger carrying those for a large archive
+    would be rewritten -- all of it -- at every compaction.
+    """
+
+    __slots__ = ("_conn", "path")
+
+    def __init__(self, path: str | Path) -> None:
+        import sqlite3
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS refs (
+                document_id TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                PRIMARY KEY (document_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS ix_refs_key ON refs(key);
+            """
+        )
+        self._conn.commit()
+
+    def keys_of(self, document_id: str) -> set[str]:
+        return {
+            r[0]
+            for r in self._conn.execute(
+                "SELECT key FROM refs WHERE document_id = ?", (document_id,)
+            )
+        }
+
+    def set(self, document_id: str, keys: set[str]) -> set[str]:
+        """Record a document's current keys; return the ones it no longer uses."""
+        old = self.keys_of(document_id)
+        self._conn.execute("DELETE FROM refs WHERE document_id = ?", (document_id,))
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO refs (document_id, key) VALUES (?, ?)",
+            [(document_id, k) for k in sorted(keys)],
+        )
+        self._conn.commit()
+        return old - keys
+
+    def remove(self, document_id: str) -> set[str]:
+        """Forget a document; return every key it used."""
+        old = self.keys_of(document_id)
+        self._conn.execute("DELETE FROM refs WHERE document_id = ?", (document_id,))
+        self._conn.commit()
+        return old
+
+    def unreferenced(self, keys: set[str]) -> set[str]:
+        """The subset of ``keys`` no document uses."""
+        out: set[str] = set()
+        for k in keys:
+            if self._conn.execute("SELECT 1 FROM refs WHERE key = ? LIMIT 1", (k,)).fetchone():
+                continue
+            out.add(k)
+        return out
+
+    def all_keys(self) -> set[str]:
+        return {r[0] for r in self._conn.execute("SELECT DISTINCT key FROM refs")}
+
+
+def sweep_cache(cache: Any, keep: set[str]) -> int:
+    """Delete every cache entry not in ``keep``. The full, mark-and-sweep GC.
+
+    For entries no build recorded -- written by a build that crashed before its
+    checkpoint, or by a version that did not record references. Compared on the
+    digest, because a file cache names entries by digest rather than full key.
+    """
+    wanted = {short(k, 64) for k in keep}
+    doomed = [k for k in cache.iter_keys() if short(k, 64) not in wanted]
+    for k in doomed:
+        cache.delete(k)
+    return len(doomed)
 
 
 class FileArtifactStore:
@@ -140,6 +236,9 @@ class JsonLedger:
         data = json.loads(self.path.read_text())
         self._in_flight = data.get("in_flight")
         for d in [*data.get("records", []), *self._replay_journal()]:
+            if d.get("deleted"):
+                self._records.pop(d["document_id"], None)
+                continue
             rec = DocumentRecord(
                 document_id=DocumentId(d["document_id"]),
                 source_uri=d["source_uri"],
@@ -170,10 +269,11 @@ class JsonLedger:
                 break
         return out
 
-    def _append(self, record: DocumentRecord) -> None:
+    def _append(self, record: DocumentRecord | dict[str, Any]) -> None:
         self.journal.parent.mkdir(parents=True, exist_ok=True)
+        line = record if isinstance(record, dict) else _record_json(record)
         with self.journal.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_record_json(record)) + "\n")
+            fh.write(json.dumps(line) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
         self._journal_lines += 1
@@ -200,7 +300,9 @@ class JsonLedger:
     def delete(self, document_id: DocumentId) -> None:
         self._load()
         self._records.pop(document_id, None)
-        self._flush()
+        # A tombstone in the journal, not a snapshot rewrite: removing a folder
+        # of 5,000 documents rewrote the whole ledger 5,000 times.
+        self._append({"document_id": document_id, "deleted": True})
 
     def iter_records(self) -> Iterator[DocumentRecord]:
         self._load()

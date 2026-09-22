@@ -61,7 +61,7 @@ from indexer.pipeline.codec import (
     encode_parsed_document,
     encode_units,
 )
-from indexer.pipeline.stores import UnitStore
+from indexer.pipeline.stores import CacheRefs, UnitStore, sweep_cache
 
 __all__ = [
     "BuildResult",
@@ -71,6 +71,18 @@ __all__ = [
     "rebind_parsed",
     "strip_identity",
 ]
+
+
+@dataclass(slots=True)
+class _Pending:
+    """Work done since the last checkpoint, not yet durable in the ledger."""
+
+    records: list[DocumentRecord] = field(default_factory=list)
+    removals: list[DocumentId] = field(default_factory=list)
+    refs: list[tuple[DocumentId, set[str]]] = field(default_factory=list)
+    #: Cache keys some document stopped using. Deleted at the end of the build
+    #: if nothing else uses them.
+    purge_candidates: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -126,8 +138,14 @@ class IngestionPipeline:
         on_document_error: str = "skip",
         index_batch_size: int = 128,
         checkpoint_every: int = 200,
+        cache_refs: CacheRefs | None = None,
+        purge_cache: bool = True,
     ) -> None:
         self.scanner = scanner
+        #: Which cache entries each document uses, so that removing or editing
+        #: a document can remove what it left in the cache. None disables it.
+        self.cache_refs = cache_refs
+        self.purge_cache = purge_cache
         self.parser = parser
         self.segmenter = segmenter
         self.enrichers = list(enrichers)
@@ -244,7 +262,7 @@ class IngestionPipeline:
         stats = CorpusStats(documents_total=len(by_id))
         failures: list[DocumentError] = []
         confidences: list[float] = []
-        pending_records: list[DocumentRecord] = []
+        pending = _Pending()
 
         for change in work:
             counter = {
@@ -263,14 +281,18 @@ class IngestionPipeline:
             if change.kind is ChangeKind.REMOVED:
                 if change.prior:
                     stats.units_deleted += self._delete_units(list(change.prior.unit_ids), ctx)
-                self.ledger.delete(change.document_id)
+                # Deferred to the checkpoint, like every other ledger write. The
+                # units were deleted from indexes in memory; forgetting the
+                # document before those deletions are durable meant a crash left
+                # its units on disk with no ledger entry to ever remove them.
+                pending.removals.append(change.document_id)
                 continue
 
             doc = by_id[change.document_id]
             if progress:
                 progress(f"{change.kind.value:>9} {doc.source_uri}")
             try:
-                parsed, _units, enriched = self._process(doc, ctx)
+                parsed, _units, enriched, keys_used = self._process(doc, ctx)
             except DocumentError as exc:
                 failures.append(exc)
                 stats.documents_failed += 1
@@ -332,7 +354,7 @@ class IngestionPipeline:
             # and the units are nowhere. That is not hypothetical: killing a
             # build mid-run left a ledger asserting 493 processed documents over
             # indexes that held none, and the resumed build skipped all 493.
-            pending_records.append(
+            pending.records.append(
                 DocumentRecord(
                     document_id=doc.document_id,
                     source_uri=doc.source_uri,
@@ -343,12 +365,14 @@ class IngestionPipeline:
                     updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
                 )
             )
-            if len(pending_records) >= self.checkpoint_every:
-                self._checkpoint(pending_records, accountant)
+            pending.refs.append((doc.document_id, keys_used))
+            if len(pending.records) >= self.checkpoint_every:
+                self._checkpoint(pending, accountant)
 
         # Final checkpoint: everything still buffered becomes durable, and only
         # then are the remaining documents recorded as done.
-        self._checkpoint(pending_records, accountant)
+        self._checkpoint(pending, accountant)
+        stats.cache_entries_purged = self._purge(pending.purge_candidates)
 
         if confidences:
             stats.mean_reading_order_confidence = sum(confidences) / len(confidences)
@@ -372,9 +396,7 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------- internals
 
-    def _checkpoint(
-        self, pending: list[DocumentRecord], accountant: Accountant | None = None
-    ) -> None:
+    def _checkpoint(self, pending: _Pending, accountant: Accountant | None = None) -> None:
         """Make index state durable, then record the documents it covers.
 
         The order is the whole point. Flushing after committing the ledger makes
@@ -399,11 +421,47 @@ class IngestionPipeline:
             with accountant.measure(fp) as run:
                 idx.flush()
                 run.attrs = {"index": name}
-                run.items_in = len(pending)
+                run.items_in = len(pending.records)
         self.unit_store.flush()
-        for record in pending:
+        for record in pending.records:
             self.ledger.put(record)
-        pending.clear()
+        for document_id in pending.removals:
+            self.ledger.delete(document_id)
+        if self.cache_refs is not None:
+            for document_id, keys in pending.refs:
+                pending.purge_candidates |= self.cache_refs.set(document_id, keys)
+            for document_id in pending.removals:
+                pending.purge_candidates |= self.cache_refs.remove(document_id)
+        pending.records.clear()
+        pending.removals.clear()
+        pending.refs.clear()
+
+    def _purge(self, candidates: set[str]) -> int:
+        """Delete cache entries that no current document uses any more.
+
+        The candidates are the entries removed documents used, and the entries
+        the previous version of an edited document used. Each is deleted only if
+        nothing else references it: the cache is shared by design, and a parse
+        another copy of the file still uses must survive. Runs after the final
+        checkpoint, so references are durable before anything is deleted.
+        """
+        if self.cache_refs is None or not self.purge_cache or not candidates:
+            return 0
+        doomed = self.cache_refs.unreferenced(candidates)
+        for key in doomed:
+            self.cache.delete(key)
+        return len(doomed)
+
+    def sweep_cache(self) -> int:
+        """Delete every cache entry no current document references.
+
+        The full collection, for entries no build recorded: written by a build
+        that died before its checkpoint, or by a version that kept no
+        references. Returns the number of entries deleted.
+        """
+        if self.cache_refs is None:
+            raise RuntimeError("sweep_cache needs cache references; none are configured")
+        return sweep_cache(self.cache, self.cache_refs.all_keys())
 
     def _disabled(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -423,13 +481,18 @@ class IngestionPipeline:
 
     def _process(
         self, doc: SourceDocument, ctx: StageContext
-    ) -> tuple[ParsedDocument, list[Unit], list[EnrichedUnit]]:
-        parsed = self._parse(doc, ctx)
-        units = self._segment(parsed, ctx)
-        enriched = self._enrich(parsed, units, ctx)
-        return parsed, units, enriched
+    ) -> tuple[ParsedDocument, list[Unit], list[EnrichedUnit], set[str]]:
+        """Run the stages for one document. Also returns the cache keys it used,
+        so that removing the document later can remove what it left behind."""
+        keys: set[str] = set()
+        parsed = self._parse(doc, ctx, keys)
+        units = self._segment(parsed, ctx, keys)
+        enriched = self._enrich(parsed, units, ctx, keys)
+        return parsed, units, enriched, keys
 
-    def _parse(self, doc: SourceDocument, ctx: StageContext) -> ParsedDocument:
+    def _parse(
+        self, doc: SourceDocument, ctx: StageContext, keys: set[str] | None = None
+    ) -> ParsedDocument:
         """Parse, with the output cached by *content* and identity stamped after.
 
         Content-addressed because an archive is full of byte-identical files --
@@ -441,6 +504,8 @@ class IngestionPipeline:
         """
         fp = self.parser.fingerprint()
         key = parse_cache_key(self.parser, doc)
+        if keys is not None:
+            keys.add(key)
         cached = ctx.cache.get(key)
         if cached is not None:
             with ctx.accountant.measure(fp) as run:
@@ -484,7 +549,9 @@ class IngestionPipeline:
         # whether or not the cache answered.
         return rebind_parsed(parsed, doc, added)
 
-    def _segment(self, parsed: ParsedDocument, ctx: StageContext) -> list[Unit]:
+    def _segment(
+        self, parsed: ParsedDocument, ctx: StageContext, keys: set[str] | None = None
+    ) -> list[Unit]:
         fp = self.segmenter.fingerprint()
         # The segmenter's input is the whole parsed document -- blocks, kinds,
         # pages, identity and metadata, all of which reach the units -- not just
@@ -492,6 +559,8 @@ class IngestionPipeline:
         # tenant and all) to every other document with the same text.
         input_hash = hash_obj(encode_parsed_document(parsed))
         key = cache_key(fp, input_hash)
+        if keys is not None:
+            keys.add(key)
         cached = ctx.cache.get(key)
         if cached is not None:
             with ctx.accountant.measure(fp) as run:
@@ -517,7 +586,11 @@ class IngestionPipeline:
         return units
 
     def _enrich(
-        self, parsed: ParsedDocument, units: list[Unit], ctx: StageContext
+        self,
+        parsed: ParsedDocument,
+        units: list[Unit],
+        ctx: StageContext,
+        used: set[str] | None = None,
     ) -> list[EnrichedUnit]:
         enriched = [EnrichedUnit(unit=u) for u in units]
         if not self.enrich_enabled:
@@ -537,6 +610,8 @@ class IngestionPipeline:
                 )
                 for eu in enriched
             ]
+            if used is not None:
+                used.update(keys)
             todo: list[int] = []
             results: dict[int, Enrichment] = {}
             for i, key in enumerate(keys):

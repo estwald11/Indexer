@@ -313,6 +313,12 @@ class CacheConfig(ImplSpec):
     #: (a prompt change that was not version-bumped) without paying to re-parse
     #: the corpus.
     stages: dict[str, bool] = Field(default_factory=dict)
+    #: Delete cache entries no current document uses -- those of removed
+    #: documents and of the previous version of edited ones -- at the end of
+    #: every build. On by default: the cache holds full text, LLM summaries
+    #: and extracted fields, and a removed document must not survive in it.
+    #: Off only trades that for cheaper reverts of edits.
+    purge_unreferenced: bool = True
 
 
 class AccountingConfig(_Base):

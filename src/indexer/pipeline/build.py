@@ -26,7 +26,7 @@ from indexer.core.registry import Registry, resolve
 from indexer.core.stages import Index
 from indexer.pipeline.ingest import IngestionPipeline
 from indexer.pipeline.query import QueryEngine
-from indexer.pipeline.stores import FileArtifactStore, FileCache, JsonLedger, UnitStore
+from indexer.pipeline.stores import CacheRefs, FileArtifactStore, FileCache, JsonLedger, UnitStore
 
 __all__ = ["Assembly", "assemble", "assemble_mapping", "build_indexes"]
 
@@ -61,6 +61,7 @@ class Assembly:
         self.artifacts = FileArtifactStore(self.paths.artifacts)
         self.ledger = JsonLedger(Path(self.paths.store) / "ledger.json")
         self.unit_store = UnitStore(Path(self.paths.store) / "units.json")
+        self.cache_refs = CacheRefs(Path(self.paths.store) / "cache-refs.db")
         self.indexes: dict[str, Index] = build_indexes(config, self.paths.store, registry)
 
     # --------------------------------------------------------------- stages
@@ -227,6 +228,8 @@ class Assembly:
             on_document_error=c.ingestion.parse.on_error,
             index_batch_size=c.ingestion.index.batch_size,
             checkpoint_every=c.ingestion.checkpoint_every,
+            cache_refs=self.cache_refs,
+            purge_cache=c.cache.purge_unreferenced,
         )
 
     def query_engine(self) -> QueryEngine:
