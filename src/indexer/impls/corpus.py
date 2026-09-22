@@ -64,8 +64,8 @@ class FilesystemParams:
     params_model=dataclass_params(FilesystemParams),
     summary="Walk a directory. Document ids derive from the path relative to root.",
 )
-def _make_filesystem(params: dict[str, Any], **_: Any) -> FilesystemScanner:
-    return FilesystemScanner(params)
+def _make_filesystem(params: dict[str, Any], **kw: Any) -> FilesystemScanner:
+    return FilesystemScanner(params, namespace=kw.get("namespace", ""))
 
 
 class FilesystemScanner(StageImpl):

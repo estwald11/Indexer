@@ -71,24 +71,25 @@ class Assembly:
         return reg.build(params, **extra)
 
     def scanner(self) -> Any:
-        from indexer.impls.corpus import FilesystemScanner
+        """Every source, built through the registry like any other stage.
 
+        It used to construct ``FilesystemScanner`` directly whatever ``impl``
+        said, so a registered scanner for a DMS or a mailbox could be named in
+        config and never run. And ``corpus.limit`` applied only when there were
+        several sources; with one, a smoke run over "the first 50 documents"
+        read the whole archive.
+        """
         sources = self.config.corpus.sources
-        if len(sources) == 1:
-            src = sources[0]
-            reg = resolve("corpus", src.impl, self.registry)
-            norm = reg.normalize(src.params)
-            return FilesystemScanner(norm, namespace=src.namespace)
-        return _MultiScanner(
-            [
-                FilesystemScanner(
-                    resolve("corpus", s.impl, self.registry).normalize(s.params),
-                    namespace=s.namespace,
-                )
-                for s in sources
-            ],
-            limit=self.config.corpus.limit,
-        )
+        state_dir = Path(self.paths.store) / "scan-state"
+        built = [
+            resolve("corpus", s.impl, self.registry).build(
+                s.params, namespace=s.namespace, state_dir=state_dir
+            )
+            for s in sources
+        ]
+        if len(built) == 1 and self.config.corpus.limit is None:
+            return built[0]
+        return _MultiScanner(built, limit=self.config.corpus.limit)
 
     def parser(self) -> Any:
         p = self.config.ingestion.parse
