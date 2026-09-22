@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from indexer.core.accounting import Accountant, CacheOutcome, InMemoryAccountant
-from indexer.core.cache import CacheStore, cache_key
+from indexer.core.cache import CacheKey, CacheStore, cache_key
 from indexer.core.document import ParsedDocument, SourceDocument
 from indexer.core.errors import ContractViolation, DocumentError
 from indexer.core.ids import ContentHash, DocumentId, hash_obj, hash_text
@@ -46,18 +46,31 @@ from indexer.core.stages import (
     Parser,
     Segmenter,
     StageContext,
+    enrich_input_hash,
+    parse_cache_scope,
 )
 from indexer.core.unit import EnrichedUnit, Enrichment, Unit
 from indexer.eval.checks import check_parsed_document, check_units
 from indexer.pipeline.codec import (
+    decode_enrichment,
+    decode_metadata,
     decode_parsed_document,
     decode_units,
+    encode_enrichment,
+    encode_metadata,
     encode_parsed_document,
     encode_units,
 )
 from indexer.pipeline.stores import UnitStore
 
-__all__ = ["BuildResult", "IngestionPipeline"]
+__all__ = [
+    "BuildResult",
+    "IngestionPipeline",
+    "cached_parse",
+    "parse_cache_key",
+    "rebind_parsed",
+    "strip_identity",
+]
 
 
 @dataclass(slots=True)
@@ -403,14 +416,28 @@ class IngestionPipeline:
         return parsed, units, enriched
 
     def _parse(self, doc: SourceDocument, ctx: StageContext) -> ParsedDocument:
+        """Parse, with the output cached by *content* and identity stamped after.
+
+        Content-addressed because an archive is full of byte-identical files --
+        the same contract attached to fifty emails -- and a layout or OCR parse
+        is the slowest stage there is. But the cached value carries no
+        identity: the first document's id, URI and metadata used to come back
+        for the second, so both collapsed into one document and the second
+        tenant's copy was unreachable.
+        """
         fp = self.parser.fingerprint()
-        key = cache_key(fp, doc.content_hash)
+        key = parse_cache_key(self.parser, doc)
         cached = ctx.cache.get(key)
         if cached is not None:
             with ctx.accountant.measure(fp) as run:
                 run.cache = CacheOutcome.HIT
                 run.input_hash = doc.content_hash
-                return decode_parsed_document(json.loads(cached))
+                payload = json.loads(cached)
+                return rebind_parsed(
+                    decode_parsed_document(payload),
+                    doc,
+                    decode_metadata(payload.get("parser_metadata", {})),
+                )
 
         with ctx.accountant.measure(fp) as run:
             run.cache = CacheOutcome.MISS
@@ -427,21 +454,40 @@ class IngestionPipeline:
                 run.attrs = {"contract_warnings": problems[:3]}
             run.output_hash = parsed.content_hash
             run.items_out = len(parsed.blocks)
-            ctx.cache.put(key, json.dumps(encode_parsed_document(parsed)).encode("utf-8"))
-        return parsed
+            # What the parser added to the scanner's metadata, from the bytes.
+            # Stored apart from identity so a hit can rebuild exactly this.
+            added = {
+                k: v
+                for k, v in parsed.metadata.items()
+                if k not in doc.metadata or doc.metadata[k] != v
+            }
+            anonymous = strip_identity(parsed)
+            payload = encode_parsed_document(anonymous)
+            payload["parser_metadata"] = encode_metadata(added)
+            ctx.cache.put(key, json.dumps(payload).encode("utf-8"))
+        # Identity is stamped on the miss path too, so every parser -- including
+        # one that forgets to copy scanner metadata -- produces the same result
+        # whether or not the cache answered.
+        return rebind_parsed(parsed, doc, added)
 
     def _segment(self, parsed: ParsedDocument, ctx: StageContext) -> list[Unit]:
         fp = self.segmenter.fingerprint()
-        key = cache_key(fp, parsed.content_hash)
+        # The segmenter's input is the whole parsed document -- blocks, kinds,
+        # pages, identity and metadata, all of which reach the units -- not just
+        # its text. Keying on text alone served one document's units (ids,
+        # tenant and all) to every other document with the same text.
+        input_hash = hash_obj(encode_parsed_document(parsed))
+        key = cache_key(fp, input_hash)
         cached = ctx.cache.get(key)
         if cached is not None:
             with ctx.accountant.measure(fp) as run:
                 run.cache = CacheOutcome.HIT
+                run.input_hash = input_hash
                 return decode_units(json.loads(cached))
 
         with ctx.accountant.measure(fp) as run:
             run.cache = CacheOutcome.MISS
-            run.input_hash = parsed.content_hash
+            run.input_hash = input_hash
             try:
                 units = list(self.segmenter.segment(parsed, ctx))
             except Exception as exc:
@@ -466,22 +512,25 @@ class IngestionPipeline:
         prior: dict[Any, dict[str, Enrichment]] = {}
         for enricher in self.enrichers:
             fp = enricher.fingerprint()
-            # The scope decides what invalidates this enricher. A unit-scoped
-            # enricher survives edits elsewhere in the document; a document-scoped
-            # one does not. Including only what was read is what keeps an edit's
-            # blast radius proportional to the edit.
-            scope_hash = "" if str(enricher.scope) == "unit" else str(parsed.content_hash)
+            # The key covers what the enricher reads: by default the whole unit
+            # (metadata and section path included), the parent document for a
+            # wider scope, and earlier enrichers' output. A unit-scoped enricher
+            # still survives edits elsewhere in its document, which is what
+            # keeps an edit's blast radius proportional to the edit.
+            keys = [
+                cache_key(
+                    fp, enrich_input_hash(enricher, eu.unit, parsed, prior.get(eu.unit_id, {}))
+                )
+                for eu in enriched
+            ]
             todo: list[int] = []
             results: dict[int, Enrichment] = {}
-            for i, eu in enumerate(enriched):
-                key = cache_key(fp, eu.unit.content_hash, scope_hash=scope_hash)
+            for i, key in enumerate(keys):
                 cached = ctx.cache.get(key)
                 if cached is None:
                     todo.append(i)
                 else:
-                    from indexer.pipeline.codec import _dec_enrichment
-
-                    results[i] = _dec_enrichment(json.loads(cached))
+                    results[i] = decode_enrichment(json.loads(cached))
 
             if todo:
                 batch = [enriched[i].unit for i in todo]
@@ -506,12 +555,7 @@ class IngestionPipeline:
                         )
                     for i, e in zip(todo, produced, strict=True):
                         results[i] = e
-                        from indexer.pipeline.codec import _enc_enrichment
-
-                        ctx.cache.put(
-                            cache_key(fp, enriched[i].unit.content_hash, scope_hash=scope_hash),
-                            json.dumps(_enc_enrichment(e)).encode("utf-8"),
-                        )
+                        ctx.cache.put(keys[i], json.dumps(encode_enrichment(e)).encode("utf-8"))
                     run.items_out = len(produced)
                     run.cost_usd = sum(e.cost_usd for e in produced)
                     run.tokens_in = sum(e.tokens_in for e in produced)
@@ -530,3 +574,83 @@ class IngestionPipeline:
 def units_signature(units: Iterable[EnrichedUnit]) -> ContentHash:
     """Hash of a document's indexed surface. Used to detect no-op rebuilds."""
     return hash_text("\x00".join(u.indexing_text() for u in units))
+
+
+# --------------------------------------------------------------------------- #
+# parse identity                                                               #
+# --------------------------------------------------------------------------- #
+
+
+def parse_cache_key(parser: Parser, doc: SourceDocument) -> CacheKey:
+    """The parse cache key: the bytes, plus whatever else the parser reads.
+
+    Never the document's identity -- that is what lets byte-identical files
+    share one parse -- but always the media type (or, for a routing parser, the
+    parser it dispatches to). The same bytes named ``.md`` and ``.txt`` go to
+    different parsers, and keying on bytes alone served the markdown parse to
+    the text document.
+    """
+    return cache_key(
+        parser.fingerprint(), doc.content_hash, scope_hash=parse_cache_scope(parser, doc)
+    )
+
+
+def strip_identity(parsed: ParsedDocument) -> ParsedDocument:
+    """The parse with every trace of *which* document removed.
+
+    What goes into the content-addressed cache. An entry shared by two tenants'
+    copies of one file must not carry either tenant's id, URI or metadata.
+    """
+    return replace(
+        parsed,
+        document_id=DocumentId(""),
+        source_uri="",
+        metadata={},
+        blocks=tuple(
+            replace(b, provenance=replace(b.provenance, document_id=DocumentId(""), source_uri=""))
+            for b in parsed.blocks
+        ),
+    )
+
+
+def rebind_parsed(
+    parsed: ParsedDocument, doc: SourceDocument, parser_metadata: Mapping[str, Any]
+) -> ParsedDocument:
+    """Stamp one document's identity onto a (possibly shared) parse.
+
+    Scanner metadata wins over anything the parser added. The scanner states
+    known facts -- the tenant a folder belongs to, the ACL a sidecar grants --
+    while a parser reports what the bytes say, and a document must not be able
+    to talk its way into another tenant by carrying a header of the same name.
+    """
+    return replace(
+        parsed,
+        document_id=doc.document_id,
+        source_uri=doc.source_uri,
+        source_hash=doc.content_hash,
+        metadata={**dict(parser_metadata), **dict(doc.metadata)},
+        blocks=tuple(
+            replace(
+                b,
+                provenance=replace(
+                    b.provenance, document_id=doc.document_id, source_uri=doc.source_uri
+                ),
+            )
+            for b in parsed.blocks
+        ),
+    )
+
+
+def cached_parse(parser: Parser, doc: SourceDocument, cache: CacheStore) -> ParsedDocument | None:
+    """The parse a build left in the cache for ``doc``, identity stamped, or None.
+
+    For tooling that needs parsed documents without re-parsing -- the golden-set
+    bootstrapper reads them this way.
+    """
+    raw = cache.get(parse_cache_key(parser, doc))
+    if raw is None:
+        return None
+    payload = json.loads(raw)
+    return rebind_parsed(
+        decode_parsed_document(payload), doc, decode_metadata(payload.get("parser_metadata", {}))
+    )

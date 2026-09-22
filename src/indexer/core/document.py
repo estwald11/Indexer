@@ -30,6 +30,7 @@ from indexer.core.ids import ContentHash, DocumentId, hash_text
 from indexer.core.provenance import Provenance
 
 __all__ = [
+    "LOCATOR_KEYS",
     "Block",
     "BlockKind",
     "MediaRef",
@@ -37,7 +38,21 @@ __all__ = [
     "SourceDocument",
     "Table",
     "TableCell",
+    "content_metadata",
 ]
+
+#: Metadata keys that say where the bytes live *on this machine* and nothing
+#: about what they are. Excluded from every cache key and content hash: an
+#: absolute path in a key makes the cache machine-specific, so moving an archive
+#: to a new server would re-pay every enrichment -- the LLM calls included --
+#: while appearing to work. Scanners keep them for ``load()``; nothing else
+#: should read them.
+LOCATOR_KEYS = frozenset({"path"})
+
+
+def content_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Metadata minus locators: the part that can legitimately change output."""
+    return {k: v for k, v in metadata.items() if k not in LOCATOR_KEYS}
 
 
 class BlockKind(StrEnum):

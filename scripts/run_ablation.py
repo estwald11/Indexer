@@ -77,17 +77,14 @@ def main() -> int:
         say(f"== golden set: {len(golden)} queries (existing) {golden.stats()}")
     else:
         say("== bootstrapping golden set")
-        import json as _json
+        from indexer.pipeline.ingest import cached_parse
 
-        from indexer.core.cache import cache_key
-        from indexer.pipeline.codec import decode_parsed_document
-
-        parser_fp = base.parser().fingerprint()
+        parser = base.parser()
         docs = []
         for sdoc in base.scanner().scan():
-            raw = base.cache.get(cache_key(parser_fp, sdoc.content_hash))
-            if raw:
-                docs.append(decode_parsed_document(_json.loads(raw)))
+            parsed = cached_parse(parser, sdoc, base.cache)
+            if parsed is not None:
+                docs.append(parsed)
         units = [
             eu for uid in base.unit_store.all_ids() if (eu := base.unit_store.get(uid)) is not None
         ]

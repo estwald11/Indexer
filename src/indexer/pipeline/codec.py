@@ -21,12 +21,41 @@ from indexer.core.unit import ContextScope, EnrichedUnit, Enrichment, Unit, Unit
 
 __all__ = [
     "decode_enriched_unit",
+    "decode_enrichment",
+    "decode_metadata",
     "decode_parsed_document",
     "decode_units",
     "encode_enriched_unit",
+    "encode_enrichment",
+    "encode_metadata",
     "encode_parsed_document",
     "encode_units",
 ]
+
+
+def encode_metadata(meta: Any) -> Any:
+    """Metadata to JSON, dates tagged so they come back as dates.
+
+    Scanner metadata was strings, so plain ``dict(...)`` sufficed. Parsers now
+    add typed facts from the bytes -- an invoice date, a total -- and a date
+    written as a bare string would compare as text in every filter downstream.
+    """
+    if isinstance(meta, dict):
+        return {str(k): encode_metadata(v) for k, v in meta.items()}
+    if isinstance(meta, (list, tuple, set, frozenset)):
+        items = sorted(meta, key=repr) if isinstance(meta, (set, frozenset)) else meta
+        return [encode_metadata(v) for v in items]
+    return _enc_scalar(meta)
+
+
+def decode_metadata(meta: Any) -> Any:
+    if isinstance(meta, dict):
+        if "__t" in meta:
+            return _dec_scalar(meta)
+        return {k: decode_metadata(v) for k, v in meta.items()}
+    if isinstance(meta, list):
+        return [decode_metadata(v) for v in meta]
+    return meta
 
 
 def _enc_prov(p: Provenance) -> dict[str, Any]:
@@ -61,7 +90,7 @@ def encode_parsed_document(doc: ParsedDocument) -> dict[str, Any]:
         "source_hash": doc.source_hash,
         "page_count": doc.page_count,
         "reading_order_confidence": doc.reading_order_confidence,
-        "metadata": dict(doc.metadata),
+        "metadata": encode_metadata(dict(doc.metadata)),
         "page_media": [
             {"uri": m.uri, "mt": m.media_type, "h": m.content_hash, "w": m.width, "ht": m.height}
             for m in doc.page_media
@@ -111,7 +140,7 @@ def decode_parsed_document(d: dict[str, Any]) -> ParsedDocument:
         source_hash=ContentHash(d["source_hash"]),
         page_count=d.get("page_count"),
         reading_order_confidence=d.get("reading_order_confidence", 1.0),
-        metadata=d.get("metadata", {}),
+        metadata=decode_metadata(d.get("metadata", {})),
         page_media=tuple(
             MediaRef(m["uri"], m["mt"], ContentHash(m["h"]), m.get("w"), m.get("ht"))
             for m in d.get("page_media", ())
@@ -176,7 +205,7 @@ def _enc_unit(u: Unit) -> dict[str, Any]:
         "nx": u.next_unit_id,
         "tr": u.table_ref,
         "vb": u.verbatim,
-        "m": dict(u.metadata),
+        "m": encode_metadata(dict(u.metadata)),
     }
 
 
@@ -197,7 +226,7 @@ def _dec_unit(d: dict[str, Any]) -> Unit:
         next_unit_id=UnitId(d["nx"]) if d.get("nx") else None,
         table_ref=d.get("tr"),
         verbatim=d.get("vb", True),
-        metadata=d.get("m", {}),
+        metadata=decode_metadata(d.get("m", {})),
     )
 
 
@@ -216,7 +245,7 @@ def _enc_enrichment(e: Enrichment) -> dict[str, Any]:
         "c": e.context,
         "fl": {k: _enc_scalar(v) for k, v in e.fields.items()},
         "l": {k: list(v) if isinstance(v, tuple) else v for k, v in e.labels.items()},
-        "x": dict(e.extra),
+        "x": encode_metadata(dict(e.extra)),
         "s": str(e.scope),
         "ti": e.tokens_in,
         "to": e.tokens_out,
@@ -250,12 +279,20 @@ def _dec_enrichment(d: dict[str, Any]) -> Enrichment:
         context=d.get("c"),
         fields={k: _dec_scalar(v) for k, v in d.get("fl", {}).items()},
         labels={k: tuple(v) if isinstance(v, list) else v for k, v in d.get("l", {}).items()},
-        extra=d.get("x", {}),
+        extra=decode_metadata(d.get("x", {})),
         scope=ContextScope(d.get("s", "unit")),
         tokens_in=d.get("ti", 0),
         tokens_out=d.get("to", 0),
         cost_usd=d.get("cu", 0.0),
     )
+
+
+def encode_enrichment(e: Enrichment) -> dict[str, Any]:
+    return _enc_enrichment(e)
+
+
+def decode_enrichment(d: dict[str, Any]) -> Enrichment:
+    return _dec_enrichment(d)
 
 
 def encode_enriched_unit(eu: EnrichedUnit) -> dict[str, Any]:

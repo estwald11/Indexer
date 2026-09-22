@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from indexer.core.document import ParsedDocument
 from indexer.core.ids import hash_obj
 from indexer.core.registry import register
 from indexer.core.stages import EnrichContext
@@ -63,23 +64,35 @@ def _make_section_prefix(params: dict[str, Any], **_: Any) -> SectionPrefixEnric
 class SectionPrefixEnricher(StageImpl):
     """Prepends the document title and heading trail.
 
-    Unit-scoped: it reads only the unit's own ``section_path``, so an edit
-    elsewhere in the document does not invalidate it. That is what unit scope is
-    for, and this is the clearest example of it.
+    Unit-scoped: it reads the unit's own ``section_path`` and the document's
+    title, and nothing else, so an edit elsewhere in the document does not
+    invalidate it. ``input_hash`` says exactly that -- a heading rename changes
+    the section path without touching the text, and a key on the text alone kept
+    serving the old heading.
     """
 
-    STAGE, IMPL, VERSION = "enrich", "section_prefix", "1"
+    STAGE, IMPL, VERSION = "enrich", "section_prefix", "2"
     name = "section_prefix"
     scope = ContextScope.UNIT
+    reads_prior = False
+
+    def input_hash(self, unit: Unit, document: ParsedDocument, prior: Any) -> str:
+        title = _document_title(document) if self.param("include_document_title", True) else ""
+        return hash_obj({"section_path": list(unit.section_path), "title": title})
 
     def enrich(self, units: Sequence[Unit], ctx: EnrichContext) -> Sequence[Enrichment]:
         sep = self.param("separator", " > ")
         include_title = self.param("include_document_title", True)
-        title = _document_title(ctx) if include_title else ""
+        title = _document_title(ctx.document) if include_title else ""
         fp = self.fingerprint().key()
         out = []
         for u in units:
-            trail = [t for t in ((title,) if title else ()) + u.section_path if t]
+            trail = [t for t in u.section_path if t]
+            # A document whose first heading is its title has the title as the
+            # root of every section path; prefixing it again spent the context
+            # on a repeated word ("Title > Title > Section").
+            if title and (not trail or trail[0] != title):
+                trail.insert(0, title)
             out.append(
                 Enrichment(
                     enricher=self.name,
@@ -91,11 +104,11 @@ class SectionPrefixEnricher(StageImpl):
         return out
 
 
-def _document_title(ctx: EnrichContext) -> str:
-    for b in ctx.document.blocks:
+def _document_title(document: ParsedDocument) -> str:
+    for b in document.blocks:
         if str(b.kind) == "heading":
             return b.text
-    name = str(ctx.document.metadata.get("name", ""))
+    name = str(document.metadata.get("name", ""))
     return name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ") if name else ""
 
 
@@ -154,6 +167,17 @@ class ExtractiveContextualizer(StageImpl):
     STAGE, IMPL, VERSION = "enrich", "extractive_context", "1"
     name = "extractive_context"
     scope = ContextScope.DOCUMENT
+    reads_prior = False
+
+    def input_hash(self, unit: Unit, document: ParsedDocument, prior: Any) -> str:
+        return hash_obj(
+            {
+                "text": unit.text,
+                "section_path": list(unit.section_path),
+                "document": str(document.content_hash),
+                "title": _document_title(document),
+            }
+        )
 
     def enrich(self, units: Sequence[Unit], ctx: EnrichContext) -> Sequence[Enrichment]:
         max_chars = int(self.param("max_chars", 400))
@@ -161,7 +185,7 @@ class ExtractiveContextualizer(StageImpl):
         n_terms = int(self.param("distinctive_terms", 6))
         fp = self.fingerprint().key()
 
-        title = _document_title(ctx)
+        title = _document_title(ctx.document)
         lead = _lead_sentences(ctx.document.text, n_lead)
         doc_terms = _top_terms(ctx.document.text, n_terms * 3)
 
@@ -259,6 +283,15 @@ class RegexFieldExtractor(StageImpl):
     STAGE, IMPL, VERSION = "enrich", "regex_fields", "1"
     name = "regex_fields"
     scope = ContextScope.UNIT
+    reads_prior = False
+
+    def input_hash(self, unit: Unit, document: ParsedDocument, prior: Any) -> str:
+        # The text, and the metadata keys copied through -- nothing else. Keyed
+        # on the text alone, two tenants' copies of one paragraph shared a
+        # cache entry, and the second tenant's unit carried the first's id.
+        return hash_obj(
+            {"text": unit.text, "metadata": {k: unit.metadata.get(k) for k in self._from_metadata}}
+        )
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
@@ -366,6 +399,12 @@ class LLMContextualizer(StageImpl):
     STAGE, IMPL, VERSION = "enrich", "llm_contextualizer", "1"
     name = "llm_contextualizer"
     scope = ContextScope.DOCUMENT
+    reads_prior = False
+
+    def input_hash(self, unit: Unit, document: ParsedDocument, prior: Any) -> str:
+        # The chunk and the document text it is situated in. Not the metadata:
+        # a renamed or moved file must not re-pay for a summary of the same text.
+        return hash_obj({"text": unit.text, "document": str(document.content_hash)})
 
     PROMPT = (
         "Here is a chunk from the document above:\n<chunk>\n{chunk}\n</chunk>\n\n"

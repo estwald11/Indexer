@@ -20,7 +20,7 @@ from typing import Any
 from indexer.core.document import Block, BlockKind, ParsedDocument, SourceDocument, Table, TableCell
 from indexer.core.provenance import Provenance, Span
 from indexer.core.registry import register
-from indexer.core.stages import StageContext
+from indexer.core.stages import StageContext, parse_cache_scope
 from indexer.plugin import StageImpl, dataclass_params
 
 __all__ = ["MarkdownParser", "PassthroughParser", "RoutingParser", "RstParser", "TextParser"]
@@ -485,6 +485,17 @@ class RoutingParser(StageImpl):
             if _matches(when, doc):
                 return parser
         return self._default
+
+    def cache_scope(self, doc: SourceDocument) -> str:
+        """The parser this document is routed to, and what *it* reads.
+
+        Routing reads the media type, the file name and scanner metadata, so
+        two byte-identical documents can legitimately be parsed differently.
+        The route taken is therefore part of the cache key -- without it the
+        first document's parse was served to the second whatever its type.
+        """
+        picked = self._pick(doc)
+        return f"{picked.fingerprint().key()}|{parse_cache_scope(picked, doc)}"
 
     def can_parse(self, doc: SourceDocument) -> float:
         return float(self._pick(doc).can_parse(doc))
