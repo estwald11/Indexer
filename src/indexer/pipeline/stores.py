@@ -118,7 +118,7 @@ class CacheRefs:
             )
         }
 
-    def set(self, document_id: str, keys: set[str]) -> set[str]:
+    def record(self, document_id: str, keys: set[str]) -> set[str]:
         """Record a document's current keys; return the ones it no longer uses."""
         old = self.keys_of(document_id)
         self._conn.execute("DELETE FROM refs WHERE document_id = ?", (document_id,))

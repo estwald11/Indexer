@@ -29,7 +29,7 @@ from indexer.core.registry import register
 from indexer.core.stages import EnrichContext
 from indexer.core.unit import ContextScope, Enrichment, FieldValue, Unit
 from indexer.plugin import StageImpl, dataclass_params
-from indexer.textutil import STOPWORDS, WORD_RE
+from indexer.textutil import STOPWORDS, WORD_RE, detect_language, stopwords_for
 
 __all__ = [
     "ExtractiveContextualizer",
@@ -129,6 +129,13 @@ class ExtractiveParams:
     #: This is the part that does the work an LLM summary would: it supplies the
     #: subject a pronoun-heavy chunk never names.
     distinctive_terms: int = 6
+    #: Stopword language for choosing those terms: en | it | auto. With the
+    #: English list an Italian document's "distinctive" terms were "della",
+    #: "degli" and "sono". ``auto`` detects per document.
+    language: str = "en"
+    #: The word introducing the terms. "Topics:" reads oddly in an Italian
+    #: surface, and it is indexed like every other word of the context.
+    topics_label: str = "Topics:"
 
 
 @register(
@@ -187,7 +194,12 @@ class ExtractiveContextualizer(StageImpl):
 
         title = _document_title(ctx.document)
         lead = _lead_sentences(ctx.document.text, n_lead)
-        doc_terms = _top_terms(ctx.document.text, n_terms * 3)
+        language = str(self.param("language", "en"))
+        if language == "auto":
+            detected = detect_language(ctx.document.text)
+            language = detected if detected in ("it", "en") else "en"
+        doc_terms = _top_terms(ctx.document.text, n_terms * 3, stopwords_for(language))
+        label = str(self.param("topics_label", "Topics:"))
 
         out: list[Enrichment] = []
         for u in units:
@@ -201,7 +213,7 @@ class ExtractiveContextualizer(StageImpl):
             body_terms = _tokenize(u.text)
             missing = [t for t in doc_terms if t not in body_terms][:n_terms]
             if missing:
-                parts.append("Topics: " + ", ".join(missing) + ".")
+                parts.append(f"{label} " + ", ".join(missing) + ".")
             context = " ".join(parts)[:max_chars].strip()
             out.append(
                 Enrichment(
@@ -218,12 +230,12 @@ def _tokenize(text: str) -> set[str]:
     return {m.group(0).lower() for m in WORD_RE.finditer(text)}
 
 
-def _top_terms(text: str, n: int) -> list[str]:
+def _top_terms(text: str, n: int, stopwords: frozenset[str] = STOPWORDS) -> list[str]:
     """Frequent, non-stopword terms. A crude TF proxy for what a document is about."""
     counts: dict[str, int] = {}
     for m in WORD_RE.finditer(text):
         w = m.group(0).lower()
-        if w in STOPWORDS or w.isdigit():
+        if w in stopwords or w.isdigit():
             continue
         counts[w] = counts.get(w, 0) + 1
     # Ties broken alphabetically: the context string is content-hashed, and a

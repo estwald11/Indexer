@@ -429,7 +429,7 @@ class IngestionPipeline:
             self.ledger.delete(document_id)
         if self.cache_refs is not None:
             for document_id, keys in pending.refs:
-                pending.purge_candidates |= self.cache_refs.set(document_id, keys)
+                pending.purge_candidates |= self.cache_refs.record(document_id, keys)
             for document_id in pending.removals:
                 pending.purge_candidates |= self.cache_refs.remove(document_id)
         pending.records.clear()

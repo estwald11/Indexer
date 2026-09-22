@@ -33,6 +33,10 @@ dense-sentence-transformer = ["sentence-transformers>=3.0"]
 # The reference reranker. Same model runtime as the line above, named separately
 # because a cross-encoder and a bi-encoder are independent choices.
 rerank-cross-encoder = ["sentence-transformers>=3.0"]
+# Snowball stemming (Italian, English) for the lexical analyser. Pure Python;
+# PyStemmer is used instead when installed, for speed. `stemmer: light` needs
+# neither.
+analysis = ["snowballstemmer>=2.2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/indexer"]
@@ -59,5 +63,5 @@ testpaths = ["tests"]
 # type checker cannot see them unless they are installed. Ignoring them here
 # keeps `mypy --strict` meaningful for everything that is not optional.
 [[tool.mypy.overrides]]
-module = ["anthropic", "scipy.*", "sentence_transformers"]
+module = ["anthropic", "scipy.*", "sentence_transformers", "Stemmer", "snowballstemmer"]
 ignore_missing_imports = true
