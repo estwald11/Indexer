@@ -23,7 +23,7 @@ from indexer.core.registry import register
 from indexer.core.results import Hit, RankedList
 from indexer.core.stages import IndexQuery, IndexStatsView, IndexWriteReceipt, StageContext
 from indexer.core.unit import EnrichedUnit
-from indexer.io import atomic_write
+from indexer.io import atomic_write, decode_value, encode_value
 from indexer.plugin import StageImpl, dataclass_params
 from indexer.textutil import tokenize
 
@@ -41,7 +41,7 @@ class BM25Params:
 @register(
     "index",
     "bm25_memory",
-    version="1",
+    version="2",
     params_model=dataclass_params(BM25Params),
     summary="In-memory BM25 over indexing_text(). The lexical baseline.",
 )
@@ -58,7 +58,7 @@ class BM25Index(StageImpl):
     quality one.
     """
 
-    STAGE, IMPL, VERSION = "index", "bm25_memory", "1"
+    STAGE, IMPL, VERSION = "index", "bm25_memory", "2"
     kind = "lexical"
 
     def __init__(self, params: dict[str, Any], name: str = "lexical") -> None:
@@ -82,17 +82,33 @@ class BM25Index(StageImpl):
             return
         self._loaded = True
         if self.path and self.path.exists():
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            stored = raw.get("identity")
+            if stored is not None and stored != self.store_identity():
+                # Built as something else -- another analyser, another version.
+                # Start empty; the ledger restages every document for exactly
+                # this change, and loading the old postings would make each
+                # rewrite a no-op.
+                self._dirty = True
+                return
             self._docs = raw["docs"]
+            for d in self._docs.values():
+                d["f"] = decode_value(d.get("f", {}))
             self._df = Counter(raw["df"])
             self._total_len = raw["total_len"]
 
     def _save(self) -> None:
         if self.path:
+            docs = {uid: {**d, "f": encode_value(d["f"])} for uid, d in self._docs.items()}
             atomic_write(
                 self.path,
                 json.dumps(
-                    {"docs": self._docs, "df": dict(self._df), "total_len": self._total_len}
+                    {
+                        "identity": self.store_identity(),
+                        "docs": docs,
+                        "df": dict(self._df),
+                        "total_len": self._total_len,
+                    }
                 ).encode("utf-8"),
             )
 
@@ -101,26 +117,32 @@ class BM25Index(StageImpl):
     def upsert(self, units: Sequence[EnrichedUnit], ctx: StageContext) -> IndexWriteReceipt:
         written = skipped = 0
         for eu in units:
-            surface = eu.indexing_text()
             existing = self._docs.get(eu.unit_id)
             # Re-writing an identical unit must be a no-op, not a duplicate:
-            # resumability depends on upsert being idempotent.
-            if existing and existing["h"] == str(eu.indexing_hash):
+            # resumability depends on upsert being idempotent. "Identical" is
+            # the whole record -- span, fields, source -- not just the surface,
+            # or a moved span and a corrected field are never written.
+            record = str(eu.record_hash)
+            if existing and existing.get("rh") == record:
                 skipped += 1
                 continue
             if existing:
                 self._retract(eu.unit_id)
+            surface = eu.indexing_text()
             tokens = tokenize(surface)
             tf = Counter(tokens)
             self._docs[eu.unit_id] = {
                 "tf": dict(tf),
                 "len": len(tokens),
                 "h": str(eu.indexing_hash),
+                "rh": record,
                 "d": eu.document_id,
                 "s": [eu.unit.provenance.span.start, eu.unit.provenance.span.end],
                 "u": eu.unit.provenance.source_uri,
                 "t": surface,
-                "f": {k: _jsonable(v) for k, v in eu.fields().items()},
+                # Typed in memory, tagged on disk. Written as ISO strings, a
+                # date filter compared date against str and excluded everything.
+                "f": dict(eu.fields()),
             }
             for term in tf:
                 self._df[term] += 1
@@ -228,10 +250,6 @@ class BM25Index(StageImpl):
                 "b": self.b,
             },
         )
-
-
-def _jsonable(v: Any) -> Any:
-    return v.isoformat() if hasattr(v, "isoformat") else v
 
 
 def _passes(pred: Predicate, fields: dict[str, Any]) -> bool:

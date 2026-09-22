@@ -28,7 +28,8 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
-from indexer.core.ids import ContentHash, DocumentId, UnitId, hash_text
+from indexer.core.document import content_metadata
+from indexer.core.ids import ContentHash, DocumentId, UnitId, hash_obj, hash_text
 from indexer.core.provenance import Provenance
 
 __all__ = [
@@ -189,8 +190,43 @@ class EnrichedUnit:
 
     @property
     def indexing_hash(self) -> ContentHash:
-        """Hash of the retrieval surface. The cache key for index writes."""
+        """Hash of the retrieval surface. Decides whether a vector is recomputed."""
         return hash_text(self.indexing_text())
+
+    @property
+    def record_hash(self) -> ContentHash:
+        """Hash of everything an index may store for this unit.
+
+        The surface is not enough to decide that a stored unit is current. A
+        paragraph inserted above a unit moves its span without touching its
+        text or id; a corrected extraction rule changes its fields without
+        touching its surface. Indexes that skipped a write because the surface
+        hash matched kept the old span -- every citation from the unit pointing
+        at the wrong offset -- and the old field values, so a fixed extractor
+        appeared to do nothing. The surface hash still decides whether a
+        *vector* is recomputed; this decides whether the record is rewritten.
+
+        Position within the document (ordinal, neighbour links, block ids) is
+        deliberately left out: no index stores it, it changes for every unit
+        below an edit, and the unit store -- which does hold it -- compares its
+        own full encoding instead.
+        """
+        u, p = self.unit, self.unit.provenance
+        return hash_obj(
+            {
+                "surface": self.indexing_text(),
+                "fields": _typed(self.fields()),
+                "labels": _typed(self.labels()),
+                "document_id": u.document_id,
+                "span": [p.span.start, p.span.end],
+                "source_uri": p.source_uri,
+                "pages": [p.pages.start, p.pages.end] if p.pages else None,
+                "section_path": list(u.section_path),
+                "kind": str(u.kind),
+                "table_ref": u.table_ref,
+                "metadata": _typed(content_metadata(u.metadata)),
+            }
+        )
 
     def fields(self) -> dict[str, FieldValue]:
         """All extracted fields, flattened. Later enrichers win on collision.
@@ -218,6 +254,26 @@ class EnrichedUnit:
 
     def cost_usd(self) -> float:
         return sum(e.cost_usd for e in self.enrichments.values())
+
+
+def _typed(v: Any) -> Any:
+    """A hashable rendering that keeps the type: ``date(2024,1,1)`` and the
+    string ``"2024-01-01"`` must not hash alike, or an extractor fixed to emit a
+    date instead of a string would leave the string in every index."""
+    if isinstance(v, bool):
+        return ["bool", v]
+    if isinstance(v, datetime):
+        return ["datetime", v.isoformat()]
+    if isinstance(v, date):
+        return ["date", v.isoformat()]
+    if v is None or isinstance(v, (int, float, str)):
+        return [type(v).__name__, v]
+    if isinstance(v, Mapping):
+        return ["map", {str(k): _typed(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}]
+    if isinstance(v, (list, tuple, set, frozenset)):
+        items = sorted(v, key=repr) if isinstance(v, (set, frozenset)) else list(v)
+        return ["list", [_typed(x) for x in items]]
+    return ["repr", repr(v)]
 
 
 def bare(units: Sequence[Unit]) -> list[EnrichedUnit]:

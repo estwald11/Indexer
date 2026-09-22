@@ -283,24 +283,33 @@ class IngestionPipeline:
             stats.bytes_parsed += len(parsed.text)
             new_ids = [u.unit_id for u in enriched]
             prior_ids = list(change.prior.unit_ids) if change.prior else []
-            to_upsert_ids, to_delete = diff_units(prior_ids, new_ids)
+            _, to_delete = diff_units(prior_ids, new_ids)
 
             # Restaging an index (a changed embedding model) must rewrite every
-            # unit, not just the textually new ones -- the unit ids are the same
-            # but their representation in that index is not.
-            full_rewrite = change.kind is not ChangeKind.CHANGED or not prior_ids
+            # unit, not just the changed ones -- the units are the same but their
+            # representation in that index is not. Otherwise a unit is written
+            # when its *record* changed, not only when its id is new: ids come
+            # from text, so a paragraph inserted above a unit keeps its id and
+            # moves its span, and rewriting new ids only left every such unit
+            # citing the wrong offset.
+            index_restaged = change.kind is ChangeKind.RESTAGED and any(
+                s.startswith("index:") for s in change.stages
+            )
+            full_rewrite = change.kind is ChangeKind.ADDED or not prior_ids or index_restaged
             to_write = (
                 enriched
                 if full_rewrite
-                else [u for u in enriched if u.unit_id in set(to_upsert_ids)]
+                else [u for u in enriched if not self.unit_store.is_current(u)]
             )
 
             if to_delete:
                 stats.units_deleted += self._delete_units(list(to_delete), ctx)
+            written = 0
             if to_write:
                 self.unit_store.put_many(to_write)
                 for i in range(0, len(to_write), self.index_batch_size):
                     batch = to_write[i : i + self.index_batch_size]
+                    batch_written = 0
                     for name, idx in self.indexes.items():
                         with accountant.measure(idx.fingerprint()) as run:
                             receipt = idx.upsert(batch, ctx)
@@ -308,9 +317,14 @@ class IngestionPipeline:
                             run.items_out = receipt.written
                             run.cost_usd = receipt.cost_usd
                             run.attrs = {"index": name}
-                stats.units_written += len(to_write)
+                        batch_written = max(batch_written, receipt.written)
+                    written += batch_written
+            # Counted as the indexes saw it: a unit whose neighbour changed is
+            # stored again (its links moved) but no index rewrites it, and no
+            # vector is recomputed -- that is the reuse this number reports.
+            stats.units_written += written
             stats.units_total += len(enriched)
-            stats.units_reused_from_cache += len(enriched) - len(to_write)
+            stats.units_reused_from_cache += len(enriched) - written
 
             # Buffered, not committed. A ledger record claims a document is
             # done; committing it before the indexes holding that document are

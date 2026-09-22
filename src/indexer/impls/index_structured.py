@@ -19,6 +19,7 @@ is precisely the fork this library exists to avoid.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ class SqliteParams:
 @register(
     "index",
     "sqlite",
-    version="1",
+    version="2",
     params_model=dataclass_params(SqliteParams),
     summary="SQLite over extracted fields. Answers the STRUCTURED route without vector search.",
 )
@@ -73,7 +74,7 @@ def _make_sqlite(params: dict[str, Any], **kw: Any) -> SqliteStructuredIndex:
 
 
 class SqliteStructuredIndex(StageImpl):
-    STAGE, IMPL, VERSION = "index", "sqlite", "1"
+    STAGE, IMPL, VERSION = "index", "sqlite", "2"
     kind = "structured"
 
     def __init__(self, params: dict[str, Any], name: str = "fields") -> None:
@@ -84,10 +85,37 @@ class SqliteStructuredIndex(StageImpl):
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
+        self._check_identity()
+
+    def _check_identity(self) -> None:
+        """Start empty if the database was built as something else.
+
+        Same rule as the other indexes: the ledger restages every document when
+        this index's fingerprint changes, and rows left from the old
+        configuration -- fields a narrowed ``fields:`` list no longer keeps --
+        would otherwise survive as "unchanged".
+        """
+        want = json.dumps(self.store_identity(), sort_keys=True)
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'identity'").fetchone()
+        if row is not None and row["value"] != want:
+            self._conn.executescript("DELETE FROM fields; DELETE FROM units;")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(units)")}
+        if "record_hash" not in cols:
+            # A database from version 1. Its rows are kept (the ledger restages
+            # them all for the version change) and rewritten as they arrive.
+            self._conn.execute("ALTER TABLE units ADD COLUMN record_hash TEXT")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('identity', ?)", (want,)
+        )
+        self._conn.commit()
 
     def _init_schema(self) -> None:
         self._conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             CREATE TABLE IF NOT EXISTS units (
                 unit_id     TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL,
@@ -96,7 +124,8 @@ class SqliteStructuredIndex(StageImpl):
                 span_end    INTEGER,
                 section     TEXT,
                 text        TEXT,
-                surface_hash TEXT
+                surface_hash TEXT,
+                record_hash TEXT
             );
             CREATE TABLE IF NOT EXISTS fields (
                 unit_id TEXT NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
@@ -124,17 +153,22 @@ class SqliteStructuredIndex(StageImpl):
         written = skipped = 0
         cur = self._conn.cursor()
         for eu in units:
+            record = str(eu.record_hash)
             row = cur.execute(
-                "SELECT surface_hash FROM units WHERE unit_id = ?", (eu.unit_id,)
+                "SELECT record_hash FROM units WHERE unit_id = ?", (eu.unit_id,)
             ).fetchone()
-            if row and row["surface_hash"] == str(eu.indexing_hash):
+            # Skipped only when the whole record matches. Comparing the surface
+            # hash skipped every unit whose fields changed without its text --
+            # which is every unit, when the change is a corrected extraction
+            # rule -- and the structured path kept answering with old values.
+            if row and row["record_hash"] == record:
                 skipped += 1
                 continue
             cur.execute(
                 "INSERT OR REPLACE INTO units "
                 "(unit_id, document_id, source_uri, span_start, span_end, section, text, "
-                "surface_hash)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "surface_hash, record_hash)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     eu.unit_id,
                     eu.document_id,
@@ -144,6 +178,7 @@ class SqliteStructuredIndex(StageImpl):
                     " > ".join(eu.unit.section_path),
                     eu.indexing_text(),
                     str(eu.indexing_hash),
+                    record,
                 ),
             )
             cur.execute("DELETE FROM fields WHERE unit_id = ?", (eu.unit_id,))

@@ -18,6 +18,7 @@ from indexer.core.document import Block, BlockKind, MediaRef, ParsedDocument, Ta
 from indexer.core.ids import ContentHash, DocumentId, UnitId
 from indexer.core.provenance import BBox, PageRef, Provenance, Span
 from indexer.core.unit import ContextScope, EnrichedUnit, Enrichment, Unit, UnitKind
+from indexer.io import decode_value, encode_value
 
 __all__ = [
     "decode_enriched_unit",
@@ -40,22 +41,11 @@ def encode_metadata(meta: Any) -> Any:
     add typed facts from the bytes -- an invoice date, a total -- and a date
     written as a bare string would compare as text in every filter downstream.
     """
-    if isinstance(meta, dict):
-        return {str(k): encode_metadata(v) for k, v in meta.items()}
-    if isinstance(meta, (list, tuple, set, frozenset)):
-        items = sorted(meta, key=repr) if isinstance(meta, (set, frozenset)) else meta
-        return [encode_metadata(v) for v in items]
-    return _enc_scalar(meta)
+    return encode_value(meta)
 
 
 def decode_metadata(meta: Any) -> Any:
-    if isinstance(meta, dict):
-        if "__t" in meta:
-            return _dec_scalar(meta)
-        return {k: decode_metadata(v) for k, v in meta.items()}
-    if isinstance(meta, list):
-        return [decode_metadata(v) for v in meta]
-    return meta
+    return decode_value(meta)
 
 
 def _enc_prov(p: Provenance) -> dict[str, Any]:

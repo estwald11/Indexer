@@ -255,16 +255,28 @@ class UnitStore:
             self._units = json.loads(self.path.read_text())
 
     def put_many(self, units: list[EnrichedUnit]) -> None:
-        from indexer.pipeline.codec import encode_enriched_unit
-
         self._load()
         for u in units:
-            self._units[u.unit_id] = encode_enriched_unit(u)
+            encoded, rh = _encode_with_hash(u)
+            self._units[u.unit_id] = {**encoded, "rh": rh}
         # Buffered, not written. Writing the whole map per document is quadratic
         # in corpus size -- the same defect the indexes had, and it hid here
         # longer because the unit store is not an Index and so was not covered
         # by the Flushable sweep. The pipeline commits once per build.
         self._dirty = True
+
+    def is_current(self, unit: EnrichedUnit) -> bool:
+        """Whether the stored record for this unit id is exactly this unit.
+
+        An unchanged id does not mean an unchanged unit: ids are derived from
+        text, so a unit keeps its id when a paragraph above it moves its span,
+        when its heading is renamed, or when an enricher's output changes. The
+        pipeline used to rewrite only new ids, and those units kept their old
+        spans and section paths in every store.
+        """
+        self._load()
+        raw = self._units.get(unit.unit_id)
+        return raw is not None and raw.get("rh") == _encode_with_hash(unit)[1]
 
     def get(self, unit_id: UnitId) -> EnrichedUnit | None:
         from indexer.pipeline.codec import decode_enriched_unit
@@ -293,6 +305,13 @@ class UnitStore:
         if self._dirty:
             atomic_write(self.path, json.dumps(self._units).encode("utf-8"))
             self._dirty = False
+
+
+def _encode_with_hash(u: EnrichedUnit) -> tuple[dict[str, Any], str]:
+    from indexer.pipeline.codec import encode_enriched_unit
+
+    encoded = encode_enriched_unit(u)
+    return encoded, hash_bytes(json.dumps(encoded, sort_keys=True).encode("utf-8"))
 
 
 def _record_json(r: DocumentRecord) -> dict[str, Any]:
