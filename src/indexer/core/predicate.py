@@ -138,6 +138,13 @@ class StructuredQuery:
     Returns rows, not a ranked list: "which contracts expire in Q1" has an
     answer set, not a relevance order. The response still carries unit ids so
     every row cites its source -- provenance holds on this path too.
+
+    ``level`` says what a row *is*. ``"unit"`` (the default, and the historical
+    behaviour) evaluates the predicate per unit and counts units. ``"document"``
+    evaluates it over each document's fields together and counts documents --
+    which is what "how many invoices over 1,000 euros" means, and what a
+    predicate needs when the supplier is named on page one and the total on
+    page three.
     """
 
     where: Predicate | None = None
@@ -146,6 +153,7 @@ class StructuredQuery:
     aggregations: tuple[Aggregation, ...] = ()
     order_by: tuple[tuple[str, bool], ...] = ()  # (field, descending)
     limit: int | None = None
+    level: str = "unit"  # unit | document
 
 
 def evaluate(pred: Predicate, fields: dict[str, Any]) -> bool:
@@ -154,51 +162,34 @@ def evaluate(pred: Predicate, fields: dict[str, Any]) -> bool:
     Not the production path -- real stores push predicates down. It exists so
     the AST has an executable definition: any store implementation must agree
     with this function, and the conformance tests check exactly that.
+
+    A field may hold a list -- the groups an ACL grants, the VAT numbers a
+    document mentions. Every comparison on a list is *existential*: it holds if
+    it holds for some element, and an empty list is an absent field. So
+    ``In("acl", principals)`` asks "does the caller hold any group this
+    document grants", which is the question an access check asks.
     """
     match pred:
         case Compare(field=f, op=op, value=v):
-            actual = fields.get(f)
-            if actual is None or v is None:
-                return op is Op.EQ and actual is None and v is None
-            try:
-                match op:
-                    case Op.EQ:
-                        return bool(actual == v)
-                    case Op.NE:
-                        return bool(actual != v)
-                    case Op.LT:
-                        return bool(actual < v)
-                    case Op.LTE:
-                        return bool(actual <= v)
-                    case Op.GT:
-                        return bool(actual > v)
-                    case Op.GTE:
-                        return bool(actual >= v)
-            except TypeError:
-                # Comparing a date to a string is a config or extraction bug.
-                # Returning False would hide it behind an empty result set.
-                raise TypeError(
-                    f"field {f!r} holds {type(actual).__name__}, compared against "
-                    f"{type(v).__name__}; fix the extraction schema"
-                ) from None
+            compared: Any = fields.get(f)
+            if _is_list(compared):
+                if not compared:
+                    return _compare(f, None, op, v)
+                return any(_compare(f, a, op, v) for a in compared)
+            return _compare(f, compared, op, v)
         case In(field=f, values=vs):
-            return fields.get(f) in vs
+            member: Any = fields.get(f)
+            if _is_list(member):
+                return any(a in vs for a in member)
+            return member in vs
         case Exists(field=f, present=p):
-            return (fields.get(f) is not None) is p
+            held: Any = fields.get(f)
+            present = bool(held) if _is_list(held) else held is not None
+            return present is p
         case TextMatch(field=f, value=v, mode=m):
-            actual_text = fields.get(f)
-            if not isinstance(actual_text, str):
-                return False
-            hay, needle = actual_text.casefold(), v.casefold()
-            match m:
-                case "contains":
-                    return needle in hay
-                case "prefix":
-                    return hay.startswith(needle)
-                case "exact":
-                    return hay == needle
-                case _:
-                    raise ValueError(f"unknown TextMatch mode {m!r}")
+            text: Any = fields.get(f)
+            values = list(text) if _is_list(text) else [text]
+            return any(_text_match(a, v, m) for a in values)
         case And(clauses=cs):
             return all(evaluate(c, fields) for c in cs)
         case Or(clauses=cs):
@@ -206,6 +197,51 @@ def evaluate(pred: Predicate, fields: dict[str, Any]) -> bool:
         case Not(clause=c):
             return not evaluate(c, fields)
     raise TypeError(f"unknown predicate node {type(pred).__name__}")
+
+
+def _is_list(v: Any) -> bool:
+    return isinstance(v, (list, tuple))
+
+
+def _compare(f: str, actual: Any, op: Op, v: Any) -> bool:
+    if actual is None or v is None:
+        return op is Op.EQ and actual is None and v is None
+    try:
+        match op:
+            case Op.EQ:
+                return bool(actual == v)
+            case Op.NE:
+                return bool(actual != v)
+            case Op.LT:
+                return bool(actual < v)
+            case Op.LTE:
+                return bool(actual <= v)
+            case Op.GT:
+                return bool(actual > v)
+            case Op.GTE:
+                return bool(actual >= v)
+    except TypeError:
+        # Comparing a date to a string is a config or extraction bug.
+        # Returning False would hide it behind an empty result set.
+        raise TypeError(
+            f"field {f!r} holds {type(actual).__name__}, compared against "
+            f"{type(v).__name__}; fix the extraction schema"
+        ) from None
+    raise ValueError(f"unknown operator {op!r}")
+
+
+def _text_match(actual: Any, value: str, mode: str) -> bool:
+    if not isinstance(actual, str):
+        return False
+    hay, needle = actual.casefold(), value.casefold()
+    match mode:
+        case "contains":
+            return needle in hay
+        case "prefix":
+            return hay.startswith(needle)
+        case "exact":
+            return hay == needle
+    raise ValueError(f"unknown TextMatch mode {mode!r}")
 
 
 def all_of(clauses: Sequence[Predicate]) -> Predicate | None:

@@ -152,6 +152,10 @@ def parse_date(raw: str, *, order: str = "dmy") -> date | None:
     s = " ".join(raw.strip().lower().split())
     if not s:
         return None
+    if order not in ("dmy", "mdy"):
+        # Outside the try: a misconfigured order is a config error, not a date
+        # that failed to parse.
+        raise ValueError(f"order must be dmy or mdy, not {order!r}")
     try:
         if m := _ISO.match(s):
             return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -159,20 +163,18 @@ def parse_date(raw: str, *, order: str = "dmy") -> date | None:
             a, b, c = (int(g) for g in m.groups())
             if len(m.group(1)) == 4:  # 2025/06/30
                 return date(a, b, c)
-            if order not in ("dmy", "mdy"):
-                raise ValueError(f"order must be dmy or mdy, not {order!r}")
             day, month = (a, b) if order == "dmy" else (b, a)
             return date(_year(c, m.group(3)), month, day)
         if m := _DAY_MONTH_YEAR.match(s):
-            month = _MONTHS.get(m.group(2))
-            if month is None:
+            named = _MONTHS.get(m.group(2))
+            if named is None:
                 return None
-            return date(_year(int(m.group(3)), m.group(3)), month, int(m.group(1)))
+            return date(_year(int(m.group(3)), m.group(3)), named, int(m.group(1)))
         if m := _MONTH_DAY_YEAR.match(s):
-            month = _MONTHS.get(m.group(1))
-            if month is None:
+            named = _MONTHS.get(m.group(1))
+            if named is None:
                 return None
-            return date(int(m.group(3)), month, int(m.group(2)))
+            return date(int(m.group(3)), named, int(m.group(2)))
     except ValueError:
         return None
     return None

@@ -167,7 +167,7 @@ class VectorIndex(StageImpl):
                 "s": [eu.unit.provenance.span.start, eu.unit.provenance.span.end],
                 "u": eu.unit.provenance.source_uri,
                 "t": surface,
-                "f": dict(eu.fields()),
+                "f": dict(eu.filter_fields()),
             }
             # The record changed; the vector only if the surface did. A moved
             # span or a corrected field must be written, and must not cost an

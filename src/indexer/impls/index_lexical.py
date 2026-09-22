@@ -202,7 +202,7 @@ class BM25Index(StageImpl):
                 "t": surface,
                 # Typed in memory, tagged on disk. Written as ISO strings, a
                 # date filter compared date against str and excluded everything.
-                "f": dict(eu.fields()),
+                "f": dict(eu.filter_fields()),
             }
             for term, f in tf.items():
                 self._postings.setdefault(term, {})[eu.unit_id] = f

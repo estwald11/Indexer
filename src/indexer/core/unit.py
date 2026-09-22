@@ -240,6 +240,32 @@ class EnrichedUnit:
             out.update(e.fields)
         return out
 
+    def filter_fields(self) -> dict[str, Any]:
+        """What filters and structured queries see: extracted fields, overlaid
+        by the scanner's metadata.
+
+        Scanner metadata used to reach an index only if an enricher copied it
+        (``regex_fields.from_metadata``), so a tenant or ACL filter silently
+        excluded everything in any config that forgot the copy. It now reaches
+        every index directly.
+
+        Metadata wins a name collision, deliberately. It states known facts --
+        the tenant a folder belongs to, the groups a sidecar grants -- while
+        fields are inferred from content, and a document must not be able to
+        re-scope itself by containing text an extractor reads as ``tenant``.
+        Lists of scalars (an ACL) are kept as tuples; nested structures are
+        not filterable and are left out.
+        """
+        out: dict[str, Any] = dict(self.fields())
+        for k, v in content_metadata(self.unit.metadata).items():
+            if isinstance(v, (list, tuple, set, frozenset)):
+                items = sorted(v, key=repr) if isinstance(v, (set, frozenset)) else list(v)
+                if all(_is_scalar(x) for x in items):
+                    out[k] = tuple(items)
+            elif _is_scalar(v) and v is not None:
+                out[k] = v
+        return out
+
     def labels(self) -> dict[str, str | tuple[str, ...]]:
         out: dict[str, str | tuple[str, ...]] = {}
         for _, e in sorted(self.enrichments.items()):
@@ -254,6 +280,10 @@ class EnrichedUnit:
 
     def cost_usd(self) -> float:
         return sum(e.cost_usd for e in self.enrichments.values())
+
+
+def _is_scalar(v: Any) -> bool:
+    return v is None or isinstance(v, (str, int, float, bool, date, datetime))
 
 
 def _typed(v: Any) -> Any:

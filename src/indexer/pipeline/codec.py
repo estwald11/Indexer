@@ -233,7 +233,7 @@ def _enc_enrichment(e: Enrichment) -> dict[str, Any]:
         "e": e.enricher,
         "f": e.fingerprint,
         "c": e.context,
-        "fl": {k: _enc_scalar(v) for k, v in e.fields.items()},
+        "fl": {k: encode_value(v) for k, v in e.fields.items()},
         "l": {k: list(v) if isinstance(v, tuple) else v for k, v in e.labels.items()},
         "x": encode_metadata(dict(e.extra)),
         "s": str(e.scope),
@@ -267,7 +267,7 @@ def _dec_enrichment(d: dict[str, Any]) -> Enrichment:
         enricher=d["e"],
         fingerprint=d.get("f", ""),
         context=d.get("c"),
-        fields={k: _dec_scalar(v) for k, v in d.get("fl", {}).items()},
+        fields={k: _as_tuple(decode_value(v)) for k, v in d.get("fl", {}).items()},
         labels={k: tuple(v) if isinstance(v, list) else v for k, v in d.get("l", {}).items()},
         extra=decode_metadata(d.get("x", {})),
         scope=ContextScope(d.get("s", "unit")),
@@ -297,3 +297,12 @@ def decode_enriched_unit(d: dict[str, Any]) -> EnrichedUnit:
         unit=_dec_unit(d["u"]),
         enrichments={k: _dec_enrichment(v) for k, v in d.get("e", {}).items()},
     )
+
+
+def _as_tuple(v: Any) -> Any:
+    """Multi-valued fields round-trip as tuples, the type they were written as.
+
+    JSON has only lists; a field that came back as a list would hash and compare
+    differently from the tuple an enricher produced.
+    """
+    return tuple(v) if isinstance(v, list) else v

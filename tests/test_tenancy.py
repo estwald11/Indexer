@@ -189,6 +189,28 @@ class TestCachesDoNotCollapseDocuments:
         assert doc.document_id.encode() not in raw
 
 
+class TestScopeWithoutCopyingMetadata:
+    """The tenant reaches every index from the scanner, not via an enricher."""
+
+    def test_filters_work_when_no_enricher_copies_the_tenant(self, tmp_path: Path) -> None:
+        cfg = _workspace(
+            tmp_path,
+            {
+                "acme/invoice.md": "# Invoice\n\nThe invoice amount 1500 is due in March.\n",
+                "globex/invoice.md": "# Invoice\n\nThe invoice amount 9000 is due in April.\n",
+            },
+        )
+        cfg.write_text(cfg.read_text().replace("from_metadata: [tenant]", "from_metadata: []"))
+        a = assemble(cfg)
+        assert a.ingestion().build().ok
+        # Before, with nothing copying the tenant into fields, this filter
+        # excluded every unit on every index -- fail-closed, but useless.
+        assert _lexical_docs(a, "invoice amount", ACME) == ["acme/invoice.md"]
+        resp = a.query_engine().query("invoices with amount greater than 1000", filters=GLOBEX)
+        assert resp.records is not None
+        assert [r["amount"] for r in resp.records.as_dicts()] == [9000]
+
+
 class TestRebinding:
     def test_parser_metadata_cannot_override_scanner_facts(self) -> None:
         from indexer.core.document import SourceDocument

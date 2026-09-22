@@ -44,6 +44,22 @@ ROWS: list[dict] = [
     {"package": "flask", "version_major": 3, "released": date(2025, 11, 2), "stable": False},
     {"package": "click", "version_major": 8, "released": date(2022, 7, 30), "stable": True},
     {"package": "attrs", "version_major": 25},  # released/stable absent entirely
+    # Where SQL and the evaluator used to disagree: a float against an int
+    # bound value, case folding outside ASCII, and multi-valued fields.
+    {
+        "package": "città-lib",
+        "version_major": 1,
+        "amount": 1500.0,
+        "city": "CITTÀ",
+        "acl": ("group:finance", "user:mario"),
+    },
+    {
+        "package": "straße",
+        "version_major": 0,
+        "amount": 999,
+        "city": "Straße",
+        "acl": ("group:legal",),
+    },
 ]
 
 PREDICATES: list[Predicate] = [
@@ -75,6 +91,27 @@ PREDICATES: list[Predicate] = [
             Not(Compare("released", Op.LT, date(2024, 1, 1))),
         )
     ),
+    # int bound against a float column, and the reverse
+    Compare("amount", Op.GT, 1000),
+    Compare("amount", Op.LTE, 999.0),
+    In("amount", (999, 1500)),
+    # case folding beyond ASCII
+    TextMatch("city", "città"),
+    TextMatch("city", "STRASSE", mode="exact"),
+    TextMatch("city", "cit", mode="prefix"),
+    # negation over an absent field: true in the evaluator, NULL in a scalar
+    # subquery -- and NOT NULL is NULL, which dropped the row
+    Not(Compare("amount", Op.GT, 1000)),
+    Not(TextMatch("city", "città")),
+    # multi-valued fields are existential
+    In("acl", ("group:finance", "group:hr")),
+    Compare("acl", Op.EQ, "group:legal"),
+    Not(In("acl", ("group:legal",))),
+    Exists("acl"),
+    Exists("acl", present=False),
+    TextMatch("acl", "finance"),
+    Compare("amount", Op.EQ, None),
+    Compare("amount", Op.NE, None),
 ]
 
 
