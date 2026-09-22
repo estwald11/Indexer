@@ -156,6 +156,37 @@ class TestStructuredQueryShape:
         )
         assert rs.rows[0][0] == 25
 
+    def test_truncation_is_reported_with_the_full_count(self, index: SqliteStructuredIndex) -> None:
+        """A prefix of the answer must not read as the whole answer."""
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rs = index.structured_query(
+            StructuredQuery(where=Exists("package"), select=("package",), limit=2), ctx
+        )
+        assert len(rs.rows) == 2
+        assert rs.truncated is True
+        assert rs.total == len(ROWS)
+
+        whole = index.structured_query(
+            StructuredQuery(where=Exists("package"), select=("package",), limit=50), ctx
+        )
+        assert whole.truncated is False
+        assert whole.total == len(ROWS)
+
+    def test_an_aggregate_over_nothing_is_empty(self, index: SqliteStructuredIndex) -> None:
+        """COUNT over zero rows is one row, and still no answer."""
+        from indexer.core.predicate import Aggregation, AggregationOp
+
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rs = index.structured_query(
+            StructuredQuery(
+                where=Compare("package", Op.EQ, "no-such-package"),
+                aggregations=(Aggregation(AggregationOp.COUNT),),
+            ),
+            ctx,
+        )
+        assert rs.rows == ((0,),)
+        assert rs.is_empty()
+
     def test_filters_push_down_to_search(self, index: SqliteStructuredIndex) -> None:
         ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
         rl = index.search(

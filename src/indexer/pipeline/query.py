@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from indexer.core.accounting import InMemoryAccountant
@@ -236,7 +237,15 @@ class QueryEngine:
         t = time.perf_counter()
         idx = self.indexes[capable[0]]
         assert isinstance(idx, StructuredCapable)
-        records = idx.structured_query(decision.structured_query, ctx)
+        # The caller's scope applies here exactly as it does to every retrieval
+        # target. `_route` conjoins it onto targets, but the structured path
+        # never reads target filters -- it runs `structured_query` -- so before
+        # this line a tenant-scoped question over the structured index answered
+        # from every tenant's records.
+        sq = decision.structured_query
+        if q.filters is not None:
+            sq = replace(sq, where=all_of([w for w in (sq.where, q.filters) if w is not None]))
+        records = idx.structured_query(sq, ctx)
         latency["structured"] = (time.perf_counter() - t) * 1000
         skipped["retrieve"] = "structured_path"
         skipped["fuse"] = "structured_path"
@@ -293,8 +302,6 @@ class QueryEngine:
 
 
 def _with_caller_filters(decision: RouteDecision, filters: Predicate) -> RouteDecision:
-    from dataclasses import replace
-
     return replace(
         decision,
         targets=tuple(

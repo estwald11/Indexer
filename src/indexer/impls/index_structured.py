@@ -281,9 +281,18 @@ class SqliteStructuredIndex(StageImpl):
             sql += " ORDER BY " + ", ".join(
                 f"{_field_expr(f)} {'DESC' if desc else 'ASC'}" for f, desc in query.order_by
             )
-        sql += f" LIMIT {int(query.limit)}" if query.limit else " LIMIT 1000"
+        limit = int(query.limit) if query.limit else 1000
 
-        rows = self._conn.execute(sql, params).fetchall()
+        # One row past the limit says whether the answer was cut; only then is
+        # the full count worth a second query.
+        rows = self._conn.execute(f"{sql} LIMIT {limit + 1}", params).fetchall()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        total = (
+            int(self._conn.execute(f"SELECT COUNT(*) AS n FROM ({sql})", params).fetchone()["n"])
+            if truncated
+            else len(rows)
+        )
         return RecordSet(
             columns=tuple(columns),
             rows=tuple(tuple(r[c] for c in columns) for r in rows),
@@ -293,6 +302,8 @@ class SqliteStructuredIndex(StageImpl):
                 tuple(UnitId(x) for x in (r["_src"] or "").split(",") if x) for r in rows
             ),
             fingerprint=self.fingerprint().key(),
+            total=total,
+            truncated=truncated,
         )
 
     def all_unit_ids(self) -> list[UnitId]:
