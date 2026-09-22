@@ -20,7 +20,6 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date
 from typing import Any
 
 from indexer.core.document import ParsedDocument
@@ -28,6 +27,7 @@ from indexer.core.ids import hash_obj
 from indexer.core.registry import register
 from indexer.core.stages import EnrichContext
 from indexer.core.unit import ContextScope, Enrichment, FieldValue, Unit
+from indexer.normalize import parse_bool, parse_date, parse_int, parse_number
 from indexer.plugin import StageImpl, dataclass_params
 from indexer.textutil import STOPWORDS, WORD_RE, detect_language, stopwords_for
 
@@ -53,7 +53,7 @@ class SectionPrefixParams:
 @register(
     "enrich",
     "section_prefix",
-    version="1",
+    version="2",
     params_model=dataclass_params(SectionPrefixParams),
     summary="Prepends the heading trail. No model. The control arm for contextualisation.",
 )
@@ -270,12 +270,17 @@ class RegexFieldParams:
     fields: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: Copy scanner metadata straight through as fields (package name, version).
     from_metadata: list[str] = field(default_factory=list)
+    #: How numbers are written: it (1.250,00), en (1,250.00) or auto. See
+    #: ``indexer.normalize`` for what auto can and cannot tell apart.
+    locale: str = "auto"
+    #: Day-month or month-day for numeric dates: dmy (Italy, Europe) or mdy.
+    date_order: str = "dmy"
 
 
 @register(
     "enrich",
     "regex_fields",
-    version="1",
+    version="2",
     params_model=dataclass_params(RegexFieldParams),
     summary="Typed field extraction by regex. No model. Feeds the structured index.",
 )
@@ -292,7 +297,7 @@ class RegexFieldExtractor(StageImpl):
     a structured query will compare is worse than useless.
     """
 
-    STAGE, IMPL, VERSION = "enrich", "regex_fields", "1"
+    STAGE, IMPL, VERSION = "enrich", "regex_fields", "2"
     name = "regex_fields"
     scope = ContextScope.UNIT
     reads_prior = False
@@ -328,7 +333,12 @@ class RegexFieldExtractor(StageImpl):
             for name, (rx, typ, group) in self._compiled.items():
                 m = rx.search(u.text)
                 if m:
-                    value = _coerce(m.group(group) if m.lastindex else m.group(0), typ)
+                    value = _coerce(
+                        m.group(group) if m.lastindex else m.group(0),
+                        typ,
+                        locale=self.param("locale", "auto"),
+                        date_order=self.param("date_order", "dmy"),
+                    )
                     if value is not None:
                         fields_out[name] = value
             out.append(
@@ -342,25 +352,29 @@ class RegexFieldExtractor(StageImpl):
         return out
 
 
-def _coerce(raw: str, typ: str) -> FieldValue:
+def _coerce(raw: str, typ: str, *, locale: str = "auto", date_order: str = "dmy") -> FieldValue:
+    """Text to a typed value, as the text's locale writes it.
+
+    It used to strip commas and call ``float``, so "1.250,00" was 1.25 and
+    "1,5" was 15.0 -- three orders of magnitude, silently, on the amount a
+    structured question then compares against.
+
+    A value that does not parse is dropped rather than stored as a string.
+    Storing "circa 2019" in a date column makes every temporal predicate over
+    that column raise or silently mis-sort.
+    """
     raw = raw.strip()
-    try:
-        match typ:
-            case "int":
-                return int(re.sub(r"[,_\s]", "", raw))
-            case "float":
-                return float(re.sub(r"[,_\s]", "", raw))
-            case "bool":
-                return raw.lower() in ("true", "yes", "1")
-            case "date":
-                return date.fromisoformat(raw[:10])
-            case _:
-                return raw
-    except (ValueError, TypeError):
-        # A value that does not parse is dropped rather than stored as a string.
-        # Storing "circa 2019" in a date column makes every temporal predicate
-        # over that column raise or silently mis-sort.
-        return None
+    match typ:
+        case "int":
+            return parse_int(raw.replace("_", ""), locale)
+        case "float":
+            return parse_number(raw.replace("_", ""), locale)
+        case "bool":
+            return parse_bool(raw)
+        case "date":
+            return parse_date(raw, order=date_order)
+        case _:
+            return raw
 
 
 # --------------------------------------------------------------------------- #
