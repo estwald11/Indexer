@@ -39,6 +39,7 @@ report verified and unverified subsets separately.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -232,6 +233,33 @@ class GoldenSet:
         from dataclasses import replace
 
         return replace(self, queries=tuple(q for q in self.queries if q.query_type is qt))
+
+    def split(self, dev_share: float = 0.3, *, salt: str = "") -> tuple[GoldenSet, GoldenSet]:
+        """``(dev, test)``: tune on the first, report on the second.
+
+        Anything chosen by looking at scores -- fusion weights, a threshold, a
+        prompt -- is fitted to the queries it was chosen on, and its score there
+        overstates what the next query will see. The test half is where the
+        number that gets reported comes from.
+
+        Each query's side is decided by a hash of its id alone, so adding
+        queries never moves an existing one across: a test query must never
+        become a dev query after a tuning run has seen it. ``salt`` draws a
+        different split, for a second opinion.
+        """
+        from dataclasses import replace
+
+        if not 0.0 < dev_share < 1.0:
+            raise ValueError("dev_share must be between 0 and 1")
+        dev: list[GoldenQuery] = []
+        test: list[GoldenQuery] = []
+        for q in self.queries:
+            digest = hashlib.sha256(f"{salt}:{q.id}".encode()).digest()
+            (dev if int.from_bytes(digest[:8], "big") / 2**64 < dev_share else test).append(q)
+        return (
+            replace(self, queries=tuple(dev), notes=f"dev split ({dev_share:.0%}) of {self.notes}"),
+            replace(self, queries=tuple(test), notes=f"test split of {self.notes}"),
+        )
 
     def stats(self) -> dict[str, Any]:
         types: dict[str, int] = {}

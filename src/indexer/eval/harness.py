@@ -36,6 +36,7 @@ from indexer.core.document import ParsedDocument
 from indexer.core.results import RetrievalResponse
 from indexer.eval.golden import GoldenSet
 from indexer.eval.metrics import RunReport
+from indexer.eval.stats import Comparison, compare
 
 __all__ = [
     "AblationResult",
@@ -233,6 +234,16 @@ class AblationResult:
                     f"Its metrics are averaged over the {r.n_queries - r.errors} that ran "
                     f"and are not comparable to the other arms."
                 )
+        significance = self.significance()
+        if significance:
+            lines.append("")
+            lines.append(
+                f"paired against {base.arm}, per query: bootstrap 95% interval for graded "
+                f"metrics, McNemar for pass/fail ('*' = significant at 5%)"
+            )
+            for arm, comparisons in significance.items():
+                lines.append(f"  {arm}")
+                lines.extend(f"    {c.render()}" for c in comparisons)
         if self.verdicts:
             lines.append("")
             lines.extend(v.render() for v in self.verdicts)
@@ -242,6 +253,15 @@ class AblationResult:
             f"   ('>' better than {base.arm}, '<' worse)"
         )
         return "\n".join(lines)
+
+    def significance(self) -> dict[str, list[Comparison]]:
+        """Each arm against the baseline, per query, with an interval or a
+        p-value per metric. A delta without one does not say whether it would
+        survive the next golden set."""
+        base = next((r for r in self.reports if r.arm == self.baseline_arm), None)
+        if base is None or not base.scores:
+            return {}
+        return {r.arm: compare(base, r) for r in self.reports if r is not base and r.scores}
 
 
 class AblationRunner(Protocol):

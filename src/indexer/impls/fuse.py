@@ -18,6 +18,11 @@ __all__ = ["ConcatFuser", "RRFFuser"]
 class RRFParams:
     k: int = 60
     weights: dict[str, float] = field(default_factory=dict)
+    #: Per query type (factual, comparative, ...), weights that override
+    #: ``weights`` for that type. Lexical evidence is worth more on a question
+    #: quoting an article number than on a paraphrased one; one set of weights
+    #: for both is a compromise the ablation can measure away.
+    weights_by_type: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @register(
@@ -48,7 +53,11 @@ class RRFFuser(StageImpl):
 
     def fuse(self, lists: Sequence[RankedList], ctx: StageContext) -> RankedList:
         k = int(self.param("k", 60))
-        weights: dict[str, float] = self.param("weights", {}) or {}
+        weights: dict[str, float] = dict(self.param("weights", {}) or {})
+        qtype = (ctx.attrs or {}).get("query_type")
+        by_type = self.param("weights_by_type", {}) or {}
+        if qtype in by_type:
+            weights.update(by_type[qtype])
         scores: dict[str, float] = {}
         best: dict[str, Hit] = {}
         contributors: dict[str, list[str]] = {}

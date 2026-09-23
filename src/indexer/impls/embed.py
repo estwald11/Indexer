@@ -23,6 +23,12 @@ Three implementations, in increasing order of what they know about language:
                           production choice. It needs a model download, so it
                           cannot run where the egress policy blocks the model
                           host; the contract is what makes it a drop-in anyway.
+                          ``MULTILINGUAL_PRESETS`` name the models, with their
+                          prefixes, that were trained on Italian.
+``voyage``                Voyage AI's embedding API over HTTP. Nothing to host,
+                          strong multilingual retrieval -- and every chunk of
+                          the archive leaves the building, so it needs the same
+                          GDPR basis as any processor.
 
 The protocol is small on purpose. Two things in it are worth explaining:
 
@@ -41,20 +47,27 @@ same lazy-invalidation pattern the numpy matrix already uses.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import re
+import time
+import urllib.error
+import urllib.request
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from indexer.textutil import tokenize
 
 __all__ = [
+    "MULTILINGUAL_PRESETS",
     "Embedder",
     "HashEmbedder",
     "SentenceTransformerEmbedder",
     "SvdEmbedder",
+    "VoyageEmbedder",
     "build_embedder",
 ]
 
@@ -530,10 +543,176 @@ class SentenceTransformerEmbedder:
         }
 
 
+#: Bi-encoders trained on Italian among many languages, with the prefixes each
+#: was trained with. The English defaults above embed Italian as a bag of
+#: unfamiliar word pieces; these do not.
+MULTILINGUAL_PRESETS: dict[str, dict[str, Any]] = {
+    # The strongest of the four on multilingual retrieval benchmarks, long
+    # inputs, no prefix. 568M parameters: a GPU, or patience.
+    "bge-m3": {
+        "model": "BAAI/bge-m3",
+        "query_prefix": "",
+        "document_prefix": "",
+        "max_seq_length": 1024,
+    },
+    "multilingual-e5-large": {
+        "model": "intfloat/multilingual-e5-large",
+        "query_prefix": "query: ",
+        "document_prefix": "passage: ",
+        "max_seq_length": 512,
+    },
+    "multilingual-e5-base": {
+        "model": "intfloat/multilingual-e5-base",
+        "query_prefix": "query: ",
+        "document_prefix": "passage: ",
+        "max_seq_length": 512,
+    },
+    "multilingual-e5-small": {
+        "model": "intfloat/multilingual-e5-small",
+        "query_prefix": "query: ",
+        "document_prefix": "passage: ",
+        "max_seq_length": 512,
+    },
+}
+
+
+# ------------------------------------------------------------------ voyage
+
+#: (method, url, headers, body) -> (status, body). Injectable for tests and for
+#: deployments that must go through a proxy with a client of their own.
+Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
+
+
+def _urllib_transport(
+    method: str, url: str, headers: dict[str, str], body: bytes | None
+) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return int(resp.status), bytes(resp.read())
+    except urllib.error.HTTPError as err:
+        return int(err.code), bytes(err.read() or b"")
+
+
+#: Default output dimension per model, so the store knows its dimension before
+#: the first call. ``output_dimension`` overrides it for models that take one.
+_VOYAGE_DIMS = {
+    "voyage-3.5": 1024,
+    "voyage-3.5-lite": 1024,
+    "voyage-3-large": 1024,
+    "voyage-multilingual-2": 1024,
+    "voyage-law-2": 1024,
+    "voyage-finance-2": 1024,
+}
+
+
+class VoyageEmbedder:
+    """Voyage AI embeddings over HTTP.
+
+    Documents and queries are sent with their ``input_type``, which Voyage uses
+    to apply its own asymmetric prompt -- the same idea as E5's prefixes, done
+    server-side. The key is read from the environment variable ``api_key_env``
+    names, at call time: it is never a parameter, so it is never in a
+    fingerprint, and rotating it does not re-embed an archive.
+
+    Failures are loud. 429 and 5xx are retried with backoff; anything else, or
+    retries exhausted, raises with the status and Voyage's message -- a dense
+    index that silently embedded nothing would score as a retrieval regression.
+    """
+
+    needs_fit = False
+
+    def __init__(
+        self,
+        params: Mapping[str, Any] | None = None,
+        transport: Transport | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        p = dict(params or {})
+        self.model = str(p.get("model", "voyage-3.5"))
+        self.output_dimension = p.get("output_dimension")
+        self.dim = int(self.output_dimension or _VOYAGE_DIMS.get(self.model, 0))
+        self.batch_size = int(p.get("batch_size", 64))
+        self.base_url = str(p.get("base_url", "https://api.voyageai.com/v1/embeddings"))
+        self.api_key_env = str(p.get("api_key_env", "VOYAGE_API_KEY"))
+        self.max_retries = int(p.get("max_retries", 4))
+        self._transport = transport or _urllib_transport
+        self._sleep = sleep or time.sleep
+        self.tokens = 0
+
+    def _post(self, texts: Sequence[str], input_type: str) -> list[list[float]]:
+        key = os.environ.get(self.api_key_env, "")
+        if not key:
+            raise RuntimeError(f"voyage embeddings need an API key in ${self.api_key_env}")
+        payload: dict[str, Any] = {
+            "input": list(texts),
+            "model": self.model,
+            "input_type": input_type,
+        }
+        if self.output_dimension:
+            payload["output_dimension"] = int(self.output_dimension)
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        for attempt in range(self.max_retries + 1):
+            status, raw = self._transport("POST", self.base_url, headers, body)
+            if status == 200:
+                data = json.loads(raw)
+                self.tokens += int((data.get("usage") or {}).get("total_tokens", 0) or 0)
+                rows = sorted(data["data"], key=lambda r: int(r["index"]))
+                vectors = [_unit([float(x) for x in r["embedding"]]) for r in rows]
+                if not self.dim and vectors:
+                    self.dim = len(vectors[0])
+                if any(len(v) != self.dim for v in vectors):
+                    raise RuntimeError(
+                        f"voyage returned {len(vectors[0])}-dimensional vectors; "
+                        f"the store holds {self.dim}"
+                    )
+                return vectors
+            if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                self._sleep(min(30.0, 2.0**attempt))
+                continue
+            message = raw[:300].decode("utf-8", errors="replace")
+            raise RuntimeError(f"voyage embeddings failed with HTTP {status}: {message}")
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def fit(self, texts: Sequence[str]) -> None:
+        return None
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch_size):
+            out.extend(self._post(texts[i : i + self.batch_size], "document"))
+        return out
+
+    def embed_query(self, text: str, *, corpus_size: int) -> list[float]:
+        return self._post([text], "query")[0]
+
+    def state(self) -> dict[str, Any]:
+        return {}
+
+    def load_state(self, state: Mapping[str, Any]) -> None:
+        return None
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "embedder": "voyage",
+            "model": self.model,
+            "dim": self.dim,
+            "tokens_billed": self.tokens,
+            "semantic": True,
+        }
+
+
+def _unit(v: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in v))
+    return [x / norm for x in v] if norm else v
+
+
 _EMBEDDERS: dict[str, Any] = {
     "hash": HashEmbedder,
     "svd": SvdEmbedder,
     "sentence_transformer": SentenceTransformerEmbedder,
+    "voyage": VoyageEmbedder,
 }
 
 

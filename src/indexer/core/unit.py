@@ -28,7 +28,8 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
-from indexer.core.ids import ContentHash, DocumentId, UnitId, hash_text
+from indexer.core.document import content_metadata
+from indexer.core.ids import ContentHash, DocumentId, UnitId, hash_obj, hash_text
 from indexer.core.provenance import Provenance
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "EnrichedUnit",
     "Enrichment",
     "FieldValue",
+    "FieldValues",
     "Unit",
     "UnitKind",
 ]
@@ -44,6 +46,9 @@ __all__ = [
 #: types a predicate can compare, sort and aggregate over. Anything richer
 #: belongs in ``Enrichment.extra`` and is not queryable structurally.
 FieldValue = str | int | float | bool | date | datetime | None
+#: A field may hold several values -- every VAT number a unit mentions, every
+#: group an ACL grants. Predicates over it are existential.
+FieldValues = FieldValue | tuple[FieldValue, ...]
 
 
 class UnitKind(StrEnum):
@@ -140,7 +145,7 @@ class Enrichment:
     enricher: str
     fingerprint: str
     context: str | None = None
-    fields: Mapping[str, FieldValue] = field(default_factory=dict)
+    fields: Mapping[str, FieldValues] = field(default_factory=dict)
     labels: Mapping[str, str | tuple[str, ...]] = field(default_factory=dict)
     extra: Mapping[str, Any] = field(default_factory=dict)
     #: What the enricher read. Determines the cache key, hence invalidation.
@@ -189,19 +194,80 @@ class EnrichedUnit:
 
     @property
     def indexing_hash(self) -> ContentHash:
-        """Hash of the retrieval surface. The cache key for index writes."""
+        """Hash of the retrieval surface. Decides whether a vector is recomputed."""
         return hash_text(self.indexing_text())
 
-    def fields(self) -> dict[str, FieldValue]:
+    @property
+    def record_hash(self) -> ContentHash:
+        """Hash of everything an index may store for this unit.
+
+        The surface is not enough to decide that a stored unit is current. A
+        paragraph inserted above a unit moves its span without touching its
+        text or id; a corrected extraction rule changes its fields without
+        touching its surface. Indexes that skipped a write because the surface
+        hash matched kept the old span -- every citation from the unit pointing
+        at the wrong offset -- and the old field values, so a fixed extractor
+        appeared to do nothing. The surface hash still decides whether a
+        *vector* is recomputed; this decides whether the record is rewritten.
+
+        Position within the document (ordinal, neighbour links, block ids) is
+        deliberately left out: no index stores it, it changes for every unit
+        below an edit, and the unit store -- which does hold it -- compares its
+        own full encoding instead.
+        """
+        u, p = self.unit, self.unit.provenance
+        return hash_obj(
+            {
+                "surface": self.indexing_text(),
+                "fields": _typed(self.fields()),
+                "labels": _typed(self.labels()),
+                "document_id": u.document_id,
+                "span": [p.span.start, p.span.end],
+                "source_uri": p.source_uri,
+                "pages": [p.pages.start, p.pages.end] if p.pages else None,
+                "section_path": list(u.section_path),
+                "kind": str(u.kind),
+                "table_ref": u.table_ref,
+                "metadata": _typed(content_metadata(u.metadata)),
+            }
+        )
+
+    def fields(self) -> dict[str, FieldValues]:
         """All extracted fields, flattened. Later enrichers win on collision.
 
         Collisions are resolved by sorted enricher name rather than run order so
         the result is deterministic; a config with two enrichers writing the
         same field is a config smell the validator warns about.
         """
-        out: dict[str, FieldValue] = {}
+        out: dict[str, FieldValues] = {}
         for _, e in sorted(self.enrichments.items()):
             out.update(e.fields)
+        return out
+
+    def filter_fields(self) -> dict[str, Any]:
+        """What filters and structured queries see: extracted fields, overlaid
+        by the scanner's metadata.
+
+        Scanner metadata used to reach an index only if an enricher copied it
+        (``regex_fields.from_metadata``), so a tenant or ACL filter silently
+        excluded everything in any config that forgot the copy. It now reaches
+        every index directly.
+
+        Metadata wins a name collision, deliberately. It states known facts --
+        the tenant a folder belongs to, the groups a sidecar grants -- while
+        fields are inferred from content, and a document must not be able to
+        re-scope itself by containing text an extractor reads as ``tenant``.
+        Lists of scalars (an ACL) are kept as tuples; nested structures are
+        not filterable and are left out.
+        """
+        out: dict[str, Any] = dict(self.fields())
+        for k, v in content_metadata(self.unit.metadata).items():
+            if isinstance(v, (list, tuple, set, frozenset)):
+                items = sorted(v, key=repr) if isinstance(v, (set, frozenset)) else list(v)
+                if all(_is_scalar(x) for x in items):
+                    out[k] = tuple(items)
+            elif _is_scalar(v) and v is not None:
+                out[k] = v
         return out
 
     def labels(self) -> dict[str, str | tuple[str, ...]]:
@@ -218,6 +284,30 @@ class EnrichedUnit:
 
     def cost_usd(self) -> float:
         return sum(e.cost_usd for e in self.enrichments.values())
+
+
+def _is_scalar(v: Any) -> bool:
+    return v is None or isinstance(v, (str, int, float, bool, date, datetime))
+
+
+def _typed(v: Any) -> Any:
+    """A hashable rendering that keeps the type: ``date(2024,1,1)`` and the
+    string ``"2024-01-01"`` must not hash alike, or an extractor fixed to emit a
+    date instead of a string would leave the string in every index."""
+    if isinstance(v, bool):
+        return ["bool", v]
+    if isinstance(v, datetime):
+        return ["datetime", v.isoformat()]
+    if isinstance(v, date):
+        return ["date", v.isoformat()]
+    if v is None or isinstance(v, (int, float, str)):
+        return [type(v).__name__, v]
+    if isinstance(v, Mapping):
+        return ["map", {str(k): _typed(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}]
+    if isinstance(v, (list, tuple, set, frozenset)):
+        items = sorted(v, key=repr) if isinstance(v, (set, frozenset)) else list(v)
+        return ["list", [_typed(x) for x in items]]
+    return ["repr", repr(v)]
 
 
 def bare(units: Sequence[Unit]) -> list[EnrichedUnit]:

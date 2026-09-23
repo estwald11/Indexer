@@ -37,6 +37,12 @@ def main() -> int:
     ap.add_argument("--regenerate-golden", action="store_true")
     ap.add_argument("--report", default=None)
     ap.add_argument("--arms", nargs="*", default=None, help="run only these arms")
+    ap.add_argument(
+        "--tune-fusion",
+        action="store_true",
+        help="fit RRF weights on a dev split of the golden set, report them on the test split",
+    )
+    ap.add_argument("--dev-share", type=float, default=0.3)
     args = ap.parse_args()
 
     cfg, _ = load(args.config)
@@ -77,17 +83,14 @@ def main() -> int:
         say(f"== golden set: {len(golden)} queries (existing) {golden.stats()}")
     else:
         say("== bootstrapping golden set")
-        import json as _json
+        from indexer.pipeline.ingest import cached_parse
 
-        from indexer.core.cache import cache_key
-        from indexer.pipeline.codec import decode_parsed_document
-
-        parser_fp = base.parser().fingerprint()
+        parser = base.parser()
         docs = []
         for sdoc in base.scanner().scan():
-            raw = base.cache.get(cache_key(parser_fp, sdoc.content_hash))
-            if raw:
-                docs.append(decode_parsed_document(_json.loads(raw)))
+            parsed = cached_parse(parser, sdoc, base.cache)
+            if parsed is not None:
+                docs.append(parsed)
         units = [
             eu for uid in base.unit_store.all_ids() if (eu := base.unit_store.get(uid)) is not None
         ]
@@ -110,6 +113,32 @@ def main() -> int:
     if not golden.queries:
         say("!! empty golden set; nothing to evaluate")
         return 1
+
+    # ---- 2b. fusion weights, fitted on dev and reported on test ---------
+    if args.tune_fusion:
+        from indexer.eval.tune import tune_fusion
+
+        dev, test = golden.split(args.dev_share)
+        engine = base.query_engine()
+        targets = sorted(
+            {t for p in cfg.query.route.paths.values() for t in (p.targets or [])}
+            - {i.name for i in cfg.ingestion.index.indexes if i.kind == "structured"}
+        )
+        say(f"== tuning fusion weights over {targets}: dev {len(dev)}, test {len(test)}")
+        tuned = tune_fusion(
+            engine,
+            EvalRunner(
+                matcher=Matcher(policy=cfg.eval.match, min_overlap=cfg.eval.min_overlap),
+                k_values=cfg.eval.k_values,
+                failure_k=cfg.eval.failure_k,
+                top_k=max([*cfg.eval.k_values, cfg.eval.failure_k]),
+            ),
+            dev,
+            test,
+            indexes=targets,
+            k=cfg.query.fuse.k,
+        )
+        say(tuned.render())
 
     # ---- 3. ablation ----------------------------------------------------
     arms = list(cfg.eval.ablations)

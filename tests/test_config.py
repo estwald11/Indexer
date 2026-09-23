@@ -9,6 +9,7 @@ structurally valid but violates an invariant.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,24 @@ FULL = "configs/full.yaml"
 @pytest.fixture(autouse=True)
 def _fake_secrets() -> None:
     os.environ.setdefault("LLAMAPARSE_API_KEY", "sk-test")
+
+
+def test_a_config_is_read_as_utf8_on_every_platform(tmp_path: Path) -> None:
+    """Windows reads text as cp1252 by default: an Italian config's "€" and
+    "società" came back as mojibake -- in value aliases and extraction patterns,
+    where nothing would ever match them and nothing would say so."""
+    raw = (
+        Path(REFERENCE)
+        .read_text(encoding="utf-8")
+        .replace(
+            "impl: rules                   # regex + field lexicon; ~0 latency baseline",
+            "impl: rules\n    params: {value_aliases: {tipo: {società: [società, '€']}}}",
+        )
+    )
+    path = tmp_path / "c.yaml"
+    path.write_bytes(raw.encode("utf-8"))
+    cfg, _ = load(path)
+    assert cfg.query.route.params["value_aliases"] == {"tipo": {"società": ["società", "€"]}}
 
 
 class TestReferenceConfig:
@@ -80,6 +99,26 @@ class TestInterpolation:
                 load(FULL)
         finally:
             os.environ["LLAMAPARSE_API_KEY"] = saved
+
+    def test_a_reference_to_a_reference_resolves_all_the_way(self) -> None:
+        """``${paths.store}`` inside a params block, where paths.store itself
+        reads an environment variable: the filesystem was handed a directory
+        literally named "${env:STATE:./var}"."""
+        from indexer.config.loader import interpolate
+
+        os.environ.pop("INDEXER_TEST_STATE", None)
+        raw = {
+            "paths": {"store": "${env:INDEXER_TEST_STATE:./var}/index"},
+            "index": {"path": "${paths.store}/fields.db"},
+        }
+        assert interpolate(raw, raw)["index"]["path"] == "./var/index/fields.db"
+
+    def test_a_reference_cycle_is_an_error(self) -> None:
+        from indexer.config.loader import interpolate
+
+        raw = {"a": "${b}", "b": "${a}"}
+        with pytest.raises(ConfigError, match="refers back to itself"):
+            interpolate(raw, raw)
 
     def test_internal_reference_resolves(self) -> None:
         cfg, _ = load(FULL)

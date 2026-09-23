@@ -74,7 +74,7 @@ class LexicalOverlapParams:
 @register(
     "rerank",
     "lexical_overlap",
-    version="2",
+    version="3",
     params_model=dataclass_params(LexicalOverlapParams),
     summary=(
         "Query-term coverage + proximity + prior rank. Offline stand-in for a "
@@ -99,7 +99,7 @@ class LexicalOverlapReranker(StageImpl):
     explicitly rather than letting the number stand in for one.
     """
 
-    STAGE, IMPL, VERSION = "rerank", "lexical_overlap", "2"
+    STAGE, IMPL, VERSION = "rerank", "lexical_overlap", "3"
 
     def rerank(self, query: Query, candidates: RankedList, ctx: StageContext) -> RankedList:
         if not candidates.hits:

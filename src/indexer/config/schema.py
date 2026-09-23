@@ -29,12 +29,14 @@ edit rather than a code path.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "AblationSpec",
+    "AccessConfig",
     "AccountingConfig",
     "CacheConfig",
     "Config",
@@ -52,6 +54,7 @@ __all__ = [
     "RetrieveConfig",
     "RouteConfig",
     "SegmentConfig",
+    "ShapeConfig",
     "SourceSpec",
 ]
 
@@ -281,6 +284,9 @@ class FuseConfig(ImplSpec):
     #: Per-index weights. Absent means 1.0. Invariant 4 says hybrid beats either
     #: half; the weights are how you find out by how much, on this corpus.
     weights: dict[str, float] = Field(default_factory=dict)
+    #: Weights per query type, overriding ``weights`` for questions of that
+    #: type. ``indexer.eval.tuning`` fits them on a development split.
+    weights_by_type: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class RerankConfig(ImplSpec):
@@ -294,11 +300,53 @@ class RerankConfig(ImplSpec):
     output_top_k: int = 10
 
 
+class AccessConfig(_Base):
+    """Document-level access control, enforced on every path.
+
+    Off by default, because the reference corpora have no ACLs. On, a query
+    must state its principals, and sees only documents whose ``field`` names
+    one of them -- in every index, the structured one included, since the
+    check is a filter conjoined to the caller's own.
+    """
+
+    enabled: bool = False
+    #: The metadata field holding each document's ACL (a list of principals).
+    field: str = "acl"
+    #: What a document with no ACL means. Deny unless the archive is known to
+    #: be open by default: an omitted ACL is far more often a missing sidecar
+    #: than a decision to publish.
+    missing: Literal["deny", "allow"] = "deny"
+
+
+class ShapeConfig(_Base):
+    """What the final result list looks like to whoever reads it -- usually an agent.
+
+    Off by default to keep the published ablation's arms unchanged.
+    """
+
+    enabled: bool = False
+    #: At most this many units per document in the final list; 0 means no
+    #: limit. Five chunks of one manual crowd out the other four documents.
+    max_per_document: int = 0
+    #: Collapse hits from documents with identical text -- the same contract
+    #: saved in three folders -- into the best-ranked one, listing the others.
+    collapse_duplicates: bool = True
+    #: Also collapse documents whose text SimHashes are within this many bits.
+    #: 0 disables it, and that is the default: two invoices from one template
+    #: differ in a few words and are *not* duplicates.
+    near_duplicate_bits: int = 0
+    #: Attach the text of this many units before and after each hit, so a
+    #: reader gets the passage around a chunk without another call.
+    expand_neighbors: int = 0
+
+
 class QueryConfig(_Base):
     route: RouteConfig
     retrieve: RetrieveConfig = Field(default_factory=lambda: RetrieveConfig())
     fuse: FuseConfig = Field(default_factory=lambda: FuseConfig())
     rerank: RerankConfig = Field(default_factory=lambda: RerankConfig())
+    access: AccessConfig = Field(default_factory=lambda: AccessConfig())
+    shape: ShapeConfig = Field(default_factory=lambda: ShapeConfig())
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +361,12 @@ class CacheConfig(ImplSpec):
     #: (a prompt change that was not version-bumped) without paying to re-parse
     #: the corpus.
     stages: dict[str, bool] = Field(default_factory=dict)
+    #: Delete cache entries no current document uses -- those of removed
+    #: documents and of the previous version of edited ones -- at the end of
+    #: every build. On by default: the cache holds full text, LLM summaries
+    #: and extracted fields, and a removed document must not survive in it.
+    #: Off only trades that for cheaper reverts of edits.
+    purge_unreferenced: bool = True
 
 
 class AccountingConfig(_Base):
@@ -483,6 +537,13 @@ class Config(_Base):
             schema = spec.params.get("schema")
             if isinstance(schema, dict):
                 names.extend(schema)
+            # Per-document-type schemas (an LLM field extractor) and label sets
+            # written as fields (a classifier).
+            for per_type in (spec.params.get("schemas") or {}).values():
+                if isinstance(per_type, dict):
+                    names.extend(per_type)
+            if spec.params.get("as_fields", True):
+                names.extend(spec.params.get("labels") or {})
         return sorted(set(names))
 
     def extracted_field_types(self) -> dict[str, str]:
@@ -509,14 +570,25 @@ class Config(_Base):
                     out[name] = str(t)
             for name in spec.params.get("from_metadata", []) or []:
                 out.setdefault(name, "str")
+            for per_type in (spec.params.get("schemas") or {}).values():
+                for name, decl in (per_type or {}).items():
+                    if isinstance(decl, dict):
+                        out[name] = str(decl.get("type", "str"))
+            if spec.params.get("as_fields", True):
+                for name in spec.params.get("labels") or {}:
+                    out.setdefault(name, "str")
         return out
 
-    def warnings(self) -> list[str]:
+    def warnings(self, declared: Collection[str] = ()) -> list[str]:
         """Configurations that are valid but probably not what was meant.
 
         Warnings rather than errors because each is a legitimate ablation arm.
         They are printed at load and recorded in the manifest, so a production
         index built from an ablation config is identifiable after the fact.
+
+        ``declared`` adds the fields implementations declare through the
+        registry (an entity extractor's, a parser's), which the config alone
+        cannot see; ``indexer.config.check`` passes them.
         """
         out: list[str] = []
         if not self.enrich_enabled:
@@ -547,7 +619,7 @@ class Config(_Base):
             structured_live = any(
                 i.kind == "structured" and i.enabled for i in self.ingestion.index.indexes
             )
-            if structured_live and not self.extracted_field_names():
+            if structured_live and not (set(self.extracted_field_names()) | set(declared)):
                 out.append(
                     "a structured index and a structured route are configured, but no "
                     "enabled enricher declares any field to extract. The router has no "

@@ -41,9 +41,14 @@ from indexer.core.registry import register
 from indexer.core.results import Hit, RankedList
 from indexer.core.stages import IndexQuery, IndexStatsView, IndexWriteReceipt, StageContext
 from indexer.core.unit import EnrichedUnit
-from indexer.impls.embed import Embedder, build_embedder
-from indexer.impls.index_lexical import _jsonable, _passes
-from indexer.io import atomic_write
+from indexer.impls.embed import (
+    MULTILINGUAL_PRESETS,
+    Embedder,
+    VoyageEmbedder,
+    build_embedder,
+)
+from indexer.impls.index_lexical import _passes
+from indexer.io import atomic_write, decode_value, encode_value
 from indexer.plugin import StageImpl, dataclass_params
 
 __all__ = ["HashEmbeddingIndex", "SentenceTransformerIndex", "SvdIndex", "VectorIndex"]
@@ -76,7 +81,7 @@ class VectorIndex(StageImpl):
     computed so far".
     """
 
-    STAGE, IMPL, VERSION = "index", "vector", "1"
+    STAGE, IMPL, VERSION = "index", "vector", "2"
     kind = "dense"
     EMBEDDER = "hash"
 
@@ -105,8 +110,20 @@ class VectorIndex(StageImpl):
     def _load(self) -> None:
         if not (self.path and self.path.exists()):
             return
-        raw = json.loads(self.path.read_text())
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        stored = raw.get("identity")
+        if stored is not None and stored != self.store_identity():
+            # Built by another embedder or with other parameters. The ledger
+            # restages every document when this index's fingerprint changes;
+            # loading the old vectors would make every rewrite a skip and leave
+            # the store holding vectors from a model that is no longer asked --
+            # of a different dimension, after a `dim` change, so that every
+            # query against it raised.
+            self._dirty = True
+            return
         self._meta = raw["meta"]
+        for m in self._meta.values():
+            m["f"] = decode_value(m.get("f", {}))
         self._vecs = raw.get("vecs", {})
         # `df` is the pre-seam layout, where the hashing embedder's document
         # frequencies sat at the top level. Read it so stores built before the
@@ -124,7 +141,11 @@ class VectorIndex(StageImpl):
     def _save(self) -> None:
         if not self.path:
             return
-        payload: dict[str, Any] = {"meta": self._meta, "embedder": self.embedder.state()}
+        payload: dict[str, Any] = {
+            "identity": self.store_identity(),
+            "meta": {uid: {**m, "f": encode_value(m["f"])} for uid, m in self._meta.items()},
+            "embedder": self.embedder.state(),
+        }
         # Vectors derived from a fitted embedder are not persisted: they are a
         # function of the surfaces, which are in `meta`, and storing them would
         # double the file for state that is refitted on load anyway.
@@ -137,19 +158,27 @@ class VectorIndex(StageImpl):
         written = skipped = 0
         pending: list[tuple[str, str]] = []
         for eu in units:
-            if self._meta.get(eu.unit_id, {}).get("h") == str(eu.indexing_hash):
+            prev = self._meta.get(eu.unit_id)
+            record = str(eu.record_hash)
+            if prev is not None and prev.get("rh") == record:
                 skipped += 1
                 continue
             surface = eu.indexing_text()
+            surface_hash = str(eu.indexing_hash)
             self._meta[eu.unit_id] = {
-                "h": str(eu.indexing_hash),
+                "h": surface_hash,
+                "rh": record,
                 "d": eu.document_id,
                 "s": [eu.unit.provenance.span.start, eu.unit.provenance.span.end],
                 "u": eu.unit.provenance.source_uri,
                 "t": surface,
-                "f": {k: _jsonable(v) for k, v in eu.fields().items()},
+                "f": dict(eu.filter_fields()),
             }
-            pending.append((eu.unit_id, surface))
+            # The record changed; the vector only if the surface did. A moved
+            # span or a corrected field must be written, and must not cost an
+            # embedding call.
+            if prev is None or prev.get("h") != surface_hash or eu.unit_id not in self._vecs:
+                pending.append((eu.unit_id, surface))
             written += 1
 
         if pending:
@@ -300,7 +329,7 @@ class HashEmbeddingParams:
 @register(
     "index",
     "hash_embedding",
-    version="2",
+    version="3",
     params_model=dataclass_params(HashEmbeddingParams),
     summary=(
         "Deterministic hashed embeddings, exact cosine. Offline and reproducible; "
@@ -312,7 +341,11 @@ def _make_hash_embedding(params: dict[str, Any], **kw: Any) -> HashEmbeddingInde
 
 
 class HashEmbeddingIndex(VectorIndex):
-    """The hashing trick. Kept at version 1 and bit-exact.
+    """The hashing trick. Bit-exact vectors since version 1.
+
+    Version 2 changed what is stored beside the vectors (the record hash, typed
+    filter fields, the store identity), not the arithmetic: the regression test
+    pinning the vectors is unchanged.
 
     An honest framing of what this is: a hashed bag of n-grams projected into a
     fixed-dimensional space. It is a real vector index -- exact cosine, with all
@@ -326,7 +359,7 @@ class HashEmbeddingIndex(VectorIndex):
     learned, use ``svd_embedding``; for a real one, ``sentence_transformer``.
     """
 
-    STAGE, IMPL, VERSION = "index", "hash_embedding", "2"
+    STAGE, IMPL, VERSION = "index", "hash_embedding", "3"
     EMBEDDER = "hash"
 
 
@@ -343,7 +376,7 @@ class SvdEmbeddingParams:
 @register(
     "index",
     "svd_embedding",
-    version="2",
+    version="3",
     params_model=dataclass_params(SvdEmbeddingParams),
     summary=(
         "Latent Semantic Analysis: TF-IDF then truncated SVD. Offline, no download, "
@@ -364,7 +397,7 @@ class SvdIndex(VectorIndex):
     into until the last one has been seen.
     """
 
-    STAGE, IMPL, VERSION = "index", "svd_embedding", "2"
+    STAGE, IMPL, VERSION = "index", "svd_embedding", "3"
     EMBEDDER = "svd"
 
 
@@ -384,7 +417,7 @@ class SentenceTransformerIndexParams:
 @register(
     "index",
     "sentence_transformer",
-    version="1",
+    version="2",
     params_model=dataclass_params(SentenceTransformerIndexParams),
     summary=(
         "Neural bi-encoder (BGE/E5/MiniLM family). The production dense index; "
@@ -407,5 +440,101 @@ class SentenceTransformerIndex(VectorIndex):
     changes.
     """
 
-    STAGE, IMPL, VERSION = "index", "sentence_transformer", "1"
+    STAGE, IMPL, VERSION = "index", "sentence_transformer", "2"
     EMBEDDER = "sentence_transformer"
+
+
+# ------------------------------------------------------------- multilingual
+
+
+@dataclass(frozen=True, slots=True)
+class MultilingualIndexParams:
+    #: bge-m3 | multilingual-e5-large | multilingual-e5-base | multilingual-e5-small.
+    preset: str = "multilingual-e5-base"
+    batch_size: int = 32
+    device: str = "cpu"
+    #: Overrides the preset's, when set.
+    max_seq_length: int | None = None
+    truncate_dim: int | None = None
+    path: str = ""
+
+    def __post_init__(self) -> None:
+        if self.preset not in MULTILINGUAL_PRESETS:
+            raise ValueError(
+                f"preset must be one of {sorted(MULTILINGUAL_PRESETS)}, not {self.preset!r}"
+            )
+
+
+@register(
+    "index",
+    "multilingual_embedding",
+    version="1",
+    params_model=dataclass_params(MultilingualIndexParams),
+    summary=(
+        "Neural bi-encoder trained on Italian among ~100 languages (bge-m3, "
+        "multilingual-e5), with each model's own query and passage prefixes."
+    ),
+    requires=("sentence-transformers",),
+)
+def _make_multilingual(params: dict[str, Any], **kw: Any) -> MultilingualIndex:
+    return MultilingualIndex(params, name=kw.get("name", "dense"), embedder=kw.get("embedder"))
+
+
+class MultilingualIndex(VectorIndex):
+    """``sentence_transformer`` with the model chosen for Italian.
+
+    A preset rather than a model name, because a multilingual model used without
+    its prefixes -- E5's "query: " and "passage: " -- loses a measurable part of
+    its quality, and nothing warns when they are missing.
+    """
+
+    STAGE, IMPL, VERSION = "index", "multilingual_embedding", "1"
+    EMBEDDER = "sentence_transformer"
+
+    def __init__(
+        self, params: dict[str, Any], name: str = "dense", embedder: Embedder | None = None
+    ) -> None:
+        preset = MULTILINGUAL_PRESETS[str(params.get("preset", "multilingual-e5-base"))]
+        resolved = {**preset, **{k: v for k, v in params.items() if v is not None}}
+        resolved.pop("preset", None)
+        super().__init__(
+            params, name=name, embedder=embedder or build_embedder(self.EMBEDDER, resolved)
+        )
+
+
+# ------------------------------------------------------------------ voyage
+
+
+@dataclass(frozen=True, slots=True)
+class VoyageIndexParams:
+    model: str = "voyage-3.5"
+    #: Truncated output for the models that support it (256, 512, 1024, 2048).
+    output_dimension: int | None = None
+    batch_size: int = 64
+    #: Where the key is read from. The key itself is never a parameter.
+    api_key_env: str = "VOYAGE_API_KEY"
+    base_url: str = "https://api.voyageai.com/v1/embeddings"
+    max_retries: int = 4
+    path: str = ""
+
+
+@register(
+    "index",
+    "voyage_embedding",
+    version="1",
+    params_model=dataclass_params(VoyageIndexParams),
+    summary=(
+        "Voyage AI embeddings over HTTP: multilingual, nothing to host. Sends every "
+        "chunk to a third party -- needs a GDPR basis."
+    ),
+)
+def _make_voyage(params: dict[str, Any], **kw: Any) -> VoyageIndex:
+    embedder = kw.get("embedder") or VoyageEmbedder(
+        params, transport=kw.get("transport"), sleep=kw.get("sleep")
+    )
+    return VoyageIndex(params, name=kw.get("name", "dense"), embedder=embedder)
+
+
+class VoyageIndex(VectorIndex):
+    STAGE, IMPL, VERSION = "index", "voyage_embedding", "1"
+    EMBEDDER = "voyage"

@@ -25,10 +25,10 @@ from indexer.core.errors import ConfigError
 from indexer.core.registry import Registry, resolve
 from indexer.core.stages import Index
 from indexer.pipeline.ingest import IngestionPipeline
-from indexer.pipeline.query import QueryEngine
-from indexer.pipeline.stores import FileArtifactStore, FileCache, JsonLedger, UnitStore
+from indexer.pipeline.query import AccessPolicy, QueryEngine, ShapePolicy
+from indexer.pipeline.stores import CacheRefs, FileArtifactStore, FileCache, JsonLedger, UnitStore
 
-__all__ = ["Assembly", "assemble", "assemble_mapping", "build_indexes"]
+__all__ = ["Assembly", "assemble", "assemble_mapping", "build_indexes", "declared_fields"]
 
 
 class Assembly:
@@ -45,8 +45,13 @@ class Assembly:
         resolved: Mapping[str, Any],
         *,
         registry: Registry | None = None,
+        llm_client: Any = None,
     ) -> None:
         self.config = config
+        #: The client every model-backed stage calls through, when the caller
+        #: supplies one: a Bedrock, Vertex or Foundry client, a proxy, a fake
+        #: in tests. None builds ``anthropic.Anthropic()`` on first use.
+        self.llm_client = llm_client
         self.resolved = dict(resolved)
         self.config_hash = _config_hash(resolved)
         self.registry = registry
@@ -61,6 +66,7 @@ class Assembly:
         self.artifacts = FileArtifactStore(self.paths.artifacts)
         self.ledger = JsonLedger(Path(self.paths.store) / "ledger.json")
         self.unit_store = UnitStore(Path(self.paths.store) / "units.json")
+        self.cache_refs = CacheRefs(Path(self.paths.store) / "cache-refs.db")
         self.indexes: dict[str, Index] = build_indexes(config, self.paths.store, registry)
 
     # --------------------------------------------------------------- stages
@@ -70,24 +76,25 @@ class Assembly:
         return reg.build(params, **extra)
 
     def scanner(self) -> Any:
-        from indexer.impls.corpus import FilesystemScanner
+        """Every source, built through the registry like any other stage.
 
+        It used to construct ``FilesystemScanner`` directly whatever ``impl``
+        said, so a registered scanner for a DMS or a mailbox could be named in
+        config and never run. And ``corpus.limit`` applied only when there were
+        several sources; with one, a smoke run over "the first 50 documents"
+        read the whole archive.
+        """
         sources = self.config.corpus.sources
-        if len(sources) == 1:
-            src = sources[0]
-            reg = resolve("corpus", src.impl, self.registry)
-            norm = reg.normalize(src.params)
-            return FilesystemScanner(norm, namespace=src.namespace)
-        return _MultiScanner(
-            [
-                FilesystemScanner(
-                    resolve("corpus", s.impl, self.registry).normalize(s.params),
-                    namespace=s.namespace,
-                )
-                for s in sources
-            ],
-            limit=self.config.corpus.limit,
-        )
+        state_dir = Path(self.paths.store) / "scan-state"
+        built = [
+            resolve("corpus", s.impl, self.registry).build(
+                s.params, namespace=s.namespace, state_dir=state_dir
+            )
+            for s in sources
+        ]
+        if len(built) == 1 and self.config.corpus.limit is None:
+            return built[0]
+        return _MultiScanner(built, limit=self.config.corpus.limit)
 
     def parser(self) -> Any:
         p = self.config.ingestion.parse
@@ -129,7 +136,16 @@ class Assembly:
         for spec in e.enrichers:
             if not spec.enabled:
                 continue
-            impl = self._build("enrich", spec.impl, spec.params)
+            # Prices are frame-supplied, like the cache: configured once, for
+            # every model-backed stage, and never part of a fingerprint -- a
+            # price change must not invalidate an enrichment.
+            impl = self._build(
+                "enrich",
+                spec.impl,
+                spec.params,
+                prices=self.config.accounting.prices,
+                client=self.llm_client,
+            )
             # An enricher whose declared scope is narrower than the code's would
             # serve stale results after an edit -- a bug that survives cache
             # clears. Config cannot widen what the implementation declares.
@@ -166,21 +182,31 @@ class Assembly:
             },
         )
         params.setdefault("default_top_k", self.config.query.retrieve.default_top_k)
-        # The router learns the corpus's field vocabulary from the extraction
-        # config, so a new corpus teaches it without a code change.
-        params.setdefault("field_lexicon", self._field_lexicon())
-        params.setdefault("field_types", self.config.extracted_field_types())
+        # The router learns the corpus's field vocabulary from what the
+        # configured stages declare they write, so a new corpus teaches it
+        # without a code change.
+        names, types = declared_fields(self.config, self.registry)
+        params.setdefault("field_lexicon", names)
+        params.setdefault("field_types", types)
         params.setdefault(
             "enable_structured",
             any(i.kind == "structured" and i.enabled for i in self.config.ingestion.index.indexes),
         )
         reg = resolve("route", r.impl, self.registry)
-        return reg.build(_accepted_params(reg, params))
+        # A router that reads the structured index's own description -- types,
+        # ranges, frequent values -- gets it from here. Frame-supplied: the
+        # description changes with every build and is no part of a fingerprint.
+        structured = next(
+            (i for i in self.indexes.values() if callable(getattr(i, "describe_schema", None))),
+            None,
+        )
+        schema = getattr(structured, "describe_schema", None)
+        return reg.build(_accepted_params(reg, params), schema=schema, client=self.llm_client)
 
     def _field_lexicon(self) -> list[str]:
         """The router's field vocabulary. One derivation, shared with the
         validator's warning, so the check and the behaviour cannot drift."""
-        return self.config.extracted_field_names()
+        return declared_fields(self.config, self.registry)[0]
 
     def retriever(self) -> Any:
         r = self.config.query.retrieve
@@ -196,6 +222,8 @@ class Assembly:
         params = dict(f.params)
         params.setdefault("k", f.k)
         params.setdefault("weights", f.weights)
+        if f.weights_by_type:
+            params.setdefault("weights_by_type", f.weights_by_type)
         reg = resolve("fuse", f.impl, self.registry)
         return reg.build(_accepted_params(reg, params))
 
@@ -204,6 +232,18 @@ class Assembly:
         if not r.enabled:
             return self._build("rerank", "noop", {})
         return self._build("rerank", r.impl, r.params)
+
+    def path_rerankers(self) -> dict[str, Any]:
+        """Rerankers a route path names for itself. The global reranker's params
+        apply when the path names the same implementation."""
+        r = self.config.query.rerank
+        if not r.enabled:
+            return {}
+        out: dict[str, Any] = {}
+        for name, spec in self.config.query.route.paths.items():
+            if spec.rerank and spec.rerank != r.impl:
+                out[name] = self._build("rerank", spec.rerank, {})
+        return out
 
     # ------------------------------------------------------------ pipelines
 
@@ -226,7 +266,13 @@ class Assembly:
             parse_enabled=c.ingestion.parse.enabled,
             on_document_error=c.ingestion.parse.on_error,
             index_batch_size=c.ingestion.index.batch_size,
+            enrich_batch_size=c.ingestion.enrich.batch_size,
+            enrich_max_concurrency=c.ingestion.enrich.max_concurrency,
+            enrich_on_error=c.ingestion.enrich.on_error,
             checkpoint_every=c.ingestion.checkpoint_every,
+            cache_refs=self.cache_refs,
+            purge_cache=c.cache.purge_unreferenced,
+            manifest_dir=self.paths.manifests,
         )
 
     def query_engine(self) -> QueryEngine:
@@ -251,7 +297,54 @@ class Assembly:
             rerank_output_top_k=c.query.rerank.output_top_k,
             default_top_k=c.query.retrieve.default_top_k,
             decision_log=log,
+            path_rerankers=self.path_rerankers(),
+            access=AccessPolicy(
+                enabled=c.query.access.enabled,
+                field=c.query.access.field,
+                missing=c.query.access.missing,
+            ),
+            shape=ShapePolicy(
+                enabled=c.query.shape.enabled,
+                max_per_document=c.query.shape.max_per_document,
+                collapse_duplicates=c.query.shape.collapse_duplicates,
+                near_duplicate_bits=c.query.shape.near_duplicate_bits,
+                expand_neighbors=c.query.shape.expand_neighbors,
+            ),
         )
+
+
+def declared_fields(
+    config: Config, registry: Registry | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """``(names, types)`` of every field the configured stages say they write.
+
+    The router's vocabulary. It used to be read from one enricher's params --
+    the regex extractor's ``fields`` -- so what the entity extractor found, the
+    facts a FatturaPA parser reads, and anything a model extracted were fields
+    no question could name. Each implementation now declares what it writes
+    (``declares_fields`` on its registration); the config's own declarations
+    still win on type. A name without a known type is in the lexicon only: a
+    wrong type is worse than none, because the router then queries a column the
+    value was never written to.
+    """
+    types: dict[str, str] = {}
+    names = set(config.extracted_field_names())
+    ing = config.ingestion
+    specs: list[tuple[str, str, Mapping[str, Any]]] = []
+    if ing.parse.enabled:
+        specs.append(("parse", ing.parse.default.impl, ing.parse.default.params))
+        specs.extend(("parse", r.impl, r.params) for r in ing.parse.routes)
+    if config.enrich_enabled:
+        specs.extend(("enrich", e.impl, e.params) for e in ing.enrich.enrichers if e.enabled)
+    for stage, impl, params in specs:
+        try:
+            declared = resolve(stage, impl, registry).fields(params)
+        except ConfigError:
+            continue  # an unknown name or bad params is phase-2 validation's report
+        types.update(declared)
+    types.update(config.extracted_field_types())
+    names |= set(types)
+    return sorted(names), types
 
 
 def build_indexes(
@@ -339,13 +432,21 @@ class _MultiScanner:
         )
 
 
-def assemble(config_path: str | Path, *, overrides: Mapping[str, Any] | None = None) -> Assembly:
+def assemble(
+    config_path: str | Path,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+    llm_client: Any = None,
+) -> Assembly:
     cfg, resolved = load(config_path, overrides=overrides)
-    return Assembly(cfg, resolved)
+    return Assembly(cfg, resolved, llm_client=llm_client)
 
 
 def assemble_mapping(
-    raw: Mapping[str, Any], *, overrides: Mapping[str, Any] | None = None
+    raw: Mapping[str, Any],
+    *,
+    overrides: Mapping[str, Any] | None = None,
+    llm_client: Any = None,
 ) -> Assembly:
     """Assemble from a config mapping already read from disk.
 
@@ -364,4 +465,4 @@ def assemble_mapping(
         cfg = Config.model_validate(resolved)
     except Exception as exc:
         raise ConfigError(str(exc)) from exc
-    return Assembly(cfg, resolved)
+    return Assembly(cfg, resolved, llm_client=llm_client)

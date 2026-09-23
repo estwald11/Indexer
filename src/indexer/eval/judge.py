@@ -76,7 +76,7 @@ class ContainmentParams:
 @register(
     "judge",
     "containment",
-    version="2",
+    version="3",
     params_model=dataclass_params(ContainmentParams),
     summary=(
         "Prose: does the answer contain enough of the gold passage's content words. "
@@ -97,7 +97,7 @@ class ContainmentJudge(StageImpl):
     report says so rather than presenting it as accuracy.
     """
 
-    STAGE, IMPL, VERSION = "judge", "containment", "2"
+    STAGE, IMPL, VERSION = "judge", "containment", "3"
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)

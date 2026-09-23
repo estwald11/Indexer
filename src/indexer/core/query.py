@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from indexer.core.ids import ContentHash, hash_text
+from indexer.core.ids import ContentHash, UnitId, hash_text
 from indexer.core.predicate import Predicate, StructuredQuery
 
 __all__ = ["Query", "QueryType", "RouteDecision", "RoutePath", "RouteTarget"]
@@ -73,6 +73,19 @@ class Query:
     #: but it will not drop context a caller supplies.
     context: Sequence[str] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    #: Who is asking: the user and groups the caller has authenticated. With
+    #: access control on, only documents whose ACL names one of these (or
+    #: none, if so configured) are visible -- on every path, structured
+    #: included. ``None`` means "not stated", which access control refuses
+    #: rather than reads as "everyone".
+    principals: tuple[str, ...] | None = None
+    #: Conditions on the *document* a passage belongs to, not on the passage:
+    #: "passages from invoices over 1,000 euros", where the total is stated on
+    #: page one and the clause asked about on page three. ``filters`` applies
+    #: to each passage's own fields; these are resolved over each document's
+    #: fields together (the structured index's document rows) and restrict
+    #: retrieval to the passages of the documents that match.
+    document_filters: Predicate | None = None
 
     @property
     def content_hash(self) -> ContentHash:
@@ -94,6 +107,8 @@ class RouteTarget:
     #: with anything the router inferred.
     filters: Predicate | None = None
     weight: float = 1.0
+    #: Search only these units, when the query was scoped to documents.
+    unit_ids: tuple[UnitId, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +137,10 @@ class RouteDecision:
     reason: str = ""
     router: str = ""
     fingerprint: str = ""
+    #: A standalone form of the question, when the router rewrote it -- a
+    #: follow-up ("e quella di marzo?") made self-contained from the caller's
+    #: context. Retrieval uses it; the trace keeps both.
+    rewritten_query: str | None = None
 
     def __post_init__(self) -> None:
         if self.step_budget < 1:
@@ -149,4 +168,5 @@ class RouteDecision:
             "fingerprint": self.fingerprint,
             "has_structured_query": self.structured_query is not None,
             "has_inferred_filters": self.inferred_filters is not None,
+            "rewritten_query": self.rewritten_query,
         }

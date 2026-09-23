@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from indexer.core.document import Block, BlockKind, ParsedDocument, SourceDocument, Table, TableCell
-from indexer.core.provenance import Provenance, Span
+from indexer.core.provenance import BBox, PageRef, Provenance, Span
 from indexer.core.registry import register
-from indexer.core.stages import StageContext
+from indexer.core.stages import StageContext, parse_cache_scope
 from indexer.plugin import StageImpl, dataclass_params
 
 __all__ = ["MarkdownParser", "PassthroughParser", "RoutingParser", "RstParser", "TextParser"]
@@ -53,6 +53,8 @@ class _Builder:
         level: int | None = None,
         table: Table | None = None,
         attrs: dict[str, Any] | None = None,
+        pages: PageRef | None = None,
+        bbox: BBox | None = None,
     ) -> Block:
         if self.parts:
             self.parts.append(self.SEP)
@@ -68,6 +70,8 @@ class _Builder:
                 document_id=self.document_id,  # type: ignore[arg-type]
                 span=Span(start, self.offset),
                 source_uri=self.source_uri,
+                pages=pages,
+                bbox=bbox,
             ),
             level=level,
             table=table,
@@ -179,77 +183,90 @@ class MarkdownParser(StageImpl):
     def parse(self, doc: SourceDocument, ctx: StageContext) -> ParsedDocument:
         text = _decode(doc, self.param("encoding", "utf-8"))
         b = _Builder(doc.document_id, doc.source_uri)
-        lines = text.splitlines()
-        i, n = 0, len(lines)
-        buf: list[str] = []
-
-        def flush(kind: BlockKind = BlockKind.PARAGRAPH) -> None:
-            nonlocal buf
-            body = "\n".join(buf).strip()
-            if body:
-                b.add(body, kind)
-            buf = []
-
-        while i < n:
-            line = lines[i]
-
-            if _FENCE.match(line.strip()):
-                flush()
-                fence = line.strip()[:3]
-                code = [line]
-                i += 1
-                while i < n and not lines[i].strip().startswith(fence):
-                    code.append(lines[i])
-                    i += 1
-                if i < n:
-                    code.append(lines[i])
-                    i += 1
-                if self.param("keep_code", True):
-                    b.add("\n".join(code), BlockKind.CODE)
-                continue
-
-            m = _H.match(line)
-            if m:
-                flush()
-                b.add(m.group(2).strip(), BlockKind.HEADING, level=len(m.group(1)))
-                i += 1
-                continue
-
-            # A pipe table is detected by its separator row, then consumed whole.
-            # The grid is preserved; the rendering in `text` is a convenience.
-            if "|" in line and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
-                flush()
-                rows_raw = [line, lines[i + 1]]
-                i += 2
-                while i < n and "|" in lines[i] and lines[i].strip():
-                    rows_raw.append(lines[i])
-                    i += 1
-                b.add(
-                    "\n".join(rows_raw),
-                    BlockKind.TABLE,
-                    table=_parse_pipe_table(rows_raw),
-                )
-                continue
-
-            if _LIST.match(line):
-                flush()
-                items: list[str] = []
-                while i < n and (_LIST.match(lines[i]) or (lines[i].startswith("  ") and items)):
-                    items.append(lines[i])
-                    i += 1
-                b.add("\n".join(items).strip(), BlockKind.LIST_ITEM)
-                continue
-
-            if not line.strip():
-                flush()
-                i += 1
-                continue
-
-            buf.append(line)
-            i += 1
-
-        flush()
+        markdown_into(b, text, keep_code=self.param("keep_code", True))
         return b.finish(doc.content_hash, metadata=dict(doc.metadata))
+
+
+def markdown_into(
+    b: _Builder, text: str, *, keep_code: bool = True, pages: PageRef | None = None
+) -> None:
+    """Append markdown's blocks to a builder, optionally all on one page.
+
+    Shared with the parsers that receive markdown per page from a layout model
+    or a service (pymupdf4llm, LlamaParse), so every markdown source yields the
+    same block structure -- and the page it came from.
+    """
+    lines = text.splitlines()
+    i, n = 0, len(lines)
+    buf: list[str] = []
+
+    def flush(kind: BlockKind = BlockKind.PARAGRAPH) -> None:
+        nonlocal buf
+        body = "\n".join(buf).strip()
+        if body:
+            b.add(body, kind, pages=pages)
+        buf = []
+
+    while i < n:
+        line = lines[i]
+
+        if _FENCE.match(line.strip()):
+            flush()
+            fence = line.strip()[:3]
+            code = [line]
+            i += 1
+            while i < n and not lines[i].strip().startswith(fence):
+                code.append(lines[i])
+                i += 1
+            if i < n:
+                code.append(lines[i])
+                i += 1
+            if keep_code:
+                b.add("\n".join(code), BlockKind.CODE, pages=pages)
+            continue
+
+        m = _H.match(line)
+        if m:
+            flush()
+            b.add(m.group(2).strip(), BlockKind.HEADING, level=len(m.group(1)), pages=pages)
+            i += 1
+            continue
+
+        # A pipe table is detected by its separator row, then consumed whole.
+        # The grid is preserved; the rendering in `text` is a convenience.
+        if "|" in line and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
+            flush()
+            rows_raw = [line, lines[i + 1]]
+            i += 2
+            while i < n and "|" in lines[i] and lines[i].strip():
+                rows_raw.append(lines[i])
+                i += 1
+            b.add(
+                "\n".join(rows_raw),
+                BlockKind.TABLE,
+                table=_parse_pipe_table(rows_raw),
+                pages=pages,
+            )
+            continue
+
+        if _LIST.match(line):
+            flush()
+            items: list[str] = []
+            while i < n and (_LIST.match(lines[i]) or (lines[i].startswith("  ") and items)):
+                items.append(lines[i])
+                i += 1
+            b.add("\n".join(items).strip(), BlockKind.LIST_ITEM, pages=pages)
+            continue
+
+        if not line.strip():
+            flush()
+            i += 1
+            continue
+
+        buf.append(line)
+        i += 1
+
+    flush()
 
 
 def _parse_pipe_table(rows_raw: list[str]) -> Table:
@@ -464,6 +481,7 @@ class RoutingParser(StageImpl):
         self._default = reg.build(norm)
 
     def fingerprint(self) -> Any:
+        from indexer.config.loader import redact
         from indexer.core.accounting import StageFingerprint
         from indexer.core.ids import hash_obj
 
@@ -473,7 +491,9 @@ class RoutingParser(StageImpl):
             version=self.VERSION,
             params_hash=hash_obj(
                 {
-                    "params": self._params,
+                    # Redacted: a routed parser's API key is not part of what
+                    # it produces, and rotating it must not re-parse anything.
+                    "params": redact(self._params),
                     "routes": [p.fingerprint().key() for _, p in self._routes],
                     "default": self._default.fingerprint().key(),
                 }
@@ -485,6 +505,17 @@ class RoutingParser(StageImpl):
             if _matches(when, doc):
                 return parser
         return self._default
+
+    def cache_scope(self, doc: SourceDocument) -> str:
+        """The parser this document is routed to, and what *it* reads.
+
+        Routing reads the media type, the file name and scanner metadata, so
+        two byte-identical documents can legitimately be parsed differently.
+        The route taken is therefore part of the cache key -- without it the
+        first document's parse was served to the second whatever its type.
+        """
+        picked = self._pick(doc)
+        return f"{picked.fingerprint().key()}|{parse_cache_scope(picked, doc)}"
 
     def can_parse(self, doc: SourceDocument) -> float:
         return float(self._pick(doc).can_parse(doc))

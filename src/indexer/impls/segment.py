@@ -171,7 +171,7 @@ class StructuralParams:
 @register(
     "segment",
     "structural",
-    version="2",
+    version="3",
     params_model=dataclass_params(StructuralParams),
     summary="Sections are units. Splits at block boundaries; never splits a table row.",
 )
@@ -195,10 +195,22 @@ class StructuralSegmenter(StageImpl):
     3 does not change the units of section 4.
     """
 
-    STAGE, IMPL, VERSION = "segment", "structural", "2"
+    STAGE, IMPL, VERSION = "segment", "structural", "3"
 
     def segment(self, parsed: ParsedDocument, ctx: StageContext) -> Sequence[Unit]:
+        """Sections into units.
+
+        ``max_tokens`` caps a unit. ``min_tokens`` and ``overlap_tokens`` govern
+        only the places where a *size* forced a boundary -- a section run past
+        the cap, a single block past it -- because those are the only places
+        the contract lets size decide anything: a split never leaves a piece
+        under ``min_tokens``, and the piece after a split repeats up to
+        ``overlap_tokens`` of the one before. Both were accepted and ignored
+        before, as was ``max_tokens`` for tables, which were always cut at 512.
+        """
         max_tok = int(self.param("max_tokens", 512))
+        min_tok = int(self.param("min_tokens", 0))
+        overlap = int(self.param("overlap_tokens", 0))
         merge_below = int(self.param("merge_below_tokens", 32))
         b = _UnitBuilder(parsed)
 
@@ -207,7 +219,7 @@ class StructuralSegmenter(StageImpl):
             if not content:
                 continue
 
-            for group in _split_tables(content):
+            for group in _split_tables(content, max_tok):
                 if isinstance(group, tuple):  # (table_block, row_groups)
                     tblock, chunks = group
                     split = len(chunks) > 1
@@ -227,14 +239,22 @@ class StructuralSegmenter(StageImpl):
 
                 pending: list[Block] = []
                 pending_tokens = 0
+                # Whether the run in `pending` continues one a size limit cut.
+                # Only then do min_tokens and overlap apply to it.
+                continues_split = False
+                carried_tokens = 0
                 for blk in group:
                     tok = estimate_tokens(blk.text)
                     if tok > max_tok:
                         if pending:
                             b.add(_join(pending), pending, path)
                             pending, pending_tokens = [], 0
+                        continues_split = False
+                        carried_tokens = 0
                         base = blk.provenance.span.start
-                        for rel_start, rel_end in _split_long_block(blk.text, max_tok):
+                        for rel_start, rel_end in _split_long_block(
+                            blk.text, max_tok, min_tokens=min_tok, overlap_tokens=overlap
+                        ):
                             # Slice the block's own text rather than re-joining
                             # sentences: re-joining normalises whitespace, and
                             # the unit then no longer matches the span it cites.
@@ -248,11 +268,20 @@ class StructuralSegmenter(StageImpl):
                         continue
                     if pending and pending_tokens + tok > max_tok:
                         b.add(_join(pending), pending, path)
-                        pending, pending_tokens = [], 0
+                        # Carry the tail of the unit just closed into the next
+                        # one, whole blocks only, up to the overlap budget.
+                        pending = _overlap_tail(pending, overlap) if overlap else []
+                        pending_tokens = sum(estimate_tokens(x.text) for x in pending)
+                        carried_tokens = pending_tokens
+                        continues_split = True
                     pending.append(blk)
                     pending_tokens += tok
                 if pending:
-                    if pending_tokens < merge_below and b.units:
+                    threshold = max(merge_below, min_tok) if continues_split else merge_below
+                    # Carried blocks are already in the previous unit; only what
+                    # is new counts toward whether this piece stands on its own.
+                    fresh = pending_tokens - carried_tokens
+                    if fresh < threshold and b.units:
                         # Too small to retrieve on and not worth an embedding, so
                         # fold it into the previous unit.
                         #
@@ -310,7 +339,22 @@ def _sections(parsed: ParsedDocument) -> list[tuple[tuple[str, ...], list[Block]
     return out
 
 
-def _split_tables(blocks: list[Block]) -> list[Any]:
+def _overlap_tail(blocks: Sequence[Block], overlap_tokens: int) -> list[Block]:
+    """The trailing whole blocks of a run that fit in ``overlap_tokens``."""
+    tail: list[Block] = []
+    used = 0
+    for blk in reversed(blocks):
+        tok = estimate_tokens(blk.text)
+        if used + tok > overlap_tokens:
+            break
+        tail.insert(0, blk)
+        used += tok
+    # Never carry the whole run: the next unit would then begin as a copy of
+    # the one before.
+    return tail if len(tail) < len(blocks) else tail[1:]
+
+
+def _split_tables(blocks: list[Block], max_tokens: int = 512) -> list[Any]:
     """Separate tables from prose runs so a table is never merged into a chunk."""
     out: list[Any] = []
     run: list[Block] = []
@@ -319,7 +363,7 @@ def _split_tables(blocks: list[Block]) -> list[Any]:
             if run:
                 out.append(run)
                 run = []
-            out.append((blk, _split_table(blk.text, blk.table)))
+            out.append((blk, _split_table(blk.text, blk.table, max_tokens)))
         else:
             run.append(blk)
     if run:
@@ -368,7 +412,39 @@ def _is_sentence_start(text: str, i: int) -> bool:
     return i < len(text) and (text[i].isupper() or text[i] in "([")
 
 
-def _split_long_block(text: str, max_tokens: int) -> list[tuple[int, int]]:
+def _split_long_block(
+    text: str, max_tokens: int, *, min_tokens: int = 0, overlap_tokens: int = 0
+) -> list[tuple[int, int]]:
+    """Split one oversized block at sentence boundaries; see ``_sentence_pieces``.
+
+    Then, if the last piece is under ``min_tokens``, it joins the one before --
+    a 30-token tail is too small to retrieve on and costs an embedding like any
+    other unit. And each piece after the first starts up to ``overlap_tokens``
+    earlier, at a sentence boundary, so a sentence cut from its antecedent
+    carries it. Pieces are still slices of the block, so each stays verbatim.
+    """
+    pieces = _sentence_pieces(text, max_tokens)
+    if min_tokens and len(pieces) > 1:
+        last_start, last_end = pieces[-1]
+        if estimate_tokens(text[last_start:last_end]) < min_tokens:
+            prev_start, _ = pieces[-2]
+            pieces = [*pieces[:-2], (prev_start, last_end)]
+    if overlap_tokens and len(pieces) > 1:
+        bounds = [
+            0,
+            *(m.end() for m in _SENT.finditer(text) if _is_sentence_start(text, m.end())),
+        ]
+        shifted = [pieces[0]]
+        for start, end in pieces[1:]:
+            earlier = [
+                s for s in bounds if s < start and estimate_tokens(text[s:start]) <= overlap_tokens
+            ]
+            shifted.append((min(earlier) if earlier else start, end))
+        pieces = shifted
+    return pieces
+
+
+def _sentence_pieces(text: str, max_tokens: int) -> list[tuple[int, int]]:
     """Split one oversized block at sentence boundaries.
 
     Returns ``(start, end)`` offsets into ``text`` rather than the pieces

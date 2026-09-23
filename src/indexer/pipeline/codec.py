@@ -18,15 +18,34 @@ from indexer.core.document import Block, BlockKind, MediaRef, ParsedDocument, Ta
 from indexer.core.ids import ContentHash, DocumentId, UnitId
 from indexer.core.provenance import BBox, PageRef, Provenance, Span
 from indexer.core.unit import ContextScope, EnrichedUnit, Enrichment, Unit, UnitKind
+from indexer.io import decode_value, encode_value
 
 __all__ = [
     "decode_enriched_unit",
+    "decode_enrichment",
+    "decode_metadata",
     "decode_parsed_document",
     "decode_units",
     "encode_enriched_unit",
+    "encode_enrichment",
+    "encode_metadata",
     "encode_parsed_document",
     "encode_units",
 ]
+
+
+def encode_metadata(meta: Any) -> Any:
+    """Metadata to JSON, dates tagged so they come back as dates.
+
+    Scanner metadata was strings, so plain ``dict(...)`` sufficed. Parsers now
+    add typed facts from the bytes -- an invoice date, a total -- and a date
+    written as a bare string would compare as text in every filter downstream.
+    """
+    return encode_value(meta)
+
+
+def decode_metadata(meta: Any) -> Any:
+    return decode_value(meta)
 
 
 def _enc_prov(p: Provenance) -> dict[str, Any]:
@@ -61,7 +80,7 @@ def encode_parsed_document(doc: ParsedDocument) -> dict[str, Any]:
         "source_hash": doc.source_hash,
         "page_count": doc.page_count,
         "reading_order_confidence": doc.reading_order_confidence,
-        "metadata": dict(doc.metadata),
+        "metadata": encode_metadata(dict(doc.metadata)),
         "page_media": [
             {"uri": m.uri, "mt": m.media_type, "h": m.content_hash, "w": m.width, "ht": m.height}
             for m in doc.page_media
@@ -111,7 +130,7 @@ def decode_parsed_document(d: dict[str, Any]) -> ParsedDocument:
         source_hash=ContentHash(d["source_hash"]),
         page_count=d.get("page_count"),
         reading_order_confidence=d.get("reading_order_confidence", 1.0),
-        metadata=d.get("metadata", {}),
+        metadata=decode_metadata(d.get("metadata", {})),
         page_media=tuple(
             MediaRef(m["uri"], m["mt"], ContentHash(m["h"]), m.get("w"), m.get("ht"))
             for m in d.get("page_media", ())
@@ -176,7 +195,7 @@ def _enc_unit(u: Unit) -> dict[str, Any]:
         "nx": u.next_unit_id,
         "tr": u.table_ref,
         "vb": u.verbatim,
-        "m": dict(u.metadata),
+        "m": encode_metadata(dict(u.metadata)),
     }
 
 
@@ -197,7 +216,7 @@ def _dec_unit(d: dict[str, Any]) -> Unit:
         next_unit_id=UnitId(d["nx"]) if d.get("nx") else None,
         table_ref=d.get("tr"),
         verbatim=d.get("vb", True),
-        metadata=d.get("m", {}),
+        metadata=decode_metadata(d.get("m", {})),
     )
 
 
@@ -214,9 +233,9 @@ def _enc_enrichment(e: Enrichment) -> dict[str, Any]:
         "e": e.enricher,
         "f": e.fingerprint,
         "c": e.context,
-        "fl": {k: _enc_scalar(v) for k, v in e.fields.items()},
+        "fl": {k: encode_value(v) for k, v in e.fields.items()},
         "l": {k: list(v) if isinstance(v, tuple) else v for k, v in e.labels.items()},
-        "x": dict(e.extra),
+        "x": encode_metadata(dict(e.extra)),
         "s": str(e.scope),
         "ti": e.tokens_in,
         "to": e.tokens_out,
@@ -248,14 +267,22 @@ def _dec_enrichment(d: dict[str, Any]) -> Enrichment:
         enricher=d["e"],
         fingerprint=d.get("f", ""),
         context=d.get("c"),
-        fields={k: _dec_scalar(v) for k, v in d.get("fl", {}).items()},
+        fields={k: _as_tuple(decode_value(v)) for k, v in d.get("fl", {}).items()},
         labels={k: tuple(v) if isinstance(v, list) else v for k, v in d.get("l", {}).items()},
-        extra=d.get("x", {}),
+        extra=decode_metadata(d.get("x", {})),
         scope=ContextScope(d.get("s", "unit")),
         tokens_in=d.get("ti", 0),
         tokens_out=d.get("to", 0),
         cost_usd=d.get("cu", 0.0),
     )
+
+
+def encode_enrichment(e: Enrichment) -> dict[str, Any]:
+    return _enc_enrichment(e)
+
+
+def decode_enrichment(d: dict[str, Any]) -> Enrichment:
+    return _dec_enrichment(d)
 
 
 def encode_enriched_unit(eu: EnrichedUnit) -> dict[str, Any]:
@@ -270,3 +297,12 @@ def decode_enriched_unit(d: dict[str, Any]) -> EnrichedUnit:
         unit=_dec_unit(d["u"]),
         enrichments={k: _dec_enrichment(v) for k, v in d.get("e", {}).items()},
     )
+
+
+def _as_tuple(v: Any) -> Any:
+    """Multi-valued fields round-trip as tuples, the type they were written as.
+
+    JSON has only lists; a field that came back as a list would hash and compare
+    differently from the tuple an enricher produced.
+    """
+    return tuple(v) if isinstance(v, list) else v

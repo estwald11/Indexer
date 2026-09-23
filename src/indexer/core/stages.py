@@ -40,8 +40,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from indexer.core.accounting import Accountant, StageFingerprint
 from indexer.core.cache import ArtifactStore, CacheStore
-from indexer.core.document import ParsedDocument, SourceDocument
-from indexer.core.ids import DocumentId, UnitId
+from indexer.core.document import ParsedDocument, SourceDocument, content_metadata
+from indexer.core.ids import DocumentId, UnitId, hash_obj, merge_hashes
 from indexer.core.predicate import Predicate, StructuredQuery
 from indexer.core.query import Query, RouteDecision
 from indexer.core.results import RankedList, RecordSet
@@ -66,6 +66,10 @@ __all__ = [
     "Stage",
     "StageContext",
     "StructuredCapable",
+    "enrich_input_hash",
+    "parse_cache_scope",
+    "prior_hash",
+    "unit_input_hash",
 ]
 
 
@@ -163,6 +167,14 @@ class Parser(Protocol):
         not trusted -- it is the root of every citation the system will ever
         emit.
 
+        *Identity is the frame's.* Parse output is cached by content, so two
+        byte-identical files -- the same PDF attached to fifty emails -- are
+        parsed once. The frame then stamps each document's own id, URI and
+        scanner metadata onto the result. A parser therefore must not derive
+        its output from ``document_id``, ``source_uri`` or scanner metadata;
+        anything it adds to ``metadata`` must come from the bytes. What else it
+        reads (the media type, by default) it states in ``cache_scope``.
+
     Minimal implementation
         Decode UTF-8, split on blank lines, one PARAGRAPH block each, spans from
         the split offsets, confidence 1.0.
@@ -188,6 +200,18 @@ class Parser(Protocol):
         ...
 
     def fingerprint(self) -> StageFingerprint: ...
+
+
+def parse_cache_scope(parser: Any, doc: SourceDocument) -> str:
+    """What a parser reads besides the bytes. Part of the parse cache key.
+
+    A parser may define ``cache_scope(doc) -> str``; a routing parser uses it to
+    name the parser it would dispatch to, so the same bytes under ``.md`` and
+    ``.txt`` are not served one cached parse. The default is the media type,
+    which every parser is entitled to read.
+    """
+    fn = getattr(parser, "cache_scope", None)
+    return str(fn(doc)) if callable(fn) else doc.media_type
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +287,9 @@ class EnrichContext:
     #: classifier can read a summary. Creates an ordering dependency, which the
     #: config makes explicit: enrichers run in listed order.
     prior: Mapping[UnitId, Mapping[str, Enrichment]] = field(default_factory=dict)
+    #: How many model calls an enricher may have in flight for this batch
+    #: (``enrich.max_concurrency``). An enricher that makes no calls ignores it.
+    max_concurrency: int = 1
 
 
 @runtime_checkable
@@ -286,6 +313,16 @@ class Enricher(Protocol):
         enricher that declares ``UNIT`` and reads the document will serve stale
         results after a document edit -- a bug that survives cache clears and
         looks like a model regression.
+
+        "The unit" means the whole unit, not its text: section path, kind and
+        scanner metadata are part of it, and an enricher that copies a tenant
+        out of ``unit.metadata`` reads the metadata. The frame's default key
+        (``enrich_input_hash``) therefore covers all of it, plus the parent
+        document for wider scopes and earlier enrichers' output unless the
+        enricher sets ``reads_prior = False``. An enricher that reads less may
+        say so precisely by defining ``input_hash(unit, document, prior)`` --
+        narrowing is an optimisation, and getting it wrong is a stale cache, so
+        the default errs wide.
 
         *Additivity.* An enricher writes its own key in ``EnrichedUnit
         .enrichments`` and never mutates another's. That is what makes
@@ -317,6 +354,68 @@ class Enricher(Protocol):
     def enrich(self, units: Sequence[Unit], ctx: EnrichContext) -> Sequence[Enrichment]: ...
 
     def fingerprint(self) -> StageFingerprint: ...
+
+
+def unit_input_hash(unit: Unit) -> str:
+    """Everything a unit-scoped enricher may read of one unit.
+
+    Text alone is not enough. A heading rename changes ``section_path`` and not
+    the text, and a section-prefix context keyed on text kept serving the old
+    heading. Two tenants holding the same paragraph differ only in metadata,
+    and an extractor keyed on text copied the first tenant's id onto the
+    second's unit -- which then answered the first tenant's filtered queries.
+    """
+    return hash_obj(
+        {
+            "text": unit.text,
+            "section_path": list(unit.section_path),
+            "kind": str(unit.kind),
+            "table_ref": unit.table_ref,
+            "metadata": content_metadata(unit.metadata),
+        }
+    )
+
+
+def enrich_input_hash(
+    enricher: Any,
+    unit: Unit,
+    document: ParsedDocument,
+    prior: Mapping[str, Enrichment],
+) -> str:
+    """The cache input for one enricher on one unit.
+
+    An enricher's own ``input_hash`` wins; otherwise the conservative default:
+    the whole unit, the parent document for any scope wider than the unit, and
+    the enrichments already attached unless the enricher declares
+    ``reads_prior = False``. Third-party enrichers that say nothing get the
+    widest key, because a needless cache miss costs a call and a missing input
+    costs a wrong answer served from cache indefinitely.
+    """
+    custom = getattr(enricher, "input_hash", None)
+    if callable(custom):
+        return str(custom(unit, document, prior))
+    parts = [unit_input_hash(unit)]
+    if str(getattr(enricher, "scope", ContextScope.UNIT)) != ContextScope.UNIT:
+        parts.append(str(document.content_hash))
+        parts.append(hash_obj(content_metadata(document.metadata)))
+    if getattr(enricher, "reads_prior", True) and prior:
+        parts.append(prior_hash(prior))
+    return merge_hashes(*parts)
+
+
+def prior_hash(prior: Mapping[str, Enrichment]) -> str:
+    """Hash of the enrichments earlier enrichers attached to one unit."""
+    return hash_obj(
+        {
+            name: {
+                "fingerprint": e.fingerprint,
+                "context": e.context,
+                "fields": dict(e.fields),
+                "labels": {k: list(v) if isinstance(v, tuple) else v for k, v in e.labels.items()},
+            }
+            for name, e in sorted(prior.items())
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #

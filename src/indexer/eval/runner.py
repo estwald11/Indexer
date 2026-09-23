@@ -93,6 +93,7 @@ class EvalRunner:
             mrr=reciprocal_rank(grades),
             failed=retrieval_failed(grades, self.failure_k),
             routed_path=str(resp.decision.path),
+            predicted_type=str(resp.decision.query_type),
             latency_ms=elapsed,
             cost_usd=resp.cost_usd,
             hits_returned=len(hits),
@@ -111,7 +112,7 @@ class EvalRunner:
         # rewards a stage for being asked rather than for answering will make
         # any ablation involving it meaningless.
         if resp.records is not None:
-            s.failed = not resp.records.rows
+            s.failed = resp.records.is_empty()
             s.recall = {k: float("nan") for k in self.k_values}
             s.precision = {k: float("nan") for k in self.k_values}
             s.ndcg = {k: float("nan") for k in self.k_values}

@@ -156,6 +156,9 @@ class QueryScore:
     #: Router correctness, scored against ``GoldenQuery.query_type``.
     route_correct: bool | None = None
     routed_path: str = ""
+    #: The query type the router predicted -- what the fuser was told, and so
+    #: what per-type fusion weights are fitted against.
+    predicted_type: str = ""
     #: End-to-end: did the system produce the right answer. ``None`` when no
     #: judge is configured -- distinct from ``False``, and conflating them would
     #: report an unjudged run as a total failure.

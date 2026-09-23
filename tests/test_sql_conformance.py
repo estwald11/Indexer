@@ -44,6 +44,22 @@ ROWS: list[dict] = [
     {"package": "flask", "version_major": 3, "released": date(2025, 11, 2), "stable": False},
     {"package": "click", "version_major": 8, "released": date(2022, 7, 30), "stable": True},
     {"package": "attrs", "version_major": 25},  # released/stable absent entirely
+    # Where SQL and the evaluator used to disagree: a float against an int
+    # bound value, case folding outside ASCII, and multi-valued fields.
+    {
+        "package": "città-lib",
+        "version_major": 1,
+        "amount": 1500.0,
+        "city": "CITTÀ",
+        "acl": ("group:finance", "user:mario"),
+    },
+    {
+        "package": "straße",
+        "version_major": 0,
+        "amount": 999,
+        "city": "Straße",
+        "acl": ("group:legal",),
+    },
 ]
 
 PREDICATES: list[Predicate] = [
@@ -75,6 +91,27 @@ PREDICATES: list[Predicate] = [
             Not(Compare("released", Op.LT, date(2024, 1, 1))),
         )
     ),
+    # int bound against a float column, and the reverse
+    Compare("amount", Op.GT, 1000),
+    Compare("amount", Op.LTE, 999.0),
+    In("amount", (999, 1500)),
+    # case folding beyond ASCII
+    TextMatch("city", "città"),
+    TextMatch("city", "STRASSE", mode="exact"),
+    TextMatch("city", "cit", mode="prefix"),
+    # negation over an absent field: true in the evaluator, NULL in a scalar
+    # subquery -- and NOT NULL is NULL, which dropped the row
+    Not(Compare("amount", Op.GT, 1000)),
+    Not(TextMatch("city", "città")),
+    # multi-valued fields are existential
+    In("acl", ("group:finance", "group:hr")),
+    Compare("acl", Op.EQ, "group:legal"),
+    Not(In("acl", ("group:legal",))),
+    Exists("acl"),
+    Exists("acl", present=False),
+    TextMatch("acl", "finance"),
+    Compare("amount", Op.EQ, None),
+    Compare("amount", Op.NE, None),
 ]
 
 
@@ -155,6 +192,37 @@ class TestStructuredQueryShape:
             ctx,
         )
         assert rs.rows[0][0] == 25
+
+    def test_truncation_is_reported_with_the_full_count(self, index: SqliteStructuredIndex) -> None:
+        """A prefix of the answer must not read as the whole answer."""
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rs = index.structured_query(
+            StructuredQuery(where=Exists("package"), select=("package",), limit=2), ctx
+        )
+        assert len(rs.rows) == 2
+        assert rs.truncated is True
+        assert rs.total == len(ROWS)
+
+        whole = index.structured_query(
+            StructuredQuery(where=Exists("package"), select=("package",), limit=50), ctx
+        )
+        assert whole.truncated is False
+        assert whole.total == len(ROWS)
+
+    def test_an_aggregate_over_nothing_is_empty(self, index: SqliteStructuredIndex) -> None:
+        """COUNT over zero rows is one row, and still no answer."""
+        from indexer.core.predicate import Aggregation, AggregationOp
+
+        ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
+        rs = index.structured_query(
+            StructuredQuery(
+                where=Compare("package", Op.EQ, "no-such-package"),
+                aggregations=(Aggregation(AggregationOp.COUNT),),
+            ),
+            ctx,
+        )
+        assert rs.rows == ((0,),)
+        assert rs.is_empty()
 
     def test_filters_push_down_to_search(self, index: SqliteStructuredIndex) -> None:
         ctx = StageContext(cache=NullCache(), accountant=InMemoryAccountant())

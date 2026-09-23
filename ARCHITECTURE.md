@@ -416,11 +416,12 @@ Out of scope, with the place each would attach.
 | Deferred | Where it attaches |
 |---|---|
 | UI | `RetrievalResponse` carries everything a citation view needs: provenance with page and bbox, the full trace, per-stage timings. |
-| Agent framework | `Retriever` on the `ITERATIVE` path, under `step_budget`. `Query.context` already carries prior turns; the frame does not manage dialogue but will not drop it. |
+| Agent loop | The tools an agent calls exist (`indexer.agent`, served over MCP); the loop that decides when to call them is the agent's. `Query.context` carries prior turns, and the LLM router turns a follow-up into a standalone question. |
 | Vendor coupling | Every vendor sits behind `Registration` and an extra. `indexer.core` imports nothing third-party. |
 | Distributed indexing | `Ledger` and `CacheStore` are protocols; a distributed build needs a shared ledger with per-document locking and a shared cache. `PlannedChange` is already a partitionable work list. |
 | Quantization | Inside a dense `Index` implementation. `IndexStatsView.detail` carries the knobs; the Matryoshka note in `configs/full.yaml` is there so the two-stage option is not foreclosed. |
-| Multi-tenancy | `Predicate` filters push down to every index, and `SourceSpec.namespace` scopes document ids. What is missing is per-tenant index isolation, which is an `Index` implementation concern. |
+| Multi-tenancy | `Predicate` filters push down to every index, `SourceSpec.namespace` scopes document ids, and `query.access` scopes every path -- structured included -- by the caller's principals. What is missing is per-tenant index isolation, which is an `Index` implementation concern. |
+| A shared store | The ledger, unit store and SQLite index are files; a Postgres-backed `Ledger`, `CacheStore` and structured `Index` would let several builders and many readers share one archive. Each is a protocol already. |
 
 ---
 
@@ -522,6 +523,51 @@ Two contract checks earned their place by catching bugs in the implementation
 that proposed them: `check_parsed_document` and `check_units` found all of the
 first two class of failures, on real documents, before any of it reached an
 index.
+
+### Round 2: an Italian company's archive
+
+Pointing the frame at an Italian archive -- FatturaPA, PEC, signed files, scanned
+contracts, folders with different readers, and an agent as the reader -- found
+the next set. Each was reproduced before it was fixed, and each has a test that
+fails without the fix.
+
+**Identity leaked through the parse cache.** The cache is content-addressed,
+and the cached value carried the first document's id and metadata; the same
+contract attached to two emails collapsed into one document, and the second
+tenant's copy was unreachable. Cached values are now stripped of identity and
+rebound per document. The rule: **a content-addressed value must not contain
+anything that is not content.**
+
+**Filters were applied on some paths and not others.** The structured path ran
+its query and ignored the caller's scope; with access control, that is a
+tenant's question answered from every tenant's records. Scope, ACL and document
+filters now apply on every path, and a test asks the structured path for what
+it must not see.
+
+**Italian was read as English.** Amounts ("1.250,00" became 1.25), dates
+("30/06/2025" dropped), an ASCII tokenizer that split "città", a router whose
+every rule was an English word. `indexer.normalize`, the Unicode tokenizer and
+the Italian router are one fix each; the one that hid longest was the
+analyser's per-unit language detection, which left one-line units -- most of an
+invoice -- unstemmed while the questions about them were stemmed.
+
+**Configuration that was accepted and never read.** `enrich.batch_size`,
+`max_concurrency` and `on_error`; three segmenter limits; per-path rerankers;
+`full.yaml` naming five implementations that did not exist while `check` said
+OK; a manifest documented as written that never was. The rule: **a setting the
+code does not read must fail validation, or it will be tuned for years.**
+
+**Model output was taken on trust.** A refused or truncated answer arrived as
+HTTP 200 and was cached as the answer. `indexer.llm` makes both errors, and the
+field extractor keeps a value only when its quoted evidence is in the document
+and states it -- a computed due date or an invented total goes to review, not
+to a structured query that would compare against it.
+
+**The router could not name what the archive held.** Its vocabulary came from
+one enricher's params, so entity fields, FatturaPA facts and anything a model
+extracted were fields no question could reach. Implementations now declare the
+fields they write (`Registration.declares_fields`), and the router, the
+config check and the agent's schema read that one list.
 
 ---
 

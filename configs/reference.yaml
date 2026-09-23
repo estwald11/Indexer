@@ -119,16 +119,17 @@ query:
       structured:
         targets: [fields]
         step_budget: 1
+      # A path may name its own reranker (`rerank: cross_encoder`), overriding
+      # query.rerank for that path when reranking is on. Not set here: the
+      # reference path runs offline, and a cross-encoder needs a download.
       lookup:
         targets: [lexical, dense]
         top_k: { lexical: 50, dense: 50 }
         step_budget: 1
-        rerank: cross_encoder
       iterative:
         targets: [lexical, dense]
         top_k: { lexical: 30, dense: 30 }
         step_budget: 4
-        rerank: cross_encoder
 
   retrieve:
     impl: parallel

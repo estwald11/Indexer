@@ -122,9 +122,31 @@ class RecordSet:
     sources: tuple[tuple[UnitId, ...], ...] = field(default_factory=tuple)
     latency_ms: float = 0.0
     fingerprint: str = ""
+    #: Rows the query matched before ``limit`` was applied. ``None`` when the
+    #: store cannot say. An agent reading 50 rows must be able to tell "these
+    #: are all of them" from "these are the first 50 of 4,000" -- without it,
+    #: a truncated list reads as a complete answer and every count derived
+    #: from it is silently wrong.
+    total: int | None = None
+    #: True when ``rows`` is a prefix of a longer answer.
+    truncated: bool = False
 
     def as_dicts(self) -> list[dict[str, FieldValue]]:
         return [dict(zip(self.columns, r, strict=True)) for r in self.rows]
+
+    def is_empty(self) -> bool:
+        """Whether the answer contains nothing.
+
+        Not ``not rows``: an aggregate over zero matching rows still returns
+        one row (``COUNT = 0``, ``SUM = NULL``), and scoring that as an answer
+        rewards a structured path for being asked rather than for finding
+        anything. A row with no source unit derives from nothing.
+        """
+        if not self.rows:
+            return True
+        if self.sources:
+            return not any(self.sources)
+        return False
 
 
 @dataclass(frozen=True, slots=True)

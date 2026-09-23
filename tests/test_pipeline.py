@@ -120,11 +120,14 @@ class TestEndToEnd:
         assert top.provenance.document_id
         assert top.provenance.span.length > 0
         assert top.unit is not None
-        # And the span really resolves to the text.
-        assert (
-            top.unit.unit.text in Path(top.provenance.source_uri.replace("file://", "")).read_text()
-            or top.unit.unit.text
-        )
+        # And the span really resolves to the text. The URI is converted with
+        # the stdlib rather than by stripping "file://": on Windows that leaves
+        # "/C:/..." behind, which is not a path.
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        source = Path(url2pathname(urlparse(top.provenance.source_uri).path))
+        assert top.unit.unit.text in source.read_text()
 
     def test_manifest_records_what_built_the_index(self, workspace: Path) -> None:
         _, res = _build(workspace)

@@ -49,6 +49,19 @@ class StageImpl:
     def param(self, name: str, default: Any = None) -> Any:
         return self._params.get(name, default)
 
+    def store_identity(self) -> dict[str, str]:
+        """What a persisted index was built *as*: implementation, version, params.
+
+        Everything but ``path``, which says where the store lives rather than
+        what is in it. An index compares this with what it finds on disk and
+        starts empty on a mismatch: the ledger restages every document when an
+        index's fingerprint changes, and an index that then loads the old
+        content skips each rewrite as "unchanged" -- keeping 256-dimension
+        vectors under a 384-dimension embedder, which failed every query.
+        """
+        params = {k: v for k, v in self._params.items() if k != "path"}
+        return {"impl": self.IMPL, "version": self.VERSION, "params": hash_obj(params)}
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.STAGE}/{self.IMPL}@{self.VERSION}>"
 
