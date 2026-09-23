@@ -18,14 +18,19 @@ Nothing here is a contract. ``indexer.core`` stays free of it.
 from __future__ import annotations
 
 import re
+import unicodedata
 
-__all__ = ["STOPWORDS", "WORD_RE", "content_words", "tokenize"]
+__all__ = ["STOPWORDS", "WORD_RE", "content_words", "fold", "tokenize"]
 
-_TOKEN = re.compile(r"[A-Za-z0-9_]+(?:[.\-][A-Za-z0-9_]+)*")
+# Unicode word characters, not ASCII. The ASCII class split every accented or
+# umlauted word into fragments -- "Größe" became "gr" + "e", "città" became
+# "citt" -- so non-English text still retrieved, but on shards that collide
+# with unrelated words across the whole corpus.
+_TOKEN = re.compile(r"\w+(?:[.\-]\w+)*")
 
 #: Matches identifier-ish words: at least three characters, dotted and
 #: hyphenated forms kept whole.
-WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.\-]{2,}")
+WORD_RE = re.compile(r"[^\W\d][\w.\-]{2,}")
 
 STOPWORDS = frozenset(
     [
@@ -147,6 +152,18 @@ STOPWORDS = frozenset(
 )
 
 
+def fold(text: str) -> str:
+    """Normalise for matching: NFKC, then casefold.
+
+    NFKC makes a precomposed "à" and "a" + combining grave the same string --
+    both occur in real documents, and without this they never match. Casefold
+    rather than lower because it is the Unicode-correct caseless form: German
+    "Straße" and "STRASSE" fold to the same token, where lower() keeps them
+    apart.
+    """
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercase alphanumerics, keeping dotted and hyphenated identifiers whole.
 
@@ -154,13 +171,13 @@ def tokenize(text: str) -> list[str]:
     corpora those identifiers carry most of the discriminative signal, and
     splitting them turns a precise query into a common-word query.
     """
-    return [m.group(0).lower() for m in _TOKEN.finditer(text)]
+    return _TOKEN.findall(fold(text))
 
 
 def content_words(text: str, *, min_length: int = 4) -> list[str]:
     """Lowercased non-stopword terms, for "what is this about" heuristics."""
     return [
         w
-        for m in WORD_RE.finditer(text)
-        if (w := m.group(0).lower()) not in STOPWORDS and not w.isdigit() and len(w) >= min_length
+        for m in WORD_RE.finditer(fold(text))
+        if (w := m.group(0)) not in STOPWORDS and not w.isdigit() and len(w) >= min_length
     ]

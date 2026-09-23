@@ -41,7 +41,7 @@ class BM25Params:
 @register(
     "index",
     "bm25_memory",
-    version="1",
+    version="2",
     params_model=dataclass_params(BM25Params),
     summary="In-memory BM25 over indexing_text(). The lexical baseline.",
 )
@@ -58,7 +58,7 @@ class BM25Index(StageImpl):
     quality one.
     """
 
-    STAGE, IMPL, VERSION = "index", "bm25_memory", "1"
+    STAGE, IMPL, VERSION = "index", "bm25_memory", "2"
     kind = "lexical"
 
     def __init__(self, params: dict[str, Any], name: str = "lexical") -> None:

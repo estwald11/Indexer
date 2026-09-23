@@ -171,7 +171,7 @@ class StructuralParams:
 @register(
     "segment",
     "structural",
-    version="1",
+    version="2",
     params_model=dataclass_params(StructuralParams),
     summary="Sections are units. Splits at block boundaries; never splits a table row.",
 )
@@ -195,7 +195,7 @@ class StructuralSegmenter(StageImpl):
     3 does not change the units of section 4.
     """
 
-    STAGE, IMPL, VERSION = "segment", "structural", "1"
+    STAGE, IMPL, VERSION = "segment", "structural", "2"
 
     def segment(self, parsed: ParsedDocument, ctx: StageContext) -> Sequence[Unit]:
         max_tok = int(self.param("max_tokens", 512))
@@ -357,7 +357,15 @@ def _split_table(rendered: str, table: Table, max_tokens: int = 512) -> list[str
     return chunks or [rendered]
 
 
-_SENT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[])")
+# Candidate boundaries; a candidate is kept only if the next character is an
+# uppercase letter in any script or an opening bracket (see _is_sentence_start).
+# The lookahead used to be [A-Z], so a German sentence opening with "Über" or
+# an Italian one with "È" was never split.
+_SENT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _is_sentence_start(text: str, i: int) -> bool:
+    return i < len(text) and (text[i].isupper() or text[i] in "([")
 
 
 def _split_long_block(text: str, max_tokens: int) -> list[tuple[int, int]]:
@@ -377,7 +385,8 @@ def _split_long_block(text: str, max_tokens: int) -> list[tuple[int, int]]:
         return [(0, len(text))]
     bounds: list[int] = [0]
     for m in _SENT.finditer(text):
-        bounds.append(m.end())
+        if _is_sentence_start(text, m.end()):
+            bounds.append(m.end())
     bounds.append(len(text))
 
     out: list[tuple[int, int]] = []

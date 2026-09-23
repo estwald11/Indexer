@@ -300,7 +300,7 @@ class HashEmbeddingParams:
 @register(
     "index",
     "hash_embedding",
-    version="1",
+    version="2",
     params_model=dataclass_params(HashEmbeddingParams),
     summary=(
         "Deterministic hashed embeddings, exact cosine. Offline and reproducible; "
@@ -326,7 +326,7 @@ class HashEmbeddingIndex(VectorIndex):
     learned, use ``svd_embedding``; for a real one, ``sentence_transformer``.
     """
 
-    STAGE, IMPL, VERSION = "index", "hash_embedding", "1"
+    STAGE, IMPL, VERSION = "index", "hash_embedding", "2"
     EMBEDDER = "hash"
 
 
@@ -343,7 +343,7 @@ class SvdEmbeddingParams:
 @register(
     "index",
     "svd_embedding",
-    version="1",
+    version="2",
     params_model=dataclass_params(SvdEmbeddingParams),
     summary=(
         "Latent Semantic Analysis: TF-IDF then truncated SVD. Offline, no download, "
@@ -364,7 +364,7 @@ class SvdIndex(VectorIndex):
     into until the last one has been seen.
     """
 
-    STAGE, IMPL, VERSION = "index", "svd_embedding", "1"
+    STAGE, IMPL, VERSION = "index", "svd_embedding", "2"
     EMBEDDER = "svd"
 
 

@@ -28,7 +28,7 @@ from indexer.core.registry import register
 from indexer.core.stages import EnrichContext
 from indexer.core.unit import ContextScope, Enrichment, FieldValue, Unit
 from indexer.plugin import StageImpl, dataclass_params
-from indexer.textutil import STOPWORDS, WORD_RE
+from indexer.textutil import STOPWORDS, WORD_RE, fold
 
 __all__ = [
     "ExtractiveContextualizer",
@@ -121,7 +121,7 @@ class ExtractiveParams:
 @register(
     "enrich",
     "extractive_context",
-    version="1",
+    version="2",
     params_model=dataclass_params(ExtractiveParams),
     summary=(
         "Document lead + heading trail + distinctive parent terms the unit omits. "
@@ -151,7 +151,7 @@ class ExtractiveContextualizer(StageImpl):
     context and exactly what ``ContextScope`` exists to make visible.
     """
 
-    STAGE, IMPL, VERSION = "enrich", "extractive_context", "1"
+    STAGE, IMPL, VERSION = "enrich", "extractive_context", "2"
     name = "extractive_context"
     scope = ContextScope.DOCUMENT
 
@@ -191,14 +191,14 @@ class ExtractiveContextualizer(StageImpl):
 
 
 def _tokenize(text: str) -> set[str]:
-    return {m.group(0).lower() for m in WORD_RE.finditer(text)}
+    return {m.group(0) for m in WORD_RE.finditer(fold(text))}
 
 
 def _top_terms(text: str, n: int) -> list[str]:
     """Frequent, non-stopword terms. A crude TF proxy for what a document is about."""
     counts: dict[str, int] = {}
-    for m in WORD_RE.finditer(text):
-        w = m.group(0).lower()
+    for m in WORD_RE.finditer(fold(text)):
+        w = m.group(0)
         if w in STOPWORDS or w.isdigit():
             continue
         counts[w] = counts.get(w, 0) + 1

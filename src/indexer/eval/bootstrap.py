@@ -56,7 +56,7 @@ from indexer.core.registry import register
 from indexer.core.unit import EnrichedUnit
 from indexer.eval.golden import GoldenQuery, GoldenSet, GoldOrigin, RelevantSpan
 from indexer.plugin import StageImpl, dataclass_params
-from indexer.textutil import STOPWORDS, WORD_RE, tokenize
+from indexer.textutil import STOPWORDS, WORD_RE, fold, tokenize
 
 __all__ = ["HeuristicBootstrapper", "LLMBootstrapper", "measure_overlap"]
 
@@ -81,7 +81,7 @@ class HeuristicParams:
 @register(
     "bootstrap",
     "heuristic",
-    version="1",
+    version="2",
     params_model=dataclass_params(HeuristicParams),
     summary="Offline golden-set generation: subject+detail queries, filtered for discriminability.",
 )
@@ -90,7 +90,7 @@ def _make_heuristic(params: dict[str, Any], **_: Any) -> HeuristicBootstrapper:
 
 
 class HeuristicBootstrapper(StageImpl):
-    STAGE, IMPL, VERSION = "bootstrap", "heuristic", "1"
+    STAGE, IMPL, VERSION = "bootstrap", "heuristic", "2"
 
     def bootstrap(
         self,
@@ -376,8 +376,8 @@ def _distinctive_terms(text: str, others: Sequence[str], n: int) -> list[str]:
     user would type, and corpus-level IDF would discard it.
     """
     here: dict[str, int] = {}
-    for m in WORD_RE.finditer(text):
-        w = m.group(0).lower()
+    for m in WORD_RE.finditer(fold(text)):
+        w = m.group(0)
         if w in STOPWORDS or w.isdigit() or len(w) < 4:
             continue
         here[w] = here.get(w, 0) + 1
