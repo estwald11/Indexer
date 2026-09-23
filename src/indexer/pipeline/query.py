@@ -25,14 +25,15 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from indexer.core.accounting import InMemoryAccountant
 from indexer.core.cache import CacheStore, NullCache
 from indexer.core.errors import AccessDenied, ContractViolation
-from indexer.core.ids import hash_text
-from indexer.core.predicate import Exists, In, Or, Predicate, all_of
+from indexer.core.ids import UnitId, hash_text
+from indexer.core.predicate import Exists, In, Or, Predicate, StructuredQuery, all_of
 from indexer.core.query import Query, RouteDecision, RoutePath, RouteTarget
-from indexer.core.results import Hit, RankedList, RetrievalResponse
+from indexer.core.results import Hit, RankedList, RecordSet, RetrievalResponse
 from indexer.core.stages import (
     Fuser,
     Index,
@@ -55,6 +56,23 @@ class AccessPolicy:
     enabled: bool = False
     field: str = "acl"
     missing: str = "deny"  # deny | allow
+
+    def allows(self, fields: Mapping[str, Any], principals: Sequence[str] | None) -> bool:
+        """Whether a unit or document with these fields is visible to
+        ``principals`` -- the same rule the query path applies as a filter, for
+        callers that fetch by id rather than search."""
+        if not self.enabled:
+            return True
+        if principals is None:
+            raise AccessDenied(
+                "access control is on and the caller states no principals; pass the "
+                "caller's user and groups"
+            )
+        acl = fields.get(self.field)
+        if acl is None:
+            return self.missing == "allow"
+        granted = acl if isinstance(acl, list | tuple) else (acl,)
+        return bool({str(g) for g in granted} & set(principals))
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +130,8 @@ class QueryEngine:
         self.path_rerankers = dict(path_rerankers or {})
         self.access = access or AccessPolicy()
         self.shape = shape or ShapePolicy()
+        #: Most documents a ``document_filters`` scope searches.
+        self.document_scope_limit = 20_000
 
     # ------------------------------------------------------------------ api
 
@@ -123,6 +143,7 @@ class QueryEngine:
         filters: Predicate | None = None,
         principals: tuple[str, ...] | None = None,
         context: Sequence[str] = (),
+        document_filters: Predicate | None = None,
     ) -> RetrievalResponse:
         """``context`` is the conversation so far, oldest first: a router that
         can read it makes a follow-up standalone before retrieval."""
@@ -133,8 +154,33 @@ class QueryEngine:
                 filters=filters,
                 principals=principals,
                 context=tuple(context),
+                document_filters=document_filters,
             )
         )
+
+    def records(
+        self,
+        sq: StructuredQuery,
+        *,
+        filters: Predicate | None = None,
+        principals: tuple[str, ...] | None = None,
+    ) -> RecordSet:
+        """A structured query as written, under the caller's scope and the
+        access policy.
+
+        For a caller that already knows the schema -- an agent that has read
+        ``describe_schema`` -- and has no use for a router's reading of a
+        sentence. The scope and the access filter apply exactly as on the
+        structured path of ``execute``.
+        """
+        q = self._scoped(Query(text="", filters=filters, principals=principals))
+        capable = [i for i in self.indexes.values() if isinstance(i, StructuredCapable)]
+        if not capable:
+            raise ContractViolation("no structured index is configured to answer records")
+        if q.filters is not None:
+            sq = replace(sq, where=all_of([w for w in (sq.where, q.filters) if w is not None]))
+        ctx = StageContext(cache=self.cache, accountant=InMemoryAccountant())
+        return capable[0].structured_query(sq, ctx)
 
     def execute(self, q: Query) -> RetrievalResponse:
         accountant = InMemoryAccountant()
@@ -145,7 +191,12 @@ class QueryEngine:
         # Access control first, as a filter on the caller's scope: from here on
         # it is the caller's own filter, which every path already honours.
         q = self._scoped(q)
+        q, scope = self._document_scope(q, ctx, skipped)
         decision = self._route(q, ctx, latency, skipped)
+        if scope is not None:
+            decision = replace(
+                decision, targets=tuple(replace(t, unit_ids=scope) for t in decision.targets)
+            )
         self._log_decision(q, decision)
 
         if str(decision.path) == RoutePath.STRUCTURED:
@@ -216,6 +267,47 @@ class QueryEngine:
         if self.access.missing == "allow":
             acl = Or((acl, Exists(self.access.field, present=False)))
         return replace(q, filters=all_of([f for f in (q.filters, acl) if f is not None]))
+
+    def _document_scope(
+        self, q: Query, ctx: StageContext, skipped: dict[str, str]
+    ) -> tuple[Query, tuple[UnitId, ...] | None]:
+        """The units of the documents ``q.document_filters`` selects.
+
+        Resolved over the structured index's document rows, where a document's
+        fields are together; without one, the conditions fall back to each
+        passage's own fields, and the response says so.
+        """
+        if q.document_filters is None:
+            return q, None
+        idx = next(
+            (
+                i
+                for i in self.indexes.values()
+                if isinstance(i, StructuredCapable) and hasattr(i, "unit_ids_for")
+            ),
+            None,
+        )
+        if idx is None:
+            skipped["document_filters"] = "no structured index: applied to each passage"
+            merged = all_of([w for w in (q.filters, q.document_filters) if w is not None])
+            return replace(q, filters=merged, document_filters=None), None
+        where = all_of([w for w in (q.document_filters, q.filters) if w is not None])
+        rows = idx.structured_query(
+            StructuredQuery(
+                where=where,
+                select=("document_id",),
+                level="document",
+                limit=self.document_scope_limit,
+            ),
+            ctx,
+        )
+        if rows.truncated:
+            skipped["document_filters"] = (
+                f"matched more than {self.document_scope_limit} documents; "
+                f"searched the first {self.document_scope_limit}"
+            )
+        documents = [str(r[0]) for r in rows.rows]
+        return q, tuple(idx.unit_ids_for(documents))
 
     # ------------------------------------------------------------- shaping
 
@@ -390,8 +482,9 @@ class QueryEngine:
         # this line a tenant-scoped question over the structured index answered
         # from every tenant's records.
         sq = decision.structured_query
-        if q.filters is not None:
-            sq = replace(sq, where=all_of([w for w in (sq.where, q.filters) if w is not None]))
+        extra = [w for w in (q.filters, q.document_filters) if w is not None]
+        if extra:
+            sq = replace(sq, where=all_of([w for w in (sq.where, *extra) if w is not None]))
         records = idx.structured_query(sq, ctx)
         latency["structured"] = (time.perf_counter() - t) * 1000
         skipped["retrieve"] = "structured_path"

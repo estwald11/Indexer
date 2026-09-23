@@ -272,6 +272,7 @@ class Assembly:
             checkpoint_every=c.ingestion.checkpoint_every,
             cache_refs=self.cache_refs,
             purge_cache=c.cache.purge_unreferenced,
+            manifest_dir=self.paths.manifests,
         )
 
     def query_engine(self) -> QueryEngine:

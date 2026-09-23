@@ -541,6 +541,22 @@ class SqliteStructuredIndex(StageImpl):
                     slot[r["name"]] = value
         return out
 
+    def unit_ids_for(self, document_ids: Iterable[str]) -> list[UnitId]:
+        """The units of these documents, for scoping retrieval to them."""
+        out: list[UnitId] = []
+        ids = list(dict.fromkeys(document_ids))
+        for chunk in _chunks(ids, 500):
+            marks = ",".join("?" for _ in chunk)
+            out.extend(
+                UnitId(r["unit_id"])
+                for r in self._conn.execute(
+                    f"SELECT unit_id FROM units WHERE document_id IN ({marks}) "
+                    f"ORDER BY document_id, ordinal, unit_id",
+                    chunk,
+                )
+            )
+        return out
+
     def all_unit_ids(self) -> list[UnitId]:
         """Every unit id, ascending. Used by tests and by ablation tooling."""
         return [

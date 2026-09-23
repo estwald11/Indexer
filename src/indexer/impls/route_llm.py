@@ -37,26 +37,24 @@ from typing import Any
 from indexer.core.predicate import (
     Aggregation,
     AggregationOp,
-    Compare,
-    Exists,
-    Op,
     Predicate,
     StructuredQuery,
-    TextMatch,
     all_of,
 )
 from indexer.core.query import Query, QueryType, RouteDecision, RoutePath, RouteTarget
 from indexer.core.registry import register
 from indexer.core.stages import StageContext
+from indexer.filters import OPS, FilterError, build_clause
 from indexer.impls.route import RulesRouter, RulesRouterParams
 from indexer.llm import Claude, LLMError, LLMResult, json_object, request
-from indexer.normalize import parse_bool, parse_date, parse_number
 from indexer.plugin import StageImpl, dataclass_params
 
 __all__ = ["LLMRouter"]
 
 _STRATEGIES = ("rules_first", "llm_first")
-_OPS = ("eq", "ne", "gt", "gte", "lt", "lte", "contains", "exists", "missing")
+#: What the model may write: every operator but ``in``, which the schema's
+#: scalar value cannot carry.
+_OPS = tuple(op for op in OPS if op != "in")
 _NUMERIC = ("int", "float")
 
 
@@ -368,50 +366,16 @@ class LLMRouter(StageImpl):
         if not isinstance(item, dict):
             raise _Rejected("malformed filter")
         name = self._known(item.get("field"))
-        op = str(item.get("op", ""))
-        if op == "exists":
-            return Exists(name)
-        if op == "missing":
-            return Exists(name, present=False)
-        if op not in _OPS:
-            raise _Rejected(f"unknown operator {op!r}")
-        kind = self.field_types.get(name) or _kind_of(item.get("value"))
-        value = self._coerce(name, kind, item.get("value"))
-        if op == "contains":
-            if kind != "str":
-                raise _Rejected(f"contains on {kind} field {name}")
-            return TextMatch(name, str(value), mode="contains")
-        if kind == "str" and op == "eq":
-            # As the rules router reads it: case-insensitive equality.
-            return TextMatch(name, str(value), mode="exact")
-        if kind in ("str", "bool") and op not in ("eq", "ne"):
-            raise _Rejected(f"{op} on {kind} field {name}")
-        return Compare(name, Op(op), value)
-
-    def _coerce(self, name: str, kind: str, value: Any) -> Any:
-        if value is None:
-            raise _Rejected(f"no value for {name}")
-        locale = self.rules.locale
-        out: Any = None
-        if kind in ("date", "datetime"):
-            out = parse_date(str(value))
-        elif kind in _NUMERIC:
-            number: float | None
-            if isinstance(value, bool):
-                number = None
-            elif isinstance(value, int | float):
-                number = float(value)
-            else:
-                number = parse_number(str(value), locale)
-            if number is not None and (kind == "float" or number == int(number)):
-                out = int(number) if kind == "int" else number
-        elif kind == "bool":
-            out = value if isinstance(value, bool) else parse_bool(str(value))
-        else:
-            out = str(value).strip() or None
-        if out is None:
-            raise _Rejected(f"{value!r} is not a {kind or 'value'} for {name}")
-        return out
+        try:
+            return build_clause(
+                name,
+                str(item.get("op", "")),
+                item.get("value"),
+                self.field_types.get(name, ""),
+                locale=self.rules.locale,
+            )
+        except FilterError as exc:
+            raise _Rejected(str(exc)) from exc
 
     def _aggregations(self, agg: Any) -> tuple[Aggregation, ...]:
         if not isinstance(agg, dict):
@@ -455,13 +419,3 @@ class LLMRouter(StageImpl):
             version=self.VERSION,
             params_hash=hash_obj({"params": self._params, "prompts": [self.SYSTEM, self.PROMPT]}),
         )
-
-
-def _kind_of(value: Any) -> str:
-    if isinstance(value, bool):
-        return "bool"
-    if isinstance(value, int | float):
-        return "float"
-    if isinstance(value, str) and parse_date(value) is not None:
-        return "date"
-    return "str"

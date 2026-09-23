@@ -28,6 +28,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from indexer.core.accounting import Accountant, CacheOutcome, InMemoryAccountant
@@ -51,6 +52,7 @@ from indexer.core.stages import (
 )
 from indexer.core.unit import EnrichedUnit, Enrichment, Unit
 from indexer.eval.checks import check_parsed_document, check_units
+from indexer.io import atomic_write
 from indexer.pipeline.codec import (
     decode_enrichment,
     decode_metadata,
@@ -167,8 +169,12 @@ class IngestionPipeline:
         checkpoint_every: int = 200,
         cache_refs: CacheRefs | None = None,
         purge_cache: bool = True,
+        manifest_dir: str | Path | None = None,
     ) -> None:
         self.scanner = scanner
+        #: Where each build's manifest is written, as ``<build_id>.json`` and
+        #: ``latest.json``. The manifest said it was written there; nothing did.
+        self.manifest_dir = Path(manifest_dir) if manifest_dir is not None else None
         #: Which cache entries each document uses, so that removing or editing
         #: a document can remove what it left in the cache. None disables it.
         self.cache_refs = cache_refs
@@ -439,6 +445,10 @@ class IngestionPipeline:
         manifest.absorb(accountant.runs())
         manifest.finish(elapsed_wall_ms=(time.perf_counter() - started) * 1000.0)
         self.ledger.commit_build(manifest.build_id)
+        if self.manifest_dir is not None:
+            data = manifest.to_json().encode("utf-8")
+            atomic_write(self.manifest_dir / f"{manifest.build_id}.json", data)
+            atomic_write(self.manifest_dir / "latest.json", data)
         return BuildResult(manifest=manifest, plan=work, failures=failures)
 
     # ------------------------------------------------------------- internals

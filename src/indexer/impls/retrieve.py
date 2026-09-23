@@ -20,7 +20,12 @@ def _search_one(
     idx: Index, target: RouteTarget, text: str, ctx: StageContext, step: int, on_error: str
 ) -> RankedList:
     try:
-        rl = idx.search(IndexQuery(text=text, top_k=target.top_k, filters=target.filters), ctx)
+        rl = idx.search(
+            IndexQuery(
+                text=text, top_k=target.top_k, filters=target.filters, unit_ids=target.unit_ids
+            ),
+            ctx,
+        )
     except Exception as exc:
         if on_error == "fail":
             raise
