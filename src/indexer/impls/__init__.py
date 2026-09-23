@@ -17,6 +17,7 @@ from indexer.impls import (
     corpus,
     enrich,
     enrich_entities,
+    enrich_llm,
     fuse,
     index_dense,
     index_lexical,
@@ -29,6 +30,7 @@ from indexer.impls import (
     rerank,
     retrieve,
     route,
+    route_llm,
     segment,
 )
 
@@ -36,6 +38,7 @@ __all__ = [
     "corpus",
     "enrich",
     "enrich_entities",
+    "enrich_llm",
     "fuse",
     "index_dense",
     "index_lexical",
@@ -48,5 +51,6 @@ __all__ = [
     "rerank",
     "retrieve",
     "route",
+    "route_llm",
     "segment",
 ]

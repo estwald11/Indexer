@@ -287,6 +287,9 @@ class EnrichContext:
     #: classifier can read a summary. Creates an ordering dependency, which the
     #: config makes explicit: enrichers run in listed order.
     prior: Mapping[UnitId, Mapping[str, Enrichment]] = field(default_factory=dict)
+    #: How many model calls an enricher may have in flight for this batch
+    #: (``enrich.max_concurrency``). An enricher that makes no calls ignores it.
+    max_concurrency: int = 1
 
 
 @runtime_checkable

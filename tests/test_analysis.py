@@ -141,7 +141,7 @@ class TestAnalyzer:
         assert a.analyze("fatture fattura") == ["fattur", "fattur"]
 
 
-def _unit(doc: str, text: str) -> EnrichedUnit:
+def _unit(doc: str, text: str, metadata: dict[str, str] | None = None) -> EnrichedUnit:
     did = DocumentId(doc)
     return EnrichedUnit(
         unit=Unit(
@@ -149,6 +149,7 @@ def _unit(doc: str, text: str) -> EnrichedUnit:
             document_id=did,
             text=text,
             provenance=Provenance(document_id=did, span=Span(0, len(text))),
+            metadata=metadata or {},
         )
     )
 
@@ -159,6 +160,10 @@ ITALIAN = {
     "c": "Le fatture del fornitore Bianchi sono state pagate in ritardo.",
     "d": "Verbale della riunione del consiglio di amministrazione.",
 }
+
+
+#: What ``bm25`` is configured with by default (the registry fills these in).
+AUTO = {"language": "auto", "stemmer": "light", "stopwords": True, "fold_accents": True}
 
 
 class TestLanguageBM25:
@@ -202,6 +207,25 @@ class TestLanguageBM25:
         assert got.keys() == want.keys()
         for k in want:
             assert got[k] == pytest.approx(want[k])
+
+    def test_a_one_line_unit_is_analysed_in_its_documents_language(self) -> None:
+        """A single invoice line gives detection nothing to go on. It was indexed
+        unstemmed, while an Italian question about it was stemmed -- "pagamento"
+        against "pagament" -- and the line was never found."""
+        idx = LanguageBM25Index(dict(AUTO))
+        line = _unit("f", "Pagamento a 30 giorni data fattura.", {"doc_language": "it"})
+        idx.upsert([line], CTX)
+        q = IndexQuery(text="Quali sono i termini di pagamento della fattura 42?", top_k=5)
+        assert [h.document_id for h in idx.search(q, CTX).hits] == ["f"]
+
+    def test_an_undetectable_document_is_still_searched(self) -> None:
+        """Without a document language, the fallback analysis is one every query
+        also makes -- so no document sits in a language nothing searches."""
+        for fallback in ("none", "it"):
+            idx = LanguageBM25Index({**AUTO, "fallback_language": fallback})
+            idx.upsert([_unit("f", "Pagamento a 30 giorni data fattura.")], CTX)
+            q = IndexQuery(text="Quali sono i termini di pagamento della fattura 42?", top_k=5)
+            assert [h.document_id for h in idx.search(q, CTX).hits] == ["f"], fallback
 
     def test_changing_the_analyser_rebuilds_the_stored_index(self, tmp_path: Path) -> None:
         path = tmp_path / "lex.json"

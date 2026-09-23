@@ -96,6 +96,12 @@ class TestItalianQuestionsTakeTheStructuredPath:
     def test_the_same_question_in_english_still_works(self, router: RulesRouter) -> None:
         assert _docs(router, "invoices with importo greater than 1000") == {"f1", "f3", "c1"}
 
+    def test_a_field_named_as_the_schema_writes_it(self, router: RulesRouter) -> None:
+        """An agent reads ``describe_schema`` and writes ``data_scadenza``; the
+        labels are compared as words, and the underscore used to hide the field."""
+        # Read as the default date field instead, the answer would be empty.
+        assert _docs(router, "contratti con data_scadenza successiva al 01/01/2026") == {"c2"}
+
     def test_plural_field_names_are_recognised(self, router: RulesRouter) -> None:
         d = router.route(Query(text="somma degli importi per fornitore"), None)  # type: ignore[arg-type]
         sq = d.structured_query

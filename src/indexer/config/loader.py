@@ -61,7 +61,10 @@ def load_mapping(path: str | Path, *, _seen: tuple[Path, ...] = ()) -> dict[str,
         raise ConfigError(f"config not found: {p}")
 
     try:
-        raw = yaml.safe_load(p.read_text()) or {}
+        # UTF-8 whatever the platform: Windows reads cp1252 by default, and an
+        # Italian config's "€", "società" and "è" came back as mojibake -- in
+        # value aliases, prompts and extraction patterns, silently.
+        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
         raise ConfigError(f"{p}: {exc}") from exc
     if not isinstance(raw, dict):

@@ -165,7 +165,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"   paths        {', '.join(sorted(cfg.query.route.paths))}")
         if cfg.eval.ablations:
             print(f"   ablations    {', '.join(a.name for a in cfg.eval.ablations)}")
-        for w in cfg.warnings():
+        declared: list[str] = []
+        if not schema_only:
+            from indexer.pipeline.build import declared_fields
+
+            declared = declared_fields(cfg)[0]
+        for w in cfg.warnings(declared):
             print(f"   warning      {w}")
 
         errors = 0

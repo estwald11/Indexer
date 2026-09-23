@@ -277,12 +277,18 @@ def _normalise(text: str) -> str:
 
     Only an apostrophe *between* letters is an elision. Replacing every one
     turned "'Bianchi Spa'" into two bare words, and the value lost its second.
+
+    An underscore between letters is a space: field labels are compared as
+    words ("importo totale"), and a question that names a field the way the
+    schema writes it -- as an agent reading ``describe_schema`` does -- found
+    no field at all.
     """
-    return _ELISION.sub(" ", text)
+    return _UNDERSCORE.sub(" ", _ELISION.sub(" ", text))
 
 
 #: An apostrophe between letters: straight, backtick, or typographic (U+2019).
 _ELISION = re.compile(r"(?<=\w)['`" + chr(0x2019) + r"](?=\w)")
+_UNDERSCORE = re.compile(r"(?<=[^\W_])_+(?=[^\W_])")
 
 
 def _fields_in(
@@ -390,7 +396,7 @@ class RulesRouterParams:
 @register(
     "route",
     "rules",
-    version="2",
+    version="3",
     params_model=dataclass_params(RulesRouterParams),
     summary=(
         "Regex and field-lexicon rules, English and Italian. Zero latency, "
@@ -402,7 +408,7 @@ def _make_rules(params: dict[str, Any], **_: Any) -> RulesRouter:
 
 
 class RulesRouter(StageImpl):
-    STAGE, IMPL, VERSION = "route", "rules", "2"
+    STAGE, IMPL, VERSION = "route", "rules", "3"
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
@@ -735,7 +741,7 @@ class RulesRouter(StageImpl):
         for f, values in self.value_aliases.items():
             for value, words in values.items():
                 for w in [str(value), *words]:
-                    stems = [_stem(x) for x in _WORD.findall(w)]
+                    stems = [_stem(x) for x in _WORD.findall(w.replace("_", " "))]
                     if stems and _find_label(tokens, stems, []) is not None:
                         out.append((f, value))
                         break

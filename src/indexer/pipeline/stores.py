@@ -233,7 +233,7 @@ class JsonLedger:
         self._loaded = True
         if not self.path.exists():
             return
-        data = json.loads(self.path.read_text())
+        data = json.loads(self.path.read_text(encoding="utf-8"))
         self._in_flight = data.get("in_flight")
         for d in [*data.get("records", []), *self._replay_journal()]:
             if d.get("deleted"):
@@ -355,7 +355,7 @@ class UnitStore:
             return
         self._loaded = True
         if self.path.exists():
-            self._units = json.loads(self.path.read_text())
+            self._units = json.loads(self.path.read_text(encoding="utf-8"))
 
     def put_many(self, units: list[EnrichedUnit]) -> None:
         self._load()

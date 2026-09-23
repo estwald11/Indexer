@@ -122,8 +122,19 @@ class QueryEngine:
         top_k: int = 20,
         filters: Predicate | None = None,
         principals: tuple[str, ...] | None = None,
+        context: Sequence[str] = (),
     ) -> RetrievalResponse:
-        return self.execute(Query(text=text, top_k=top_k, filters=filters, principals=principals))
+        """``context`` is the conversation so far, oldest first: a router that
+        can read it makes a follow-up standalone before retrieval."""
+        return self.execute(
+            Query(
+                text=text,
+                top_k=top_k,
+                filters=filters,
+                principals=principals,
+                context=tuple(context),
+            )
+        )
 
     def execute(self, q: Query) -> RetrievalResponse:
         accountant = InMemoryAccountant()

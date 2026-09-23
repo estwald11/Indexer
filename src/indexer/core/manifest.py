@@ -53,6 +53,11 @@ class CorpusStats:
     #: previous version of edited ones. Counted because erasure that is not
     #: observable is not auditable.
     cache_entries_purged: int = 0
+    #: Units an enricher could not enrich this build (a refused or truncated
+    #: model answer, an API error) under ``enrich.on_error: skip``. They are
+    #: indexed without that enrichment, and their documents are retried by
+    #: the next build.
+    enrichments_failed: int = 0
     bytes_parsed: int = 0
     #: Mean over documents. A drop here is an early warning that a corpus has
     #: acquired scans or multi-column layouts the current parser cannot handle.

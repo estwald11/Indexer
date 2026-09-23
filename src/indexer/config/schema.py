@@ -29,6 +29,7 @@ edit rather than a code path.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -536,6 +537,13 @@ class Config(_Base):
             schema = spec.params.get("schema")
             if isinstance(schema, dict):
                 names.extend(schema)
+            # Per-document-type schemas (an LLM field extractor) and label sets
+            # written as fields (a classifier).
+            for per_type in (spec.params.get("schemas") or {}).values():
+                if isinstance(per_type, dict):
+                    names.extend(per_type)
+            if spec.params.get("as_fields", True):
+                names.extend(spec.params.get("labels") or {})
         return sorted(set(names))
 
     def extracted_field_types(self) -> dict[str, str]:
@@ -562,14 +570,25 @@ class Config(_Base):
                     out[name] = str(t)
             for name in spec.params.get("from_metadata", []) or []:
                 out.setdefault(name, "str")
+            for per_type in (spec.params.get("schemas") or {}).values():
+                for name, decl in (per_type or {}).items():
+                    if isinstance(decl, dict):
+                        out[name] = str(decl.get("type", "str"))
+            if spec.params.get("as_fields", True):
+                for name in spec.params.get("labels") or {}:
+                    out.setdefault(name, "str")
         return out
 
-    def warnings(self) -> list[str]:
+    def warnings(self, declared: Collection[str] = ()) -> list[str]:
         """Configurations that are valid but probably not what was meant.
 
         Warnings rather than errors because each is a legitimate ablation arm.
         They are printed at load and recorded in the manifest, so a production
         index built from an ablation config is identifiable after the fact.
+
+        ``declared`` adds the fields implementations declare through the
+        registry (an entity extractor's, a parser's), which the config alone
+        cannot see; ``indexer.config.check`` passes them.
         """
         out: list[str] = []
         if not self.enrich_enabled:
@@ -600,7 +619,7 @@ class Config(_Base):
             structured_live = any(
                 i.kind == "structured" and i.enabled for i in self.ingestion.index.indexes
             )
-            if structured_live and not self.extracted_field_names():
+            if structured_live and not (set(self.extracted_field_names()) | set(declared)):
                 out.append(
                     "a structured index and a structured route are configured, but no "
                     "enabled enricher declares any field to extract. The router has no "

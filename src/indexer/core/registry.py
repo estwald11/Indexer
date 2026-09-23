@@ -79,6 +79,19 @@ class Registration(Generic[T]):
     summary: str = ""
     #: Extras required for this implementation, e.g. ``("parse-pymupdf",)``.
     requires: tuple[str, ...] = field(default_factory=tuple)
+    #: The fields this implementation writes, by name and type (str, int,
+    #: float, bool, date), given its params. The router's vocabulary is built
+    #: from these: a field nobody declares is one no question can name, and
+    #: before this hook only the regex extractor's fields were ever declared.
+    declares_fields: Callable[[Mapping[str, Any]], Mapping[str, str]] | None = None
+
+    def fields(self, params: Mapping[str, Any]) -> dict[str, str]:
+        """``declares_fields`` over normalised params; empty when not declared."""
+        if self.declares_fields is None:
+            return {}
+        normalized = self.normalize(params)
+        source = normalized if isinstance(normalized, Mapping) else params
+        return {str(k): str(v) for k, v in self.declares_fields(dict(source)).items()}
 
     def fingerprint(self, params: Mapping[str, Any]) -> StageFingerprint:
         return StageFingerprint(
@@ -174,6 +187,7 @@ def register(
     params_model: Callable[[Mapping[str, Any]], Any] | None = None,
     summary: str = "",
     requires: tuple[str, ...] = (),
+    declares_fields: Callable[[Mapping[str, Any]], Mapping[str, str]] | None = None,
     registry: Registry | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator form. The only way implementations enter the frame."""
@@ -188,6 +202,7 @@ def register(
                 params_model=params_model,
                 summary=summary,
                 requires=requires,
+                declares_fields=declares_fields,
             )
         )
         return factory

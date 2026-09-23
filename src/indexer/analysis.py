@@ -160,6 +160,14 @@ class Analyzer:
     reliably -- in every candidate language, searching the union of the terms.
     An archive of an Italian company holds English contracts too, and neither
     half should be analysed as the other.
+
+    What is detected is the *document*, when the caller knows it: a unit is
+    often one line -- "Pagamento a 30 giorni data fattura." -- too short to
+    detect, and was indexed unstemmed while an Italian question about it was
+    stemmed, so "pagamento" and "pagament" never met. A text nothing can be
+    detected from is analysed as ``fallback`` (``none`` by default; an Italian
+    archive sets ``it``), and every query is analysed that way too, so no
+    document is analysed in a language no query searches.
     """
 
     language: str = "none"
@@ -167,6 +175,7 @@ class Analyzer:
     stopwords: bool = False
     fold: bool = False
     min_token_length: int = 1
+    fallback: str = "none"
 
     def __post_init__(self) -> None:
         if self.language not in LANGUAGES:
@@ -175,6 +184,8 @@ class Analyzer:
             raise ValueError(f"stemmer must be one of {STEMMERS}, not {self.stemmer!r}")
         if self.stemmer != "none" and self.language == "none":
             raise ValueError("a stemmer needs a language: set language to it, en or auto")
+        if self.fallback not in ("none", "it", "en"):
+            raise ValueError(f"fallback language must be none, it or en, not {self.fallback!r}")
 
     # ------------------------------------------------------------------ api
 
@@ -186,6 +197,7 @@ class Analyzer:
             stopwords=bool(params.get("stopwords", False)),
             fold=bool(params.get("fold_accents", False)),
             min_token_length=int(params.get("min_token_length", 1)),
+            fallback=str(params.get("fallback_language", "none")),
         )
 
     @property
@@ -208,16 +220,22 @@ class Analyzer:
             "fold": self.fold,
             "min_token_length": self.min_token_length,
         }
+        if self.language == "auto":
+            out["fallback"] = self.fallback
         if self.stemmer == "snowball":
             langs = ("it", "en") if self.language == "auto" else (self.language,)
             out["backend"] = sorted({snowball_stemmer(lang)[1] for lang in langs})
         return out
 
-    def analyze(self, text: str) -> list[str]:
-        """Terms of a document, in order (duplicates kept, for term frequency)."""
+    def analyze(self, text: str, language: str | None = None) -> list[str]:
+        """Terms of a document, in order (duplicates kept, for term frequency).
+
+        ``language`` is the language of the document the text belongs to, when
+        known; with ``auto`` it is used instead of detecting one on ``text``.
+        """
         if self.is_identity:
             return tokenize(text)
-        lang = self._language_of(text)
+        lang = self._language_of(text, language)
         return list(self._terms(tokenize(text), lang))
 
     def analyze_query(self, text: str) -> list[str]:
@@ -228,7 +246,9 @@ class Analyzer:
         if self.language != "auto":
             return list(dict.fromkeys(self._terms(tokens, self.language)))
         detected = detect_language(text)
-        langs = (detected,) if detected in ("it", "en") else ("it", "en")
+        langs = [detected] if detected in ("it", "en") else ["it", "en"]
+        if self.fallback not in langs:
+            langs.append(self.fallback)
         out: dict[str, None] = {}
         for lang in langs:
             out.update(dict.fromkeys(self._terms(tokens, lang)))
@@ -236,11 +256,13 @@ class Analyzer:
 
     # ------------------------------------------------------------- internals
 
-    def _language_of(self, text: str) -> str:
+    def _language_of(self, text: str, hint: str | None = None) -> str:
         if self.language != "auto":
             return self.language
+        if hint in ("it", "en"):
+            return hint
         detected = detect_language(text)
-        return detected if detected in ("it", "en") else "none"
+        return detected if detected in ("it", "en") else self.fallback
 
     def _terms(self, tokens: Sequence[str], lang: str) -> Iterable[str]:
         stops = _stopwords_for(lang, folded=self.fold) if self.stopwords else frozenset()

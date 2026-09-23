@@ -81,6 +81,7 @@ class EntityParams:
         "VAT numbers, fiscal codes, IBANs and emails, kept only when their check digit "
         "holds. No model. Multi-valued fields for filtering and entity lookup."
     ),
+    declares_fields=lambda p: {k: "str" for k in p.get("kinds", _KINDS)},
 )
 def _make_entities(params: dict[str, Any], **_: Any) -> EntityExtractor:
     return EntityExtractor(params)
@@ -173,6 +174,11 @@ class MasterDataParams:
         "Joins identifiers found in a unit (VAT numbers, fiscal codes, codes) to the "
         "company's registers (CSV), emitting customer/supplier codes and names."
     ),
+    declares_fields=lambda p: {
+        target: "str"
+        for spec in p.get("sources", [])
+        for target in (spec.get("emit") or {}).values()
+    },
 )
 def _make_master_data(params: dict[str, Any], **_: Any) -> MasterDataLinker:
     return MasterDataLinker(params)

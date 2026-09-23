@@ -221,6 +221,37 @@ class FatturaPAParams:
     total_tolerance: float = 0.01
 
 
+#: The facts a FatturaPA carries into metadata, and so into every index's
+#: fields, with their types -- what the router needs to read "fatture sopra i
+#: 1.000 euro" as a comparison on a number.
+FATTURAPA_FIELDS: dict[str, str] = {
+    "formato": "str",
+    "tipo_documento": "str",
+    "tipo_documento_sdi": "str",
+    "numero_documento": "str",
+    "data_documento": "date",
+    "divisa": "str",
+    "importo_totale": "float",
+    "imponibile": "float",
+    "imposta": "float",
+    "causale": "str",
+    "cedente_denominazione": "str",
+    "cedente_piva": "str",
+    "cedente_codice_fiscale": "str",
+    "cessionario_denominazione": "str",
+    "cessionario_piva": "str",
+    "cessionario_codice_fiscale": "str",
+    "data_scadenza": "date",
+    "modalita_pagamento": "str",
+    "iban": "str",
+    "ordini_acquisto": "str",
+    "contratti": "str",
+    "totali_coerenti": "bool",
+    "fatture_nel_file": "int",
+    "numeri_documento": "str",
+}
+
+
 @register(
     "parse",
     "fatturapa",
@@ -230,6 +261,7 @@ class FatturaPAParams:
         "FatturaPA e-invoices (FPA12/FPR12): exact typed facts as document metadata, "
         "lines and VAT summary as tables. Standard library."
     ),
+    declares_fields=lambda _p: dict(FATTURAPA_FIELDS),
 )
 def _make_fatturapa(params: dict[str, Any], **_: Any) -> FatturaPAParser:
     return FatturaPAParser(params)

@@ -9,6 +9,7 @@ structurally valid but violates an invariant.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,24 @@ FULL = "configs/full.yaml"
 @pytest.fixture(autouse=True)
 def _fake_secrets() -> None:
     os.environ.setdefault("LLAMAPARSE_API_KEY", "sk-test")
+
+
+def test_a_config_is_read_as_utf8_on_every_platform(tmp_path: Path) -> None:
+    """Windows reads text as cp1252 by default: an Italian config's "€" and
+    "società" came back as mojibake -- in value aliases and extraction patterns,
+    where nothing would ever match them and nothing would say so."""
+    raw = (
+        Path(REFERENCE)
+        .read_text(encoding="utf-8")
+        .replace(
+            "impl: rules                   # regex + field lexicon; ~0 latency baseline",
+            "impl: rules\n    params: {value_aliases: {tipo: {società: [società, '€']}}}",
+        )
+    )
+    path = tmp_path / "c.yaml"
+    path.write_bytes(raw.encode("utf-8"))
+    cfg, _ = load(path)
+    assert cfg.query.route.params["value_aliases"] == {"tipo": {"società": ["società", "€"]}}
 
 
 class TestReferenceConfig:

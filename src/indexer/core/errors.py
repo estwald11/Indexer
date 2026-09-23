@@ -11,11 +11,15 @@ at corpus scale; a build that silently drops 8% of documents is worse. So
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 __all__ = [
     "AccessDenied",
     "ConfigError",
     "ContractViolation",
     "DocumentError",
+    "EnrichmentIncomplete",
     "IndexerError",
     "StageError",
 ]
@@ -70,3 +74,33 @@ class DocumentError(IndexerError):
         super().__init__(f"{document_id} failed at {stage}: {message}")
         self.document_id = document_id
         self.stage = stage
+
+
+class EnrichmentIncomplete(IndexerError):
+    """Some units of a batch could not be enriched; the others could.
+
+    Raised by an enricher instead of failing the whole batch for one refused or
+    truncated answer. ``results`` holds the enrichments that were produced, in
+    input order, with ``None`` where one was not; what happens to those units is
+    the ``enrich.on_error`` policy, not the enricher's call. The tokens and cost
+    of the failed calls travel with it, because they were spent all the same.
+    """
+
+    def __init__(
+        self,
+        results: Sequence[Any],
+        errors: Sequence[str],
+        *,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        missing = sum(r is None for r in results)
+        super().__init__(
+            f"{missing} of {len(results)} units not enriched: " + "; ".join(errors[:3])
+        )
+        self.results = list(results)
+        self.errors = list(errors)
+        self.tokens_in = tokens_in
+        self.tokens_out = tokens_out
+        self.cost_usd = cost_usd

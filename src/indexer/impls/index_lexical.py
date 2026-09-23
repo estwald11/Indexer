@@ -57,6 +57,8 @@ class BM25Params:
     stemmer: str = "none"
     stopwords: bool = False
     fold_accents: bool = False
+    #: With ``auto``: the language of a text none can be detected in.
+    fallback_language: str = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +71,15 @@ class LanguageBM25Params:
     stemmer: str = "light"
     stopwords: bool = True
     fold_accents: bool = True
+    #: The language of a document none can be detected in. ``it`` for an
+    #: Italian archive; ``none`` leaves such a document unstemmed.
+    fallback_language: str = "none"
 
 
 @register(
     "index",
     "bm25_memory",
-    version="2",
+    version="3",
     params_model=dataclass_params(BM25Params),
     summary="In-memory BM25 over indexing_text(). The lexical baseline; word forms as written.",
 )
@@ -85,7 +90,7 @@ def _make_bm25(params: dict[str, Any], **kw: Any) -> BM25Index:
 @register(
     "index",
     "bm25",
-    version="1",
+    version="2",
     params_model=dataclass_params(LanguageBM25Params),
     summary=(
         "BM25 with language analysis: accents folded, stopwords removed, Italian "
@@ -110,7 +115,7 @@ class BM25Index(StageImpl):
     forever".
     """
 
-    STAGE, IMPL, VERSION = "index", "bm25_memory", "2"
+    STAGE, IMPL, VERSION = "index", "bm25_memory", "3"
     kind = "lexical"
 
     def __init__(self, params: dict[str, Any], name: str = "lexical") -> None:
@@ -189,7 +194,12 @@ class BM25Index(StageImpl):
             if existing:
                 self._retract(eu.unit_id)
             surface = eu.indexing_text()
-            tokens = self.analyzer.analyze(surface)
+            # The document's language, detected on the whole document, not on
+            # this unit: a one-line unit gives detection nothing to go on.
+            doc_language = eu.unit.metadata.get("doc_language")
+            tokens = self.analyzer.analyze(
+                surface, doc_language if isinstance(doc_language, str) else None
+            )
             tf = Counter(tokens)
             self._docs[eu.unit_id] = {
                 "tf": dict(tf),
@@ -323,7 +333,7 @@ class BM25Index(StageImpl):
 class LanguageBM25Index(BM25Index):
     """BM25 with language-aware analysis on by default. See module docstring."""
 
-    STAGE, IMPL, VERSION = "index", "bm25", "1"
+    STAGE, IMPL, VERSION = "index", "bm25", "2"
 
 
 def _passes(pred: Predicate, fields: dict[str, Any]) -> bool:
