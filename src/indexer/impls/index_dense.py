@@ -41,7 +41,12 @@ from indexer.core.registry import register
 from indexer.core.results import Hit, RankedList
 from indexer.core.stages import IndexQuery, IndexStatsView, IndexWriteReceipt, StageContext
 from indexer.core.unit import EnrichedUnit
-from indexer.impls.embed import Embedder, build_embedder
+from indexer.impls.embed import (
+    MULTILINGUAL_PRESETS,
+    Embedder,
+    VoyageEmbedder,
+    build_embedder,
+)
 from indexer.impls.index_lexical import _passes
 from indexer.io import atomic_write, decode_value, encode_value
 from indexer.plugin import StageImpl, dataclass_params
@@ -437,3 +442,99 @@ class SentenceTransformerIndex(VectorIndex):
 
     STAGE, IMPL, VERSION = "index", "sentence_transformer", "2"
     EMBEDDER = "sentence_transformer"
+
+
+# ------------------------------------------------------------- multilingual
+
+
+@dataclass(frozen=True, slots=True)
+class MultilingualIndexParams:
+    #: bge-m3 | multilingual-e5-large | multilingual-e5-base | multilingual-e5-small.
+    preset: str = "multilingual-e5-base"
+    batch_size: int = 32
+    device: str = "cpu"
+    #: Overrides the preset's, when set.
+    max_seq_length: int | None = None
+    truncate_dim: int | None = None
+    path: str = ""
+
+    def __post_init__(self) -> None:
+        if self.preset not in MULTILINGUAL_PRESETS:
+            raise ValueError(
+                f"preset must be one of {sorted(MULTILINGUAL_PRESETS)}, not {self.preset!r}"
+            )
+
+
+@register(
+    "index",
+    "multilingual_embedding",
+    version="1",
+    params_model=dataclass_params(MultilingualIndexParams),
+    summary=(
+        "Neural bi-encoder trained on Italian among ~100 languages (bge-m3, "
+        "multilingual-e5), with each model's own query and passage prefixes."
+    ),
+    requires=("sentence-transformers",),
+)
+def _make_multilingual(params: dict[str, Any], **kw: Any) -> MultilingualIndex:
+    return MultilingualIndex(params, name=kw.get("name", "dense"), embedder=kw.get("embedder"))
+
+
+class MultilingualIndex(VectorIndex):
+    """``sentence_transformer`` with the model chosen for Italian.
+
+    A preset rather than a model name, because a multilingual model used without
+    its prefixes -- E5's "query: " and "passage: " -- loses a measurable part of
+    its quality, and nothing warns when they are missing.
+    """
+
+    STAGE, IMPL, VERSION = "index", "multilingual_embedding", "1"
+    EMBEDDER = "sentence_transformer"
+
+    def __init__(
+        self, params: dict[str, Any], name: str = "dense", embedder: Embedder | None = None
+    ) -> None:
+        preset = MULTILINGUAL_PRESETS[str(params.get("preset", "multilingual-e5-base"))]
+        resolved = {**preset, **{k: v for k, v in params.items() if v is not None}}
+        resolved.pop("preset", None)
+        super().__init__(
+            params, name=name, embedder=embedder or build_embedder(self.EMBEDDER, resolved)
+        )
+
+
+# ------------------------------------------------------------------ voyage
+
+
+@dataclass(frozen=True, slots=True)
+class VoyageIndexParams:
+    model: str = "voyage-3.5"
+    #: Truncated output for the models that support it (256, 512, 1024, 2048).
+    output_dimension: int | None = None
+    batch_size: int = 64
+    #: Where the key is read from. The key itself is never a parameter.
+    api_key_env: str = "VOYAGE_API_KEY"
+    base_url: str = "https://api.voyageai.com/v1/embeddings"
+    max_retries: int = 4
+    path: str = ""
+
+
+@register(
+    "index",
+    "voyage_embedding",
+    version="1",
+    params_model=dataclass_params(VoyageIndexParams),
+    summary=(
+        "Voyage AI embeddings over HTTP: multilingual, nothing to host. Sends every "
+        "chunk to a third party -- needs a GDPR basis."
+    ),
+)
+def _make_voyage(params: dict[str, Any], **kw: Any) -> VoyageIndex:
+    embedder = kw.get("embedder") or VoyageEmbedder(
+        params, transport=kw.get("transport"), sleep=kw.get("sleep")
+    )
+    return VoyageIndex(params, name=kw.get("name", "dense"), embedder=embedder)
+
+
+class VoyageIndex(VectorIndex):
+    STAGE, IMPL, VERSION = "index", "voyage_embedding", "1"
+    EMBEDDER = "voyage"
