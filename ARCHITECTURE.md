@@ -37,6 +37,17 @@ choices.
 > failures stay at 4–8% regardless of configuration. Precision@5 predicts answer
 > accuracy at r=0.98.
 
+**Where those numbers come from, and how far they reach.** Yuan, Su and Yao,
+*Diagnosing Retrieval vs. Utilization Bottlenecks in LLM Agent Memory*
+(arXiv 2603.02473, March 2026). The figures are quoted correctly, but the study
+is about agent *memory* on one conversational benchmark (LoCoMo), nine
+configurations, one reader model; its "retrieval failure" bucket includes
+write-side failures, and r=0.98 is a correlation across nine points. The
+invariant survives because the same direction shows up everywhere else:
+oracle-versus-retrieved gaps of 7–30 points recur across 2025–26 document
+benchmarks (T²-RAGBench, Akarsu et al.). The percentages are one study's; the
+priority they imply is the field's. See `docs/STATE_OF_THE_ART.md` §0.
+
 **What it forced.**
 
 *The library stops at retrieval.* `RetrievalResponse` carries passages, a route
@@ -46,7 +57,9 @@ and a library that owns generation inevitably starts optimising for it.
 
 *Precision@5 is not optional.* `EvalConfig.k_values` is validated to include 5,
 and a config omitting it produces a warning. When there is room for one number
-on a dashboard, r=0.98 says which one.
+on a dashboard, this is the one: cheap to compute, and the metric that tracked
+answer accuracy most closely in the study above. nDCG@10 is the one the
+2025–26 benchmarks report; both are in the table.
 
 *Retrieval failure rate is reported separately from recall.* `RunReport` carries
 both because they answer different questions. Recall@20 averages coverage;
@@ -150,9 +163,25 @@ ablation arm. Overlap is a chunking-era workaround for lost context; this
 invariant says the fix is contextualisation. Worth a number on a new corpus,
 not worth a default.
 
+**What the 2025–26 evidence adds.** The Anthropic figures are vendor-internal
+and no independent reproduction of the full 5.7% → 1.9% ladder exists.
+Merola & Singh (2025) measure +5.8% nDCG@10 for contextual retrieval on an
+NFCorpus subsample, at ~20 GB VRAM; Zhou et al. (*Beyond Chunk-Then-Embed*,
+Feb 2026) find contextualisation improves in-corpus retrieval but *degrades
+in-document* retrieval. Two alternatives now give a chunk its context without
+an LLM summary: late chunking (Jina 2024; ConTEB 2025, +9 nDCG@10 untrained) and
+document-batched contextual embedders (Voyage `voyage-context-4`, vendor
+figures). Both attach inside the dense `Index` implementation, because the
+embedder has to see the whole document, and the enrich stage already delivers
+units batched by document. The section-prefix control arm is more important,
+not less: the 2026 literature's main complaint about contextualisation papers
+is the missing "does any prefix help?" baseline.
+
 **Revisit when:** the numbers move on your corpus. They are published figures,
 not laws. `configs/reference.yaml` encodes them as `sanity_checks`, so a corpus
-that disagrees says so on the first ablation run.
+that disagrees says so on the first ablation run. Read a failed check as "the
+effect is smaller here", not "the wiring is wrong", until the diagnosis list
+has been walked.
 
 **What measuring it added to the contract.** The published framing says "an
 LLM-written 50-100 token summary". Running the ablation with an *extractive*
@@ -211,10 +240,24 @@ construction — a gap would silently distort every RRF score.
 and records the error; it does not fail the query. A reranker over three lists
 works with two.
 
+**What the 2025–26 evidence adds.** Hybrid still wins with 2026 embedders:
+Vespa (Jan 2026) measures +3–5 nDCG points for BM25 + vector over vector alone
+on every sub-500M model tested; Akarsu et al. (Apr 2026) find BM25 *beating*
+text-embedding-3-large on 23k financial queries and hybrid RRF beating both.
+Two caveats are now measured. *Balancing the Blend* (2025): fusion is only as
+good as its weakest leg, so a third leg (learned sparse, visual) has to earn its
+place on the ablation table rather than being added because it exists.
+*Drowning in Documents* (2025) and the 2026 compute-allocation study: reranker
+gains grow to about k=100 and then flatten or reverse, so `input_top_k` is a
+tuned parameter, not a default. On fusion functions, Bruch, Gai & Ingber (2023)
+remain the reference: RRF is sensitive to `k`, and a convex combination of
+normalised scores with a fitted weight beats it when a few labelled queries are
+available. `k=60` is a prior; `configs/reference.yaml` now carries a `k=20` arm.
+
 **Revisit when:** a single retriever genuinely dominates on your corpus. The
 frame does not require hybrid — `dense-only` and `lexical-only` are two of the
-six arms in `configs/reference.yaml` precisely so this can be checked rather
-than assumed.
+arms in `configs/reference.yaml` precisely so this can be checked rather than
+assumed.
 
 **What measuring it added to the contract.** On the ablation corpus, hybrid was
 *worse* than its lexical half alone: 7.5% top-20 failure for BM25, 47.4% for the
@@ -316,6 +359,21 @@ the pipeline still records a decision with `reason="stage_disabled"`. Routing
 errors are invisible in aggregate retrieval metrics, because the misrouted
 queries are exactly the ones whose gold the retriever never saw — the metrics
 blame the retriever.
+
+**What the 2025–26 evidence adds.** The direction is supported; the word
+"never" is stronger than the evidence. TableRAG (EMNLP 2025) shows SQL execution
+over preserved tables beating flattened-table retrieval on aggregation and
+nested questions (HeteQA 44.19% vs 34.54%), and T²-RAGBench (EACL 2026) puts
+oracle-context numerical accuracy near 72% against ~41% for the best retrieval
+pipeline — the bottleneck is finding the table, not the arithmetic. Text or
+hybrid retrieval is still what *locates* it. The frame already behaves this
+way: `RulesRouter` falls back to LOOKUP when no predicate is extractable and
+records why. What the evidence asks for is a structured *executor* (SQL over
+extracted rows, which `StructuredCapable` + `sqlite` already is) rather than a
+structured *filter* alone, and a per-type metric slice so misrouting is
+visible — which `RunReport.by_query_type` provides. On routers themselves,
+RAGRouter-Bench (Apr 2026) finds a TF-IDF + SVM complexity router at macro-F1
+0.928 saving 28% of tokens, which vindicates the rules router as the reference.
 
 **Revisit when:** retrieval models start handling numeric and temporal
 constraints natively. The seam is `RoutePath`, which is open: a fourth path
@@ -422,6 +480,13 @@ Out of scope, with the place each would attach.
 | Quantization | Inside a dense `Index` implementation. `IndexStatsView.detail` carries the knobs; the Matryoshka note in `configs/full.yaml` is there so the two-stage option is not foreclosed. |
 | Multi-tenancy | `Predicate` filters push down to every index, `SourceSpec.namespace` scopes document ids, and `query.access` scopes every path -- structured included -- by the caller's principals. What is missing is per-tenant index isolation, which is an `Index` implementation concern. |
 | A shared store | The ledger, unit store and SQLite index are files; a Postgres-backed `Ledger`, `CacheStore` and structured `Index` would let several builders and many readers share one archive. Each is a protocol already. |
+| Late chunking / contextual embeddings | Inside the dense `Index`: the embedder sees the whole document and returns one vector per unit. `Index.upsert` already receives units batched by document. |
+| Visual (page-image) index | The `visual` kind in `configs/full.yaml`. ViDoRe v3 (2026) says: route per page, fuse with the text legs, and rerank with a *text* reranker; store pooled, truncated or binarised multi-vectors. |
+| Tree / table-of-contents index | A `tree` kind: TOC tree with node summaries (PageIndex-style, ~$0.001/page), plus a section-as-file layout of `ParsedDocument` so grep-style agents can navigate at zero model cost. Routed to for long single-document analytical questions. |
+| Learned sparse leg | A third first-stage index (`SPLADE-v3`, OpenSearch neural-sparse v3-gte) behind the same `Index` protocol. Must earn its place: a weak leg drags fusion down. |
+| Graph enrichment | An optional `Enricher` writing entities and relations into `Enrichment.extra`, gated on a multi-hop-heavy query mix. Fair 2026 benchmarks (GraphRAG-Bench, WildGraphBench) show it losing to hybrid + rerank on fact retrieval. |
+| Deletion semantics | `Index.delete` says "must actually remove". *Ghost Vectors* (Jun 2026) shows soft-deleted vectors stay recoverable in HNSW files, and most stores compact lazily. The manifest should record the store's compaction policy; a compaction or key-rotation step belongs after any bulk re-index. |
+| Embedding-model migration | Drift-Adapter (EMNLP 2025) and shared-space model families (Voyage 4) make "swap the model without re-embedding everything" possible. The gate is the eval harness: 200–500 labelled queries before cutover. |
 
 ---
 
@@ -568,6 +633,33 @@ one enricher's params, so entity fields, FatturaPA facts and anything a model
 extracted were fields no question could reach. Implementations now declare the
 fields they write (`Registration.declares_fields`), and the router, the
 config check and the agent's schema read that one list.
+
+---
+
+## Evidence review, 2026-09-18
+
+Every invariant was re-checked against 2025–2026 primary sources; the full
+survey is `docs/STATE_OF_THE_ART.md`. The summary, for the maintainer who reads
+only this file:
+
+- **The contracts held.** Structure-first segmentation with zero overlap, the
+  section-prefix control arm, rank-based fusion, a rules router as the
+  reference, span-anchored gold and the retrieval failure rate are each the
+  measured winner or the field's direction of travel in 2026. No contract needed
+  changing.
+- **Two invariants were over-stated in the prose.** Invariant 1's percentages
+  come from an agent-memory study and are now scoped; invariant 5's "never" is
+  now "never alone". The code already behaved the corrected way.
+- **The reranker guidance was re-termed.** "Cross-encoder, not LLM" became
+  "small pointwise on LOOKUP, listwise or reasoning only on ITERATIVE", because
+  the best small rerankers are now LLM-based pointwise models.
+- **Six seams were added to the table above** (tool-exposed retrieval, late
+  chunking, visual, tree, learned sparse, graph), each with the evidence that
+  earns or withholds a default.
+- **Two ablation arms were added** to `configs/reference.yaml`: RRF `k=20` and
+  `overlap_tokens: 64`, so the two most-cited 2026 fusion and chunking findings
+  can be checked on any corpus.
+- **The first real-corpus ablation was run**; see `docs/ABLATION-pypi-docs.md`.
 
 ---
 

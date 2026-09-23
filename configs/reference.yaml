@@ -148,6 +148,11 @@ query:
     # Off in the reference path: a cross-encoder means a model download, and the
     # reference path must run offline. configs/full.yaml turns it on, and the
     # ablation measures what it buys.
+    #
+    # input_top_k is the main cost dial on the query path. The 2026 evidence
+    # (compute-allocation study on BRIGHT; "Drowning in Documents") puts the
+    # knee near 100 for pointwise rerankers, with gains flattening or reversing
+    # beyond it. 50 here keeps the offline path cheap; full.yaml uses 100.
     enabled: false
     impl: noop
     input_top_k: 50
@@ -207,6 +212,23 @@ eval:
       description: Everything takes LOOKUP. Measures what invariant 5 is worth.
       overrides:
         query.route.enabled: false
+
+    # Two arms added in the 2026-09 evidence review. Each checks a knob the
+    # literature most often finds mis-set; see docs/STATE_OF_THE_ART.md §2, §6.
+    - name: hybrid-context-rrf-k20
+      description: >
+        RRF with k=20 instead of the published 60. Bruch, Gai & Ingber (2023)
+        show RRF is sensitive to k; 60 is a prior, not a finding.
+      overrides:
+        query.fuse.k: 20
+
+    - name: hybrid-context-overlap
+      description: >
+        64 tokens of overlap on the structural segmenter. Three independent
+        2024-26 studies find overlap adds nothing once units carry context;
+        this arm produces the number on this corpus.
+      overrides:
+        ingestion.segment.overlap_tokens: 64
 
   # Published expectations, asserted against this corpus. A failure here means
   # something is wired wrong -- see SanityVerdict for the usual causes.

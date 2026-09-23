@@ -36,7 +36,9 @@ names one.
 | `configs/pypi-docs.yaml` | The ablation corpus and its eight-arm ladder. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Which invariant drove which contract, and what implementing it changed. |
 | [`docs/ABLATION.md`](docs/ABLATION.md) | The ablation report on a real corpus, and what it does and does not establish. |
-| [`docs/REVIEW.md`](docs/REVIEW.md) | Decisions taken, and the environment constraints on the report. |
+| [`docs/STATE_OF_THE_ART.md`](docs/STATE_OF_THE_ART.md) | The 2026 survey: what the published evidence says about every stage, and where it attaches to the frame. |
+| [`docs/ABLATION-pypi-docs.md`](docs/ABLATION-pypi-docs.md) | The first, eight-arm run on the same corpus, kept for the record; superseded by `ABLATION.md`. |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | Decisions taken, the environment constraints on the report, and each round's changes. |
 
 ```
                      ingestion (paid once)
@@ -153,24 +155,39 @@ What it does with the archive:
 ## The six invariants
 
 These are evidence-backed, and they shape the frame rather than sitting in a
-doc. `ARCHITECTURE.md` traces each one to the contract it forced.
+doc. `ARCHITECTURE.md` traces each one to the contract it forced;
+`docs/STATE_OF_THE_ART.md` §0 audits each against the 2025–2026 literature.
 
-1. **Retrieval is the bottleneck, not generation.** Retrieval failures drive
-   11–46% of end-to-end errors; utilisation failures stay at 4–8%. Precision@5
-   predicts answer accuracy at r=0.98.
+1. **Retrieval is the bottleneck, not generation.** Oracle-versus-retrieved gaps
+   of 7–30 points recur across 2025–26 document benchmarks. The often-quoted
+   split — retrieval failures 11–46% of questions, utilisation failures 4–8%,
+   Precision@5 correlated with accuracy at r=0.98 — is one 2026 agent-memory
+   study's result on nine configurations, and is directional rather than a law.
 2. **Ingestion cost is paid once, query cost forever.** Push work upstream.
-3. **Chunks must carry their context.** A 50–100 token summary prepended before
-   both embedding and lexical indexing: 5.7% → 2.9% top-20 retrieval failure.
-   Reranking: → 1.9%.
-4. **Hybrid beats either half.** Dense plus sparse, fused, then reranked.
-5. **Structured, numeric and temporal questions must never reach vector search.**
-6. **Nothing is optimized without a before/after number.**
+3. **Chunks must carry their context.** Anthropic's figures: a 50–100 token
+   summary prepended before both embedding and lexical indexing, 5.7% → 2.9%
+   top-20 retrieval failure; reranking → 1.9%. Independent replications find
+   smaller gains at real compute cost, and one 2026 study finds context can hurt
+   within-document questions. The size of the effect is measured per corpus,
+   not assumed.
+4. **Hybrid beats either half.** Still true with 2026 embedders (+3–5 nDCG
+   points over dense alone on every model tested), with two caveats: a weak leg
+   drags fusion down, and reranker depth has to be bounded.
+5. **Structured, numeric and temporal questions go to a structured executor,
+   never to vector search alone.** SQL over extracted fields beats
+   flattened-table retrieval on aggregation; text retrieval is still what
+   locates the table, so the structured path keeps a lookup fallback.
+6. **Nothing is optimized without a before/after number.** And no number
+   without a confidence interval.
 
 ## Reading order
 
 Start with `ARCHITECTURE.md`. Then `src/indexer/core/stages.py`, which is the
 whole frame: eight protocols, each stating its input and output, what it may
 assume, what it must preserve, and what its minimal implementation looks like.
+Then `docs/STATE_OF_THE_ART.md` for what the evidence says each implementation
+should be in 2026, and `docs/ABLATION-pypi-docs.md` for what the harness
+measured on a real corpus.
 
 ## Development
 

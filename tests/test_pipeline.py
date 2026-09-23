@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import pytest
 
@@ -123,8 +125,6 @@ class TestEndToEnd:
         # And the span really resolves to the text. The URI is converted with
         # the stdlib rather than by stripping "file://": on Windows that leaves
         # "/C:/..." behind, which is not a path.
-        from urllib.parse import urlparse
-        from urllib.request import url2pathname
 
         source = Path(url2pathname(urlparse(top.provenance.source_uri).path))
         assert top.unit.unit.text in source.read_text()

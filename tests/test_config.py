@@ -67,7 +67,7 @@ class TestOverlays:
     def test_full_inherits_from_reference(self) -> None:
         cfg, _ = load(FULL)
         assert cfg.paths.store == "./var/index"  # inherited
-        assert len(cfg.eval.ablations) == 6  # inherited
+        assert len(cfg.eval.ablations) == 8  # inherited
         assert cfg.query.rerank.enabled is True  # overridden
 
     def test_lists_replace_rather_than_append(self) -> None:

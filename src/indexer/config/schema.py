@@ -424,7 +424,9 @@ class SanityCheck(_Base):
 class EvalConfig(_Base):
     golden_set: str = "./eval/golden.jsonl"
     #: Depths for recall@k and nDCG@k. 5 is always included: Precision@5 is the
-    #: metric that predicts answer accuracy at r=0.98, so it is not optional.
+    #: cheap headline that tracked answer accuracy most closely in the
+    #: invariant-1 study, so it is not optional. 10 matters too: nDCG@10 is what
+    #: the 2025-26 benchmarks report.
     k_values: list[int] = Field(default_factory=lambda: [1, 5, 10, 20])
     #: Top-k for the retrieval failure rate. 20 matches the published numbers
     #: the sanity checks are calibrated against.

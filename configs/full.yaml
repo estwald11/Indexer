@@ -30,6 +30,14 @@ ingestion:
       # Classify per document. A text-native PDF is an order of magnitude
       # cheaper to parse than a scan and there is no reason to pay scan prices
       # for the 80% of a corpus that does not need it.
+      #
+      # 2026 note (docs/STATE_OF_THE_ART.md §1): every top-ten entry on
+      # OmniDocBench v1.6 is an end-to-end vision-language parser under 2B
+      # parameters (PaddleOCR-VL-1.6, MinerU2.5-Pro, GLM-OCR). Docling's value
+      # is its lossless document model and table structure (Granite-Docling,
+      # TEDS 0.97 at 258M), not raw OCR; run one of those VLMs behind it for
+      # scans. Score a parser change on the golden set, not on character error
+      # rate: OCR accuracy does not predict retrieval accuracy (InduOCRBench).
       - when: { media_type: "application/pdf", text_layer: true }
         impl: pymupdf4llm
       - when: { media_type: "application/pdf", text_layer: false }
@@ -37,9 +45,9 @@ ingestion:
         params:
           ocr: true
       - when: { media_type: "application/pdf", complexity: high }
-        impl: llamaparse           # managed API; complex tables and scans
-        params:
-          api_key: ${env:LLAMAPARSE_API_KEY}
+        impl: llamaparse           # managed API; complex tables and scans.
+        params:                    # Mistral OCR 4 batch ($2/1k pages) is the
+          api_key: ${env:LLAMAPARSE_API_KEY}   # 2026 price point to compare.
       - when: { media_type: "text/markdown" }
         impl: markdown
     default:
@@ -107,7 +115,9 @@ ingestion:
     indexes:
       - name: lexical
         kind: lexical
-        impl: bm25              # SPLADE-v3 where the extra cost is earned
+        impl: bm25              # BM25 stays the always-on lexical leg; it beat
+                                # text-embedding-3-large outright on 23k financial
+                                # queries (Akarsu et al., 2026).
       - name: dense
         kind: dense
         # A real bi-encoder: `impl: sentence_transformer` needs only the
@@ -135,6 +145,13 @@ ingestion:
         # accuracy ceiling; an ANN store trades some of it for latency that only
         # starts to matter past roughly a hundred thousand vectors. Until then
         # the win is the embedder, not the database.
+        # 2026 options, from docs/STATE_OF_THE_ART.md §4.1 -- none registered yet,
+        # so none is named: Qwen3-Embedding-4B (Apache-2.0, 32K context, MRL);
+        # managed voyage-4 / voyage-context-4 or Gemini Embedding 2. int8 storage
+        # with float rescoring of the top 100 is lossless in practice. A
+        # learned-sparse third leg (SPLADE-v3, OpenSearch neural-sparse v3-gte)
+        # must earn its place on the ablation table: fusion is only as good as
+        # its weakest leg.
       - name: fields
         kind: structured
         impl: sqlite
@@ -144,6 +161,13 @@ ingestion:
       # a registration away: adding one touches no other index and no frame
       # code. None ships yet, so none is named here: a config must not name an
       # implementation that does not exist, even disabled.
+      #
+      # When one is written (docs/STATE_OF_THE_ART.md): ViDoRe v3 (2026) says route
+      # per page rather than per corpus, fuse with the text legs and rerank with a
+      # *text* reranker; late-interaction vectors are 100-2000x a single vector,
+      # so truncate to 128 dims or binarise. A fifth kind, a table-of-contents
+      # tree with node summaries (PageIndex-style), is the seam for long
+      # single-document analytical questions.
 
 query:
   route:
@@ -184,8 +208,16 @@ query:
     enabled: true
     impl: cross_encoder
     params:
+      # Small pointwise reranker on the simple path. bge-reranker-v2-m3 is the
+      # reference; Qwen3-Reranker-4B (Apache-2.0, 32K context) and
+      # jina-reranker-v3.5 are the 2026 open alternatives, Voyage rerank-2.5 and
+      # Cohere Rerank 4 the managed ones. Listwise / reasoning rerankers
+      # (ReasonRank) show no gain on ordinary queries and belong on the
+      # iterative path only. See STATE_OF_THE_ART.md §7.
       model: BAAI/bge-reranker-v2-m3
-    input_top_k: 50
+    # 100, not 50: reranking gains grow to about k=100 and flatten or reverse
+    # beyond it (compute-allocation study, 2026; "Drowning in Documents").
+    input_top_k: 100
     output_top_k: 10
 
 accounting:

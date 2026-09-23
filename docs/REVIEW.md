@@ -170,6 +170,32 @@ work cannot test.
 
 ---
 
+## Round 3 (2026-09-18): evidence review
+
+Not a code round. Every invariant and every number quoted in the docs and
+docstrings was traced to its primary source and checked against what was
+published between the 2024 brief and September 2026. The survey is
+`docs/STATE_OF_THE_ART.md`; the changes it produced:
+
+| Where | What changed | Why |
+|---|---|---|
+| README, `ARCHITECTURE.md` | Invariant 1 re-scoped to its source (a 2026 agent-memory study on LoCoMo); invariant 5 softened from "never" to "never alone"; invariants 3 and 4 given their replication caveats. | The numbers were correct; their scope was not stated. |
+| `core/stages.py`, `eval/metrics.py`, `config/schema.py` | Docstrings that quoted the invariant-1 figures as general facts now state where they come from; reranker guidance restated as pointwise-small versus listwise-large. | Same. |
+| `configs/reference.yaml` | Arms `hybrid-context-rrf-k20` and `hybrid-context-overlap` added. | RRF `k` and overlap are the two knobs the 2026 literature most often finds mis-set. |
+| `configs/full.yaml` | `rerank.input_top_k: 100`; 2026 model names in comments; `sparse` and `tree` index entries sketched, disabled. | Reranking gains flatten near k=100; the new kinds are the seams the evidence opened. |
+| `eval/checks.py` | `check_index_surface` probes with the *rarest* context-only term, at a depth of at least its document frequency. | On the PyPI corpus it probed with "Changelog" (2,181 surfaces) and reported both indexes broken when both were correct. |
+| `eval/runner.py` | A sanity check that passes within tolerance no longer carries a "larger than expected" diagnosis. | Every PASS in the JSON report read as a warning. |
+| `configs/pypi-docs.yaml` | Arm 4 restates `regex_fields` in its enricher override. | Lists replace on overlay, so the arm had silently removed the structured path and measured two changes as one. |
+| `tests/test_pipeline.py` | `file://` URI handled with `url2pathname`. | The only test failure on Windows was a test-side path bug. |
+| `pyproject.toml` | mypy `python_version` pin removed. | Pinning 3.11 breaks type-checking on 3.12+ hosts where numpy's stubs use `type` statements. |
+| `docs/ABLATION-pypi-docs.md` | First ablation on the PyPI-docs corpus. | Deliverable 4 from round 2 had not been recorded. |
+
+What was deliberately *not* changed: no contract, no protocol, no schema field.
+The evidence review found the seams in the right places; it did not find a
+missing stage.
+
+---
+
 ## Round 2: the Italian enterprise archive (2026-09)
 
 What was built is summarised in the README and in ARCHITECTURE.md under "Round
