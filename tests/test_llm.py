@@ -182,3 +182,14 @@ def test_batches_are_split_polled_and_read_back_by_custom_id() -> None:
     assert out["r0"].cost_usd == pytest.approx(0.5)  # type: ignore[union-attr]
     assert isinstance(out["r2"], LLMError) and out["r2"].kind == "batch_errored"
     assert not client.calls  # nothing went through the live endpoint
+
+
+def test_an_sdk_too_old_for_a_parameter_stops_everything() -> None:
+    """Every call would fail the same way; recording it once per unit would
+    finish a build with nothing enriched."""
+    client = FakeClient(
+        lambda p: TypeError("create() got an unexpected keyword argument 'fallbacks'")
+    )
+    with pytest.raises(LLMError, match="set fallbacks: none") as err:
+        Claude(client).call(request(model="claude-opus-5", max_tokens=10, content="x"))
+    assert err.value.fatal

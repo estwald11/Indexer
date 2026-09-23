@@ -284,7 +284,7 @@ query:
     # fields before use and replaced by the rules decision when it fails.
     impl: llm
     params:
-      strategy: rules_first
+      strategy: rules_signals
       locale: it
       # A row is a document: "quante fatture" counts invoices, not passages.
       level: document

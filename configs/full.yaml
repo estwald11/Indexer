@@ -153,7 +153,7 @@ query:
     impl: llm
     params:
       model: claude-haiku-4-5
-      strategy: rules_first
+      strategy: rules_signals
     min_confidence: 0.6
     fallback_path: lookup
     paths:

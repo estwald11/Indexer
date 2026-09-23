@@ -19,10 +19,15 @@ it. A route that does not survive the check is not guessed at; the rules
 router's decision is used, and the decision log says why.
 
 ``strategy``
-    ``rules_first`` (default) -- the rules decide first, and the model is asked
-    only when they found no structured query, or when the question comes with
-    conversation to resolve. Well-formed questions stay at zero latency and
-    zero cost, and the model earns its call on the ones the rules miss.
+    ``rules_signals`` (default) -- the rules decide first. The model is asked
+    when they found no structured query *and* the question carries a structural
+    cue the rules could not use -- "quanto", a month, an amount, a field the
+    corpus knows -- or comes with conversation to resolve. A plain prose
+    question ("come si richiedono le ferie?") is a lookup whatever a model
+    says, and never waits for one.
+    ``rules_first`` -- the model is asked whenever the rules found no
+    structured query: every prose question pays a call, for the inferred
+    filters a model can add to a lookup.
     ``llm_first`` -- the model routes everything; the rules are the fallback.
 """
 
@@ -51,7 +56,7 @@ from indexer.plugin import StageImpl, dataclass_params
 
 __all__ = ["LLMRouter"]
 
-_STRATEGIES = ("rules_first", "llm_first")
+_STRATEGIES = ("rules_signals", "rules_first", "llm_first")
 #: What the model may write: every operator but ``in``, which the schema's
 #: scalar value cannot carry.
 _OPS = tuple(op for op in OPS if op != "in")
@@ -61,8 +66,8 @@ _NUMERIC = ("int", "float")
 @dataclass(frozen=True, slots=True)
 class LLMRouterParams(RulesRouterParams):
     model: str = "claude-opus-5"
-    #: rules_first | llm_first.
-    strategy: str = "rules_first"
+    #: rules_signals | rules_first | llm_first. See the module docstring.
+    strategy: str = "rules_signals"
     effort: str = "low"
     max_tokens: int = 1024
     fallbacks: str = "default"
@@ -139,7 +144,7 @@ class LLMRouter(StageImpl):
         super().__init__(params)
         self.rules = RulesRouter({k: v for k, v in params.items() if k in _RULES_KEYS})
         self.claude = Claude(client, fallbacks=str(self.param("fallbacks", "default")))
-        self.strategy = str(self.param("strategy", "rules_first"))
+        self.strategy = str(self.param("strategy", "rules_signals"))
         self.field_types: dict[str, str] = dict(self.rules.field_types)
         for name in self.rules.lexicon:
             self.field_types.setdefault(name, "")
@@ -156,12 +161,11 @@ class LLMRouter(StageImpl):
         rules = self.rules.route(query, ctx)
         rules = replace(rules, router=f"{self.IMPL}:rules", fingerprint=self.fingerprint().key())
         conversation = bool(query.context)
-        if (
-            self.strategy == "rules_first"
-            and not conversation
-            and str(rules.path) == RoutePath.STRUCTURED
-        ):
-            return replace(rules, reason=f"{rules.reason}; rules decided")
+        if self.strategy != "llm_first" and not conversation:
+            if str(rules.path) == RoutePath.STRUCTURED:
+                return replace(rules, reason=f"{rules.reason}; rules decided")
+            if self.strategy == "rules_signals" and not self.rules.signals(query.text):
+                return replace(rules, reason=f"{rules.reason}; no structural cue, rules decided")
 
         params = self._request(query)
         with ctx.accountant.measure(self.fingerprint()) as run:

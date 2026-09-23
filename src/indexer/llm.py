@@ -372,10 +372,16 @@ class Claude:
             raise
         except Exception as exc:
             # The SDK has already retried what is retryable (429, 5xx, network).
-            # Authentication, permission and not-found fail every call alike.
+            # Authentication, permission and not-found fail every call alike,
+            # and so does an SDK too old to take a parameter (a TypeError).
             status = getattr(exc, "status_code", None)
+            message = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, TypeError) and "fallbacks" in str(exc):
+                message += " -- upgrade the anthropic package, or set fallbacks: none"
             raise LLMError(
-                f"{type(exc).__name__}: {exc}", kind="api", fatal=status in (401, 403, 404)
+                message,
+                kind="api",
+                fatal=status in (401, 403, 404) or isinstance(exc, TypeError),
             ) from exc
         return self.result(message, params)
 

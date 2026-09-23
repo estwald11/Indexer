@@ -490,6 +490,29 @@ class RulesRouter(StageImpl):
             fingerprint=self.fingerprint().key(),
         )
 
+    def signals(self, text: str) -> list[str]:
+        """The structural cues in a question, whether or not a query could be
+        built from them: aggregate, numeric or temporal wording, a date, a
+        comparison, several parts, a field or a value the corpus knows.
+
+        What an LLM router consults before paying for a call: a question with
+        none of these ("come si richiedono le ferie?") is a lookup whatever a
+        model says, and asking one only adds its latency.
+        """
+        norm = _normalise(text)
+        cues = (
+            ("aggregate", _AGGREGATE),
+            ("numeric", _NUMERIC),
+            ("temporal", _TEMPORAL),
+            ("date", _DATE),
+            ("comparative", _COMPARATIVE),
+            ("multi_hop", _MULTI_HOP),
+        )
+        found = [name for name, rx in cues if rx.search(norm)]
+        if self._mentions(norm):
+            found.append("field")
+        return found
+
     # ------------------------------------------------------------- internals
 
     def _mentions(self, text: str) -> list[str]:

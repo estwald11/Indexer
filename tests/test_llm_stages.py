@@ -469,7 +469,11 @@ class TestLLMRouter:
             "sub_queries": [],
             "reason": "",
         }
-        a, _ = _router_setup(tmp_path, lambda p: message(data=answer))
+        a, _ = _router_setup(
+            tmp_path,
+            lambda p: message(data=answer),
+            "{level: document, strategy: rules_first}",
+        )
         resp = a.query_engine().query("le fatture grosse di Rossi")
         assert resp.decision.router == "llm:rules"
         assert "llm route rejected" in resp.decision.reason
@@ -501,6 +505,15 @@ class TestLLMRouter:
         assert resp.hits and "Pagamento a 30 giorni" in resp.hits[0].unit.unit.text
         log = (Path(a.paths.store) / "route-decisions.jsonl").read_text().splitlines()
         assert json.loads(log[-1])["rewritten_query"].startswith("Quali sono")
+
+    def test_a_plain_prose_question_does_not_wait_for_a_model(self, tmp_path: Path) -> None:
+        """No amount, date, aggregate or known field: a lookup whatever a model
+        says, so the default strategy does not pay for one."""
+        a, client = _router_setup(tmp_path, lambda p: AssertionError("no call expected"))
+        resp = a.query_engine().query("come funziona il pagamento a trenta giorni")
+        assert str(resp.decision.path) == RoutePath.LOOKUP
+        assert "no structural cue" in resp.decision.reason
+        assert not client.calls
 
     def test_an_unreachable_model_falls_back_to_the_rules(self, tmp_path: Path) -> None:
         a, _ = _router_setup(tmp_path, lambda p: ConnectionError("no route to host"))
