@@ -167,3 +167,49 @@ generation out of the library, and it means end-to-end correctness is judged by
 lexical containment over the retrieved passages — so the r=0.91 correlation
 with P@5 is arithmetic, not evidence. Invariant 1 is the one invariant this
 work cannot test.
+
+---
+
+## Round 2: the Italian enterprise archive (2026-09)
+
+What was built is summarised in the README and in ARCHITECTURE.md under "Round
+2". These are the decisions taken without asking, most arguable first.
+
+1. **The field extractor rejects rather than guesses.** A value must come with a
+   verbatim quote that is in the document and states it; anything else goes to
+   `indexer review`. That drops computed values ("30 giorni data fattura" is
+   not a due date) along with invented ones. The alternative -- index it and
+   flag it -- puts a nearly-right number where a structured query compares
+   against it.
+2. **Search filters hold for the document by default.** "Clauses of invoices
+   over 1,000 euros" means the invoice's total, stated in another passage.
+   `filter_level: unit` keeps the per-passage reading for identifiers.
+3. **The LLM router runs after the rules, not instead of them.** Rules answer
+   the questions they can read at zero cost; the model gets paraphrases and
+   follow-ups, and anything it writes is checked against the fields before use.
+   `strategy: llm_first` is one line away, for the ablation to decide.
+4. **Model defaults.** New model-backed stages default to `claude-opus-5` at low
+   effort (medium for the field extractor); the contextualiser stays on `claude-haiku-4-5`, as the brief
+   specified a small model for per-chunk work. Every one is a parameter, every
+   call is priced in the manifest, and cheaper models are an ablation arm, not a
+   default someone has to discover.
+5. **Principals are per MCP server process, never a tool argument.** A prompt
+   that reaches the agent must not be able to ask for someone else's documents.
+   It means one server per identity, which a gateway provides.
+6. **A document without an ACL is invisible** in the Italian preset
+   (`missing: deny`, with a default ACL for unruled folders). Safe by default,
+   and the preset's `default_acl` says who "everyone" is.
+7. **Failed enrichments do not fail documents.** `on_error: skip` indexes the
+   units and records the enricher as incomplete, so the next build retries
+   exactly what failed. A bad key or an unknown model still stops the build.
+
+Not done, and why:
+
+* **A Postgres backend.** The seam is documented; building it without a
+  deployment to size it against would guess at the wrong things.
+* **Live calls in tests.** Every model-backed path is tested against a fake
+  client that records what was sent. Nothing here has been run against the
+  API; the first `indexer prefill` on a real archive is where to look.
+* **OCR.** Scans go to Docling when it is installed and named as the PDF
+  parser's fallback (the preset shows the line); nothing OCRs without it.
+
