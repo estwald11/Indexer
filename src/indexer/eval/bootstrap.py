@@ -76,6 +76,9 @@ class HeuristicParams:
     #: router is measurable. A set of pure prose lookups cannot see invariant 5.
     structured_share: float = 0.2
     max_per_document: int = 4
+    #: Language of the structured questions: en or it. An Italian archive
+    #: asked in English measures a router nobody will use.
+    language: str = "en"
 
 
 @register(
@@ -285,6 +288,7 @@ class HeuristicBootstrapper(StageImpl):
         numeric = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
         dated = [v for v in values if hasattr(v, "isoformat")]
         textual = [v for v in values if isinstance(v, str)]
+        say = _TEMPLATES[str(self.param("language", "en"))]
 
         if numeric:
             ordered = sorted(numeric)
@@ -292,21 +296,13 @@ class HeuristicBootstrapper(StageImpl):
             # "greater than" always matches something.
             for t in _interior(ordered, limit, rng):
                 if t < ordered[-1]:
-                    out.append(
-                        (f"which entries have {pretty} greater than {t}", None, QueryType.NUMERIC)
-                    )
+                    out.append((say.greater(pretty, t), None, QueryType.NUMERIC))
         if dated:
             ordered = sorted(dated)
             # Strictly above the minimum, so "before" always matches something.
             for t in _interior(ordered, limit, rng):
                 if t > ordered[0]:
-                    out.append(
-                        (
-                            f"which entries have {pretty} before {t.isoformat()}",
-                            None,
-                            QueryType.TEMPORAL,
-                        )
-                    )
+                    out.append((say.before(pretty, t), None, QueryType.TEMPORAL))
         if textual:
             counts: dict[str, int] = {}
             for v in textual:
@@ -315,13 +311,47 @@ class HeuristicBootstrapper(StageImpl):
             # structured path than one the corpus actually groups by.
             common = [v for v, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
             for v in common[:limit]:
-                out.append((f"which entries have {pretty} {v}", v, QueryType.STRUCTURED))
+                out.append((say.equal(pretty, v), v, QueryType.STRUCTURED))
             if common:
-                out.append(
-                    (f"how many distinct {pretty} values are recorded", None, QueryType.STRUCTURED)
-                )
+                out.append((say.distinct(pretty), None, QueryType.STRUCTURED))
         rng.shuffle(out)
         return out[: limit + 1]
+
+
+@dataclass(frozen=True, slots=True)
+class _Phrasing:
+    """How a structured question is worded, per language. Each must be one the
+    rules router reads as the comparison it states -- the point of these items
+    is to measure the router, not to trip it on wording."""
+
+    greater: Any
+    before: Any
+    equal: Any
+    distinct: Any
+
+
+def _it_number(v: float) -> str:
+    """As an Italian writes it: "1.250,5", "480"."""
+    if float(v).is_integer():
+        return f"{int(v):,}".replace(",", ".")
+    whole, frac = f"{v:,.2f}".split(".")
+    return whole.replace(",", ".") + "," + frac
+
+
+_TEMPLATES: dict[str, _Phrasing] = {
+    "en": _Phrasing(
+        greater=lambda f, t: f"which entries have {f} greater than {t}",
+        before=lambda f, t: f"which entries have {f} before {t.isoformat()}",
+        equal=lambda f, v: f"which entries have {f} {v}",
+        distinct=lambda f: f"how many distinct {f} values are recorded",
+    ),
+    "it": _Phrasing(
+        greater=lambda f, t: f"quali documenti hanno {f} superiore a {_it_number(t)}",
+        before=lambda f, t: f"quali documenti hanno {f} prima del {t.strftime('%d/%m/%Y')}",
+        equal=lambda f, v: f"quali documenti hanno {f} {v}",
+        distinct=lambda f: f"quanti valori distinti di {f} sono registrati",
+    ),
+}
 
 
 def _interior(ordered: Sequence[Any], k: int, rng: random.Random) -> list[Any]:
@@ -419,6 +449,8 @@ class LLMParams:
     max_unit_chars: int = 4000
     drop_if_baseline_rank: int = 1
     drop_if_worse_than: int = 50
+    #: en or it: the language questions are written in.
+    language: str = "en"
 
 
 @register(
@@ -493,6 +525,22 @@ class LLMBootstrapper(StageImpl):
         "Query:"
     )
 
+    #: The same request, for an Italian archive: the question an Italian
+    #: employee would type, in Italian, about a company document.
+    PROMPT_IT = (
+        "Ecco un passaggio di un documento aziendale:\n"
+        "<passage>\n{passage}\n</passage>\n\n"
+        "Una persona che NON ha letto questo passaggio vuole trovarlo. Scrivi la "
+        "ricerca che digiterebbe, in italiano.\n\n"
+        "Regole:\n"
+        "- Chiedi l'informazione, non ripeterla.\n"
+        "- Evita le parole caratteristiche del passaggio. Usa parole comuni per gli "
+        "stessi concetti, come chi descrive un problema prima di conoscerne il termine.\n"
+        "- Mantieni il soggetto '{subject}', perché la ricerca non sia ambigua.\n"
+        "- Una riga, meno di quindici parole, senza virgolette né preamboli.\n\n"
+        "Ricerca:"
+    )
+
     def __init__(self, params: dict[str, Any], client: Any = None) -> None:
         super().__init__(params)
         self._client = client
@@ -532,6 +580,7 @@ class LLMBootstrapper(StageImpl):
             "drop_if_worse_than",
             "structured_share",
             "max_per_document",
+            "language",
         )
         return HeuristicBootstrapper(
             {k: self.param(k) for k in shared if self.param(k) is not None}
@@ -544,7 +593,7 @@ class LLMBootstrapper(StageImpl):
             messages=[
                 {
                     "role": "user",
-                    "content": self.PROMPT.format(passage=passage[:4000], subject=subject),
+                    "content": self._prompt().format(passage=passage[:4000], subject=subject),
                 }
             ],
         )
@@ -562,6 +611,9 @@ class LLMBootstrapper(StageImpl):
             getattr(usage, "input_tokens", 0) if usage else 0,
             getattr(usage, "output_tokens", 0) if usage else 0,
         )
+
+    def _prompt(self) -> str:
+        return self.PROMPT_IT if self.param("language", "en") == "it" else self.PROMPT
 
     def bootstrap(
         self,
@@ -654,5 +706,5 @@ class LLMBootstrapper(StageImpl):
             stage=self.STAGE,
             impl=self.IMPL,
             version=self.VERSION,
-            params_hash=hash_obj({**self._params, "_prompt": self.PROMPT}),
+            params_hash=hash_obj({**self._params, "_prompt": self._prompt()}),
         )

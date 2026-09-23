@@ -93,6 +93,7 @@ class EvalRunner:
             mrr=reciprocal_rank(grades),
             failed=retrieval_failed(grades, self.failure_k),
             routed_path=str(resp.decision.path),
+            predicted_type=str(resp.decision.query_type),
             latency_ms=elapsed,
             cost_usd=resp.cost_usd,
             hits_returned=len(hits),
