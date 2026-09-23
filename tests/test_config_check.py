@@ -69,7 +69,35 @@ def test_schema_only_skips_resolution(tmp_path: Path, capsys: pytest.CaptureFixt
     assert "schema only" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("name", ["reference.yaml", "pypi-docs.yaml"])
-def test_the_shipped_configs_resolve(name: str) -> None:
+@pytest.mark.parametrize(
+    "name", ["reference.yaml", "pypi-docs.yaml", "full.yaml", "it-enterprise.yaml"]
+)
+def test_the_shipped_configs_resolve(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """full.yaml named five implementations that did not exist until this held."""
+    monkeypatch.setenv("LLAMAPARSE_API_KEY", "sk-test")
     cfg, _ = load(Path("configs") / name)
     assert [f for f in resolve_all(cfg) if f.level == "error"] == []
+
+
+def test_every_arm_of_the_italian_preset_assembles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ablation arm that cannot be built is found by the run that needed it,
+    hours in. Every arm is assembled here -- stages constructed, models not
+    loaded, nothing called."""
+    from indexer.pipeline.build import assemble, declared_fields
+
+    monkeypatch.setenv("ARCHIVE_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("ARCHIVE_ROOT", str(tmp_path / "archive"))
+    (tmp_path / "archive").mkdir()
+    path = Path("configs") / "it-enterprise.yaml"
+    cfg, _ = load(path)
+    names, types = declared_fields(cfg)
+    # The router's vocabulary covers what the parser, the extractors and the
+    # classifier write -- the reason declares_fields exists.
+    assert {"importo_totale", "data_documento", "doc_type", "piva", "iban", "anno"} <= set(names)
+    assert types["importo_totale"] == "float" and types["data_documento"] == "date"
+    for arm in cfg.eval.ablations:
+        a = assemble(path, overrides=arm.overrides)
+        a.ingestion()
+        a.query_engine()

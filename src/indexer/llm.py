@@ -211,12 +211,20 @@ def cost_usd(
     if name is None:
         return 0.0
     p = table[name]
-    inp = float(p.get("input", 0.0))
+
+    def price(key: str, default: float) -> float:
+        # "input" or "input_per_mtok": configs have been written both ways.
+        for k in (key, f"{key}_per_mtok"):
+            if k in p:
+                return float(p[k])
+        return default
+
+    inp = price("input", 0.0)
     total = (
         usage.input_tokens * inp
-        + usage.output_tokens * float(p.get("output", 0.0))
-        + usage.cache_read_tokens * float(p.get("cache_read", inp * 0.1))
-        + usage.cache_write_tokens * float(p.get("cache_write", inp * 1.25))
+        + usage.output_tokens * price("output", 0.0)
+        + usage.cache_read_tokens * price("cache_read", inp * 0.1)
+        + usage.cache_write_tokens * price("cache_write", inp * 1.25)
     ) / 1_000_000
     return total * 0.5 if batch else total
 

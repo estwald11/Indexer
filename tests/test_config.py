@@ -100,6 +100,26 @@ class TestInterpolation:
         finally:
             os.environ["LLAMAPARSE_API_KEY"] = saved
 
+    def test_a_reference_to_a_reference_resolves_all_the_way(self) -> None:
+        """``${paths.store}`` inside a params block, where paths.store itself
+        reads an environment variable: the filesystem was handed a directory
+        literally named "${env:STATE:./var}"."""
+        from indexer.config.loader import interpolate
+
+        os.environ.pop("INDEXER_TEST_STATE", None)
+        raw = {
+            "paths": {"store": "${env:INDEXER_TEST_STATE:./var}/index"},
+            "index": {"path": "${paths.store}/fields.db"},
+        }
+        assert interpolate(raw, raw)["index"]["path"] == "./var/index/fields.db"
+
+    def test_a_reference_cycle_is_an_error(self) -> None:
+        from indexer.config.loader import interpolate
+
+        raw = {"a": "${b}", "b": "${a}"}
+        with pytest.raises(ConfigError, match="refers back to itself"):
+            interpolate(raw, raw)
+
     def test_internal_reference_resolves(self) -> None:
         cfg, _ = load(FULL)
         fields = next(i for i in cfg.ingestion.index.indexes if i.name == "fields")

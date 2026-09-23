@@ -2,17 +2,19 @@
 #
 # This file exists to demonstrate the claim: everything below is a config
 # change. No implementation named here requires a frame edit to introduce --
-# each registers itself and is resolved by name.
+# each registers itself and is resolved by name, and `indexer check` resolves
+# every one of them (it used to name five that did not exist, and say OK).
 #
 # Nothing here is a recommendation for your corpus. These are the reference
 # starting points from the brief, and each is expected to be replaced once the
-# ablation table on a real corpus says something different.
+# ablation table on a real corpus says something different. For an Italian
+# company archive, start from configs/it-enterprise.yaml instead.
 
 extends: reference.yaml
 
 project:
   name: full
-  description: Hybrid retrieval with LLM contextualisation, visual index and reranking.
+  description: Hybrid retrieval with LLM contextualisation, extraction and reranking.
 
 corpus:
   sources:
@@ -45,45 +47,61 @@ ingestion:
 
   enrich:
     enabled: true
+    # Units per model call, and calls in flight per batch. The first call of a
+    # batch goes alone, so the others read the prompt cache it wrote.
     batch_size: 24
     max_concurrency: 8
+    # A refused or failed enrichment indexes the unit without it, and the next
+    # build retries only what failed.
+    on_error: skip
     enrichers:
-      # Invariant 3. A small fast model, prompt-cached over the parent document
-      # so the document is sent once rather than once per chunk -- which is what
-      # makes this affordable at corpus scale.
+      # Invariant 3. A small fast model over the parent document: per-unit calls
+      # with the document as a cached prefix when it is long enough to cache
+      # (4,096 tokens on Haiku 4.5), one call per batch when it is not.
       #
-      # scope: document means any edit to the parent invalidates every unit's
+      # Document-scoped: any edit to the parent invalidates every unit's
       # context. That is the honest cost of document-level context, and it is
       # stated here rather than discovered during a rebuild.
       - impl: llm_contextualizer
         scope: document
         params:
-          model: claude-haiku-4-5-20251001
+          model: claude-haiku-4-5
           prompt_cache: true
           target_tokens: 75        # the 50-100 band from the published numbers
-          max_tokens: 128
+          max_tokens: 160
+
+      # What each document is. One call per document, labels as fields.
+      - impl: llm_classifier
+        scope: document
+        params:
+          model: claude-haiku-4-5
+          labels:
+            doc_type: [contract, amendment, invoice, policy, correspondence, other]
 
       # Invariant 5. Extracted fields are what the structured path answers from;
       # without them a numeric or temporal question has nowhere to go but the
-      # vector index.
+      # vector index. Every value must be quoted from the document, or it goes
+      # to review (`indexer review`) instead of the index.
       - impl: llm_field_extractor
-        scope: unit
+        scope: document
         params:
-          model: claude-haiku-4-5-20251001
-          schema:
-            effective_date: date
-            expiry_date: date
-            contract_value: float
-            currency: str
-            counterparty: str
-            governing_law: str
-
-      - impl: llm_classifier
-        scope: unit
-        params:
-          model: claude-haiku-4-5-20251001
-          labels:
-            doc_section: [recitals, definitions, obligations, termination, schedules]
+          model: claude-haiku-4-5
+          locale: en
+          date_order: mdy
+          schemas:
+            contract:
+              effective_date: { type: date }
+              expiry_date: { type: date }
+              contract_value: { type: float }
+              currency: { type: str }
+              counterparty: { type: str }
+              governing_law: { type: str }
+            invoice:
+              invoice_number: { type: str }
+              invoice_date: { type: date }
+              total_amount: { type: float }
+              currency: { type: str }
+              counterparty: { type: str }
 
   index:
     indexes:
@@ -92,10 +110,10 @@ ingestion:
         impl: bm25              # SPLADE-v3 where the extra cost is earned
       - name: dense
         kind: dense
-        # A real bi-encoder, and the one part of this file that is implemented
-        # rather than aspirational: `impl: sentence_transformer` resolves, needs
-        # only the `dense-sentence-transformer` extra, and is the same store the
-        # reference path uses with its embedder swapped.
+        # A real bi-encoder: `impl: sentence_transformer` needs only the
+        # `dense-sentence-transformer` extra, and is the same store the
+        # reference path uses with its embedder swapped. For a corpus that is
+        # not English, `multilingual_embedding` (bge-m3, multilingual-e5).
         impl: sentence_transformer
         params:
           model: BAAI/bge-large-en-v1.5
@@ -117,38 +135,25 @@ ingestion:
         # accuracy ceiling; an ANN store trades some of it for latency that only
         # starts to matter past roughly a hundred thousand vectors. Until then
         # the win is the embedder, not the database.
-        #
-        #   impl: qdrant
-        #   params:
-        #     url: ${env:QDRANT_URL:http://localhost:6333}
-        #     collection: ${project.name}
-        #     model: BAAI/bge-large-en-v1.5
-        #     dims: [256, 1024]
-        #     prefetch_dim: 256
       - name: fields
         kind: structured
         impl: sqlite
         params:
           path: ${paths.store}/fields.db
-      # The fourth kind. Adding it touched no other index, no dispatch table and
-      # no frame code -- which was the requirement.
-      #
-      # Off by default: decisive on slides, decks and scans, a loss on dense
-      # scientific prose. Enable per corpus, and let the ablation decide.
-      - name: visual
-        kind: visual
-        enabled: false
-        impl: colqwen
-        params:
-          model: colqwen2.5
-          batch_size: 4
+      # A fourth kind -- a visual (ColPali-style) index over page images -- is
+      # a registration away: adding one touches no other index and no frame
+      # code. None ships yet, so none is named here: a config must not name an
+      # implementation that does not exist, even disabled.
 
 query:
   route:
-    impl: llm_router
+    # The rules router decides the questions it can read, at zero latency; the
+    # model routes the paraphrases and follow-ups, and every route it writes
+    # is checked against the corpus's fields before it is used.
+    impl: llm
     params:
-      model: claude-haiku-4-5-20251001
-      fallback: rules            # rules router on timeout or low confidence
+      model: claude-haiku-4-5
+      strategy: rules_first
     min_confidence: 0.6
     fallback_path: lookup
     paths:
@@ -177,7 +182,7 @@ query:
 
   rerank:
     enabled: true
-    impl: bge_reranker
+    impl: cross_encoder
     params:
       model: BAAI/bge-reranker-v2-m3
     input_top_k: 50
@@ -185,28 +190,25 @@ query:
 
 accounting:
   enabled: true
+  # USD per million tokens. Cache reads default to a tenth of input and
+  # five-minute cache writes to 1.25x.
   prices:
-    claude-haiku-4-5-20251001: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    claude-haiku-4-5: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
 
 eval:
   judge:
-    impl: hybrid_judge
+    # Exact comparison for numbers, dates and booleans: cheaper, deterministic,
+    # and strictly more reliable than asking a model whether two dates match.
+    impl: exact
     params:
-      # Exact comparison for numbers and dates: cheaper, deterministic, and
-      # strictly more reliable than asking a model whether two dates match.
       exact_types: [number, date, boolean]
-      model: claude-haiku-4-5-20251001
   bootstrap:
     impl: llm_bootstrap
     params:
-      model: claude-haiku-4-5-20251001
+      model: claude-haiku-4-5
       target_size: 300
-      # Reject questions a cheap lexical baseline already answers from the wrong
-      # unit: items no system can distinguish measure nothing.
-      specificity_filter: true
-      type_distribution:
-        factual: 0.4
-        structured: 0.2
-        temporal: 0.1
-        comparative: 0.1
-        multi_hop: 0.2
+      # A fifth of the set asks structured questions, so the router is
+      # measurable; the rest are paraphrased away from the passage's wording.
+      structured_share: 0.2
+      # Items a cheap lexical baseline already ranks first measure nothing.
+      drop_if_baseline_rank: 1

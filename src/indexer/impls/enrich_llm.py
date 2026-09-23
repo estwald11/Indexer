@@ -109,8 +109,12 @@ class ClassifierParams:
     #: passive" is evidence too. Part of the cache key, so moving a file
     #: re-classifies it.
     metadata_keys: list[str] = field(
-        default_factory=lambda: ["name", "relpath", "doc_title", "subject", "sender"]
+        default_factory=lambda: ["name", "relpath", "doc_title", "email_subject", "email_from"]
     )
+    #: {label: metadata key} for labels a parser already states: a FatturaPA's
+    #: ``tipo_documento`` is the document type, exactly. When every label is
+    #: known that way, and allowed, no call is made.
+    known: dict[str, str] = field(default_factory=dict)
     #: Domain guidance appended to the prompt.
     instructions: str = ""
     effort: str = "low"
@@ -120,6 +124,9 @@ class ClassifierParams:
     def __post_init__(self) -> None:
         if not self.labels:
             raise ValueError("labels: at least one label set is required")
+        unknown = set(self.known) - set(self.labels)
+        if unknown:
+            raise ValueError(f"known: {sorted(unknown)} are not labels")
         for name, values in self.labels.items():
             if not values or len(set(values)) != len(values):
                 raise ValueError(f"labels.{name}: values must be non-empty and distinct")
@@ -171,6 +178,7 @@ class LLMClassifier(ModelEnricher):
             {
                 "text": str(hash_text(_document_excerpt(document, self._max_chars))),
                 "metadata": _metadata(document, self.param("metadata_keys", [])),
+                "known": self._known(document),
             }
         )
 
@@ -178,9 +186,20 @@ class LLMClassifier(ModelEnricher):
     def _max_chars(self) -> int:
         return int(self.param("max_chars", 12_000))
 
+    def _known(self, document: ParsedDocument) -> dict[str, str] | None:
+        """Every label, read from metadata, when the parser states them all."""
+        known: dict[str, str] = self.param("known", {}) or {}
+        labels: dict[str, list[str]] = self.param("labels", {})
+        if not known or set(known) != set(labels):
+            return None
+        out = {name: str(document.metadata.get(key, "")) for name, key in known.items()}
+        return out if all(v in labels[n] for n, v in out.items()) else None
+
     def requests_for(
         self, units: Sequence[Unit], ctx: EnrichContext
     ) -> list[tuple[str, dict[str, Any]]]:
+        if self._known(ctx.document) is not None:
+            return []
         labels: dict[str, list[str]] = self.param("labels", {})
         descriptions: dict[str, str] = self.param("descriptions", {}) or {}
         lines = []
@@ -218,16 +237,20 @@ class LLMClassifier(ModelEnricher):
         ctx: EnrichContext,
         answers: Mapping[str, LLMResult | LLMError],
     ) -> list[Enrichment | None]:
-        answer = answers.get("doc")
-        if not isinstance(answer, LLMResult) or not isinstance(answer.data, dict):
-            return [None] * len(units)
         labels: dict[str, list[str]] = self.param("labels", {})
-        chosen = {
-            name: str(answer.data[name])
-            for name, allowed in labels.items()
-            if str(answer.data.get(name)) in allowed
-        }
-        if len(chosen) != len(labels):
+        known = self._known(ctx.document)
+        answer = answers.get("doc")
+        if known is not None:
+            chosen = known
+        elif isinstance(answer, LLMResult) and isinstance(answer.data, dict):
+            chosen = {
+                name: str(answer.data[name])
+                for name, allowed in labels.items()
+                if str(answer.data.get(name)) in allowed
+            }
+            if len(chosen) != len(labels):
+                return [None] * len(units)
+        else:
             return [None] * len(units)
         fields: dict[str, FieldValue] = dict(chosen) if self.param("as_fields", True) else {}
         fp = self.fingerprint().key()
@@ -237,7 +260,7 @@ class LLMClassifier(ModelEnricher):
             labels=dict(chosen),
             fields=fields,
             scope=self.scope,
-            **spent(answer),
+            **(spent(answer) if isinstance(answer, LLMResult) else {}),
         )
         rest = Enrichment(
             enricher=self.name, fingerprint=fp, labels=dict(chosen), fields=fields, scope=self.scope
@@ -282,6 +305,10 @@ class FieldExtractorParams:
     effort: str = "medium"
     max_tokens: int = 2048
     fallbacks: str = "default"
+    #: Metadata values that mean "do not extract": {formato: FatturaPA} -- a
+    #: parser read that document's facts exactly, and a model would only be
+    #: paid to guess at them.
+    skip_when: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         declared: dict[str, str] = {}
@@ -365,7 +392,14 @@ class LLMFieldExtractor(ModelEnricher):
             {
                 "text": str(hash_text(_document_excerpt(document, self._max_chars))),
                 "doc_type": self._doc_type(prior),
+                "skip": self._skipped(document),
             }
+        )
+
+    def _skipped(self, document: ParsedDocument) -> bool:
+        conditions: dict[str, Any] = self.param("skip_when", {}) or {}
+        return bool(conditions) and all(
+            document.metadata.get(k) == v for k, v in conditions.items()
         )
 
     @property
@@ -392,7 +426,7 @@ class LLMFieldExtractor(ModelEnricher):
     ) -> list[tuple[str, dict[str, Any]]]:
         doc_type = self._type_of(units, ctx)
         schema = self._schema_for(doc_type)
-        if not schema:
+        if not schema or self._skipped(ctx.document):
             return []
         lines = []
         for name, decl in schema.items():
@@ -443,8 +477,8 @@ class LLMFieldExtractor(ModelEnricher):
         fp = self.fingerprint().key()
         doc_type = self._type_of(units, ctx)
         schema = self._schema_for(doc_type)
-        if not schema:
-            # Nothing to extract for this type: an answer, and a cacheable one.
+        if not schema or self._skipped(ctx.document):
+            # Nothing to extract for this document: an answer, and a cacheable one.
             empty = Enrichment(enricher=self.name, fingerprint=fp, scope=self.scope)
             return [empty] * len(units)
         answer = answers.get("doc")

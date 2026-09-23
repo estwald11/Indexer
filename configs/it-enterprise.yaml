@@ -1,0 +1,417 @@
+# An Italian company's digital archive, indexed for an agent that acts on it.
+#
+# E-invoices (FatturaPA, often signed as .p7m and delivered by PEC), contracts,
+# minutes and procedures in PDF and Word, spreadsheets, email, and folders that
+# different people may read. Every choice below is a starting point for the
+# ablation on your own archive, not a conclusion -- and every one is config.
+#
+# Before the first build:
+#   ARCHIVE_ROOT        the folder to index (read-only is fine: nothing is
+#                       written under it)
+#   ARCHIVE_STATE       where the indexes, cache and manifests live
+#   ANTHROPIC_API_KEY   (or `ant auth login`) for the model-backed stages
+#   acl_rules           below: who may read which folder
+#
+#   indexer check   configs/it-enterprise.yaml
+#   indexer prefill configs/it-enterprise.yaml   # first build's model calls by batch, half price
+#   indexer build   configs/it-enterprise.yaml
+#   indexer review  configs/it-enterprise.yaml   # extracted values held back for a human
+#   indexer mcp     configs/it-enterprise.yaml --principal group:amministrazione
+#
+# Data protection: the model-backed stages send document text to the Claude
+# API, and the dense index's model is downloaded once and runs locally. Both
+# need a legal basis and a record of processing like any other processor; the
+# `voyage_embedding` alternative sends every chunk to a second one.
+
+schema_version: 1
+
+project:
+  name: archivio
+  description: Archivio documentale aziendale, indicizzato per un agente.
+
+paths:
+  store: ${env:ARCHIVE_STATE:./var/archivio}/index
+  cache: ${env:ARCHIVE_STATE:./var/archivio}/cache
+  manifests: ${env:ARCHIVE_STATE:./var/archivio}/manifests
+  artifacts: ${env:ARCHIVE_STATE:./var/archivio}/artifacts
+
+corpus:
+  sources:
+    - impl: filesystem
+      namespace: archivio
+      params:
+        root: ${env:ARCHIVE_ROOT:./data}
+        include:
+          - "**/*.pdf"
+          - "**/*.p7m"
+          - "**/*.xml"
+          - "**/*.eml"
+          - "**/*.docx"
+          - "**/*.xlsx"
+          - "**/*.html"
+          - "**/*.htm"
+          - "**/*.txt"
+          - "**/*.md"
+          - "**/*.zip"
+        exclude: ["**/.*", "**/~$*", "**/Thumbs.db", "**/desktop.ini"]
+        max_bytes: 50000000
+        # Signed files, email and PEC (with their attachments and daticert.xml)
+        # and zip archives are opened: the invoice inside a PEC inside a zip is
+        # a document, and the envelope's facts -- signer, PEC id, subject --
+        # travel with it.
+        expand: [p7m, eml, zip]
+        # A fact the folder layout already states is known, not inferred.
+        path_metadata:
+          anno: '(?:^|/)((?:19|20)\d\d)(?:/|$)'
+        # First matching rule wins; a sidecar file's "acl" overrides. Adapt to
+        # your folders and your directory's groups.
+        acl_rules:
+          - { pattern: "Amministrazione/**", acl: ["group:amministrazione", "group:direzione"] }
+          - { pattern: "Personale/**", acl: ["group:hr", "group:direzione"] }
+          - { pattern: "Commerciale/**", acl: ["group:commerciale", "group:direzione"] }
+          - { pattern: "Legale/**", acl: ["group:legale", "group:direzione"] }
+        default_acl: ["group:dipendenti"]
+
+ingestion:
+  parse:
+    enabled: true
+    routes:
+      # FatturaPA: every figure exact and typed, straight from the XML. An XML
+      # file that is not an invoice fails here and is listed in the build's
+      # failures; route such folders elsewhere if the archive holds them.
+      - when: { media_type: application/xml }
+        impl: fatturapa
+      - when: { media_type: message/rfc822 }
+        impl: email
+        params: { labels: it }
+      # Outlook .msg needs extract-msg, which is GPL-3.0: check it fits how you
+      # distribute before enabling (and add "**/*.msg" to include).
+      # - when: { media_type: application/vnd.ms-outlook }
+      #   impl: msg
+      #   params: { labels: it }
+      - when: { media_type: application/pdf }
+        impl: pdf_text
+        # A scan has no text layer. With Docling installed (`pip install
+        # docling`), OCR it instead of indexing its metadata alone:
+        # params: { fallback: { impl: docling, params: { ocr: true } } }
+      - when: { media_type: application/vnd.openxmlformats-officedocument.wordprocessingml.document }
+        impl: docx
+      - when: { media_type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet }
+        impl: xlsx
+      - when: { media_type: text/html }
+        impl: html
+      - when: { media_type: text/markdown }
+        impl: markdown
+    default:
+      impl: text
+    on_error: skip
+
+  segment:
+    impl: structural
+    max_tokens: 400
+    min_tokens: 48
+    params:
+      merge_below_tokens: 24
+
+  enrich:
+    enabled: true
+    # Units per model call, and calls in flight per batch.
+    batch_size: 16
+    max_concurrency: 4
+    # A refused or failed enrichment indexes the unit without it; the next
+    # build retries only what failed.
+    on_error: skip
+    enrichers:
+      # The heading trail: free, and the control arm for everything below.
+      - impl: section_prefix
+        scope: unit
+
+      # VAT numbers, fiscal codes, IBANs and email addresses, kept only when
+      # their check digit holds. `find_entity` searches them.
+      - impl: entities
+
+      # The year in the folder path, as a field the router can name.
+      - impl: regex_fields
+        params:
+          locale: it
+          date_order: dmy
+          from_metadata: [anno]
+
+      # Link identifiers to the company's own registers -- the customer and
+      # supplier exports from the ERP, ";"-separated is fine. Uncomment with
+      # the real paths: a register's contents are part of the fingerprint, so
+      # updating it re-links exactly the units that need it.
+      # - impl: master_data
+      #   params:
+      #     sources:
+      #       - path: ./registri/clienti.csv
+      #         match: { fields: [piva, cessionario_piva], column: PartitaIVA }
+      #         emit: { CodiceCliente: codice_cliente, RagioneSociale: cliente }
+      #       - path: ./registri/fornitori.csv
+      #         match: { fields: [piva, cedente_piva], column: PartitaIVA }
+      #         emit: { CodiceFornitore: codice_fornitore, RagioneSociale: fornitore }
+
+      # What each document is -- one call per document, whatever its length.
+      # A FatturaPA says it itself, and is not asked.
+      - impl: llm_classifier
+        scope: document
+        params:
+          labels:
+            doc_type:
+              - fattura
+              - nota_di_credito
+              - preventivo
+              - offerta
+              - ordine
+              - ddt
+              - contratto
+              - verbale
+              - delibera
+              - bilancio
+              - busta_paga
+              - comunicazione
+              - procedura
+              - manuale
+              - report
+              - altro
+          descriptions:
+            ddt: documento di trasporto che accompagna la merce spedita
+            verbale: verbale di riunione, assemblea o consiglio
+            delibera: delibera di un organo societario
+            comunicazione: lettera, email o circolare
+            procedura: procedura interna, istruzione operativa, regolamento
+          known: { doc_type: tipo_documento }
+          instructions: >-
+            I documenti sono di un'azienda italiana. Scegli "altro" solo se
+            nessun altro tipo si applica.
+
+      # The facts each type of document states, as typed fields -- each value
+      # quoted from the document and checked, or held back for review. The
+      # names match the ones a FatturaPA's parser writes, so an electronic
+      # invoice and a PDF one answer the same question; the electronic ones
+      # are skipped, because their parser already read them exactly.
+      - impl: llm_field_extractor
+        scope: document
+        params:
+          skip_when: { formato: FatturaPA }
+          locale: it
+          date_order: dmy
+          schemas:
+            fattura:
+              numero_documento: { type: str, description: numero della fattura }
+              data_documento: { type: date, description: data di emissione }
+              importo_totale: { type: float, description: "totale del documento in euro, IVA inclusa" }
+              imponibile: { type: float }
+              cedente_denominazione: { type: str, description: chi emette la fattura }
+              cedente_piva: { type: str, validate: piva }
+              cessionario_denominazione: { type: str, description: chi la riceve }
+              data_scadenza: { type: date, description: "scadenza del pagamento, se scritta" }
+            nota_di_credito:
+              numero_documento: { type: str }
+              data_documento: { type: date }
+              importo_totale: { type: float }
+              cedente_denominazione: { type: str }
+            ordine:
+              numero_documento: { type: str, description: numero dell'ordine }
+              data_documento: { type: date }
+              importo_totale: { type: float }
+              controparte: { type: str, description: fornitore o cliente dell'ordine }
+            ddt:
+              numero_documento: { type: str }
+              data_documento: { type: date }
+              controparte: { type: str, description: destinatario della merce }
+            preventivo:
+              data_documento: { type: date }
+              importo_totale: { type: float }
+              controparte: { type: str }
+              data_validita: { type: date, description: fino a quando vale l'offerta }
+            contratto:
+              controparte: { type: str, description: l'altra parte del contratto }
+              data_stipula: { type: date }
+              data_decorrenza: { type: date }
+              data_scadenza: { type: date }
+              valore_contratto: { type: float, description: "valore economico, se scritto" }
+              rinnovo_tacito: { type: bool, description: se si rinnova tacitamente }
+              preavviso_disdetta: { type: str, description: termine di preavviso per la disdetta }
+              foro_competente: { type: str }
+            verbale:
+              data_documento: { type: date, description: data della riunione }
+              organo: { type: str, description: "assemblea, consiglio o comitato" }
+
+      # Invariant 3: a situating context per passage, in Italian. A small fast
+      # model: one call per batch for documents under its cache minimum (most
+      # invoices, letters and emails), per-passage calls over the cached
+      # document above it.
+      - impl: llm_contextualizer
+        scope: document
+        params:
+          model: claude-haiku-4-5
+          target_tokens: 75
+          system: >-
+            Il documento proviene dall'archivio di un'azienda italiana. Nomina
+            tipo di documento, controparte, data e numero quando ci sono.
+
+  index:
+    batch_size: 128
+    indexes:
+      # Italian analysis: accents folded, function words removed, light
+      # stemming ("fatture" finds "fattura"); a text too short to tell its
+      # language is read as Italian.
+      - name: lexical
+        kind: lexical
+        impl: bm25
+        params:
+          fallback_language: it
+      # A bi-encoder trained on Italian, with its own prefixes. bge-m3 is
+      # stronger and wants a GPU; for an offline smoke test, `hash_embedding`.
+      - name: dense
+        kind: dense
+        impl: multilingual_embedding
+        params:
+          preset: ${env:EMBED_PRESET:multilingual-e5-base}
+          device: ${env:EMBED_DEVICE:cpu}
+      - name: fields
+        kind: structured
+        impl: sqlite
+        params:
+          path: ${paths.store}/fields.db
+
+query:
+  route:
+    enabled: true
+    # Rules first -- Italian operators, dates and amounts as Italians write
+    # them -- and the model for paraphrases and follow-ups, checked against the
+    # fields before use and replaced by the rules decision when it fails.
+    impl: llm
+    params:
+      strategy: rules_first
+      locale: it
+      # A row is a document: "quante fatture" counts invoices, not passages.
+      level: document
+      default_date_field: data_documento
+      default_measure: importo_totale
+      field_aliases:
+        importo_totale: [importo, importi, totale, ammontare]
+        data_documento: [data, emessa, emesse, datata, datate]
+        data_scadenza: [scadenza, scade, scadono, scadenze]
+        cedente_denominazione: [fornitore, fornitori, emittente]
+        cessionario_denominazione: [cliente, clienti, destinatario]
+        controparte: [controparte, controparti]
+        doc_type: [tipo, tipologia]
+      value_aliases:
+        doc_type:
+          fattura: [fattura, fatture]
+          nota_di_credito: [nota di credito, note di credito]
+          contratto: [contratto, contratti]
+          ordine: [ordine, ordini]
+          ddt: [ddt, documento di trasporto, documenti di trasporto]
+          preventivo: [preventivo, preventivi]
+          verbale: [verbale, verbali]
+      instructions: >-
+        L'archivio è di un'azienda italiana. Le domande sono di solito in
+        italiano. "Fornitore" è cedente_denominazione, "cliente" è
+        cessionario_denominazione.
+    paths:
+      structured:
+        targets: [fields]
+      lookup:
+        targets: [lexical, dense]
+        top_k: { lexical: 50, dense: 50 }
+        step_budget: 1
+      iterative:
+        targets: [lexical, dense]
+        top_k: { lexical: 30, dense: 30 }
+        step_budget: 3
+
+  retrieve:
+    impl: parallel
+    default_top_k: 50
+    on_index_error: degrade
+
+  fuse:
+    impl: rrf
+    k: 60
+    weights: { lexical: 1.0, dense: 1.0 }
+
+  rerank:
+    # Multilingual cross-encoder; Italian included.
+    enabled: true
+    impl: cross_encoder
+    params:
+      model: BAAI/bge-reranker-v2-m3
+    input_top_k: 40
+    output_top_k: 10
+
+  # Every tool call states who is asking; a document without an ACL is
+  # visible to no one until a rule or a sidecar gives it one.
+  access:
+    enabled: true
+    missing: deny
+
+  # What an agent reads: at most three passages per document, the same
+  # passage filed in three folders shown once, a neighbour on each side.
+  shape:
+    enabled: true
+    max_per_document: 3
+    collapse_duplicates: true
+    expand_neighbors: 1
+
+cache:
+  impl: filesystem
+  enabled: true
+  params:
+    root: ${paths.cache}
+  # A removed document's text, contexts and fields leave the cache with it.
+  purge_unreferenced: true
+
+accounting:
+  enabled: true
+  # USD per million tokens (September 2026 list prices); keep them current.
+  prices:
+    claude-haiku-4-5: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    claude-sonnet-5: { input_per_mtok: 2.0, output_per_mtok: 10.0 }
+    claude-opus-5: { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+
+eval:
+  golden_set: ${env:ARCHIVE_STATE:./var/archivio}/eval/golden.jsonl
+  k_values: [1, 5, 10, 20]
+  failure_k: 20
+  match: span_overlap
+  min_overlap: 0.5
+  report_dir: ${env:ARCHIVE_STATE:./var/archivio}/eval
+  judge:
+    impl: exact
+    params:
+      exact_types: [number, date, boolean]
+  bootstrap:
+    impl: heuristic
+    params:
+      language: it
+      target_size: 200
+      structured_share: 0.25
+
+  # Each arm differs from the first in the listed keys only. Model-free arms
+  # first: they say what the models are being paid to beat.
+  ablations:
+    - name: completo
+      description: Everything above.
+      overrides: {}
+    - name: senza-contesto-llm
+      description: Heading trail only. What the LLM contexts are worth.
+      overrides:
+        ingestion.enrich.enrichers[llm_contextualizer].enabled: false
+    - name: router-a-regole
+      description: The rules router alone. What the model router is worth.
+      overrides:
+        query.route.impl: rules
+    - name: solo-lessicale
+      description: BM25 alone. What the dense index is worth.
+      overrides:
+        ingestion.index.indexes[dense].enabled: false
+        query.route.paths.lookup.targets: [lexical]
+        query.route.paths.iterative.targets: [lexical]
+        query.fuse.enabled: false
+    - name: senza-rerank
+      description: No cross-encoder.
+      overrides:
+        query.rerank.enabled: false

@@ -507,3 +507,34 @@ class TestLLMRouter:
         resp = a.query_engine().query("chi è il fornitore della fattura 42?")
         assert str(resp.decision.path) == RoutePath.LOOKUP
         assert "llm router failed" in resp.decision.reason
+
+
+def test_what_a_parser_already_knows_is_not_asked_of_a_model(tmp_path: Path) -> None:
+    """A FatturaPA states its type and its figures exactly; classifying and
+    extracting it again would pay a model to guess at known facts."""
+    enrichers = (
+        "      - impl: llm_classifier\n"
+        "        params:\n"
+        "          labels: {doc_type: [fattura, contratto, altro]}\n"
+        "          known: {doc_type: tipo_documento}\n"
+        + EXTRACT.replace(
+            "        params:\n", "        params:\n          skip_when: {formato: FatturaPA}\n", 1
+        )
+    )
+    a, client = _setup(
+        tmp_path,
+        _all,
+        enrichers=enrichers,
+        files={
+            "fattura.md": INVOICE,
+            "fattura.md.meta.json": '{"formato": "FatturaPA", "tipo_documento": "fattura"}',
+            "contratto.md": CONTRACT,
+        },
+    )
+    assert a.ingestion().build().ok
+    # Only the contract is classified and extracted by the model.
+    assert len(client.calls) == 2
+    assert all("Contratto di fornitura" in prompt_of(c) for c in client.calls)
+    invoice = next(u for u in _units(a) if u.unit.metadata["name"] == "fattura.md")
+    assert invoice.enrichments["llm_classifier"].labels["doc_type"] == "fattura"
+    assert not invoice.enrichments["llm_field_extractor"].fields

@@ -95,18 +95,24 @@ def deep_merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, An
     return out
 
 
-def interpolate(obj: Any, root: Mapping[str, Any]) -> Any:
-    """Expand ``${env:VAR}``, ``${env:VAR:default}`` and ``${dotted.path}``."""
+def interpolate(obj: Any, root: Mapping[str, Any], _seen: frozenset[str] = frozenset()) -> Any:
+    """Expand ``${env:VAR}``, ``${env:VAR:default}`` and ``${dotted.path}``.
+
+    A reference to a value that itself contains references is expanded all the
+    way: ``${paths.store}/fields.db`` where ``paths.store`` is
+    ``${env:STATE:./var}/index``. It used to stop one level down and hand the
+    filesystem a directory literally named ``${env:STATE:./var}``.
+    """
     if isinstance(obj, str):
-        return _INTERP.sub(lambda m: _expand(m.group(1), root), obj)
+        return _INTERP.sub(lambda m: _expand(m.group(1), root, _seen), obj)
     if isinstance(obj, Mapping):
-        return {k: interpolate(v, root) for k, v in obj.items()}
+        return {k: interpolate(v, root, _seen) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [interpolate(v, root) for v in obj]
+        return [interpolate(v, root, _seen) for v in obj]
     return obj
 
 
-def _expand(ref: str, root: Mapping[str, Any]) -> str:
+def _expand(ref: str, root: Mapping[str, Any], seen: frozenset[str] = frozenset()) -> str:
     if ref.startswith("env:"):
         _, _, rest = ref.partition(":")
         name, _, default = rest.partition(":")
@@ -118,6 +124,8 @@ def _expand(ref: str, root: Mapping[str, Any]) -> str:
                 )
             return default
         return val
+    if ref in seen:
+        raise ConfigError(f"${{{ref}}} refers back to itself")
     cur: Any = root
     for part in ref.split("."):
         if not isinstance(cur, Mapping) or part not in cur:
@@ -125,6 +133,8 @@ def _expand(ref: str, root: Mapping[str, Any]) -> str:
         cur = cur[part]
     if isinstance(cur, (Mapping, list)):
         raise ConfigError(f"${{{ref}}} resolves to a {type(cur).__name__}, not a scalar")
+    if isinstance(cur, str) and "${" in cur:
+        return str(interpolate(cur, root, seen | {ref}))
     return str(cur)
 
 
