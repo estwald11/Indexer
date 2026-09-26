@@ -19,12 +19,18 @@ it a removed document answers queries forever.
 **Contract enforcement.** Parser and segmenter output is checked against
 ``eval.checks`` before it is allowed downstream, because a broken span here
 becomes a wrong citation three stages later with nothing to attribute it to.
+
+**Documents read together are invalidated together.** An enricher scoped
+``RELATED`` reads the documents the scanner linked to its own -- the message an
+attachment came in. The ledger records what those were, and a document whose
+related documents changed is restaged though its own bytes did not.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -33,24 +39,26 @@ from typing import Any
 
 from indexer.core.accounting import Accountant, CacheOutcome, InMemoryAccountant
 from indexer.core.cache import CacheKey, CacheStore, cache_key
-from indexer.core.document import ParsedDocument, SourceDocument, content_metadata
+from indexer.core.document import PARENT_KEY, ParsedDocument, SourceDocument, content_metadata
 from indexer.core.errors import ContractViolation, DocumentError, EnrichmentIncomplete
 from indexer.core.ids import ContentHash, DocumentId, hash_obj, hash_text
 from indexer.core.ledger import ChangeKind, DocumentRecord, Ledger, PlannedChange, diff_units
 from indexer.core.manifest import BuildManifest, CorpusStats, IndexStats
 from indexer.core.stages import (
+    RELATIONS,
     CorpusScanner,
     EnrichContext,
     Enricher,
     Flushable,
     Index,
     Parser,
+    RelatedDocument,
     Segmenter,
     StageContext,
     enrich_input_hash,
     parse_cache_scope,
 )
-from indexer.core.unit import EnrichedUnit, Enrichment, Unit
+from indexer.core.unit import ContextScope, EnrichedUnit, Enrichment, Unit
 from indexer.eval.checks import check_parsed_document, check_units
 from indexer.io import atomic_write
 from indexer.pipeline.codec import (
@@ -170,8 +178,15 @@ class IngestionPipeline:
         cache_refs: CacheRefs | None = None,
         purge_cache: bool = True,
         manifest_dir: str | Path | None = None,
+        access_field: str | None = None,
     ) -> None:
         self.scanner = scanner
+        #: The metadata key that says who may read a document, when access
+        #: control is on. A document is read beside a related one only when
+        #: both say the same, so nothing written about one carries the other's
+        #: text to someone who may not read it.
+        self.access_field = access_field
+        self._related_memo: OrderedDict[tuple[str, str], ParsedDocument] = OrderedDict()
         #: Where each build's manifest is written, as ``<build_id>.json`` and
         #: ``latest.json``. The manifest said it was written there; nothing did.
         self.manifest_dir = Path(manifest_dir) if manifest_dir is not None else None
@@ -231,6 +246,68 @@ class IngestionPipeline:
             keys[f"index:{name}"] = idx.fingerprint().key()
         return keys
 
+    # ------------------------------------------------------------- relations
+
+    @property
+    def relations(self) -> tuple[str, ...]:
+        """The relations the configured enrichers read, in ``RELATIONS`` order."""
+        if not self.enrich_enabled:
+            return ()
+        wanted = {r for e in self.enrichers if _reads_related(e) for r in _relations_of(e)}
+        return tuple(r for r in RELATIONS if r in wanted)
+
+    def _linked(
+        self, doc: SourceDocument, family: _Family, relations: Sequence[str]
+    ) -> list[tuple[str, SourceDocument]]:
+        """The documents linked to ``doc`` that an enricher may read beside it:
+        only those with the same readers."""
+        return [
+            (relation, other)
+            for relation, other in family.related(doc, relations)
+            if self._same_readers(doc, other)
+        ]
+
+    def _same_readers(self, a: SourceDocument, b: SourceDocument) -> bool:
+        if self.access_field is None:
+            return True
+        return _readers(a, self.access_field) == _readers(b, self.access_field)
+
+    def _related_signature(self, doc: SourceDocument, family: _Family) -> str:
+        """What the ledger records of ``doc``'s related documents: which they
+        are and their content, so a change to one restages ``doc``."""
+        linked = self._linked(doc, family, self.relations) if self.relations else []
+        if not linked:
+            return ""
+        return hash_obj([[rel, str(d.document_id), str(d.content_hash)] for rel, d in linked])
+
+    def _related(
+        self, doc: SourceDocument, family: _Family | None, ctx: StageContext
+    ) -> list[RelatedDocument]:
+        """``doc``'s related documents, parsed, for every relation an enricher
+        reads. Parsed through the cache with an accountant of their own: each is
+        also a document of the build, and counting its parse twice would
+        misreport the build."""
+        if family is None or not self.relations:
+            return []
+        side = StageContext(cache=ctx.cache, accountant=InMemoryAccountant())
+        out: list[RelatedDocument] = []
+        for relation, other in self._linked(doc, family, self.relations):
+            key = (str(other.document_id), str(other.content_hash))
+            parsed = self._related_memo.get(key)
+            if parsed is None:
+                try:
+                    parsed = with_document_facts(self._parse(other, side))
+                except DocumentError:
+                    # One that does not parse is not read; the key then says so.
+                    continue
+                self._related_memo[key] = parsed
+                if len(self._related_memo) > 32:
+                    self._related_memo.popitem(last=False)
+            else:
+                self._related_memo.move_to_end(key)
+            out.append(RelatedDocument(relation, parsed))
+        return out
+
     def plan(
         self, *, scanned: Mapping[DocumentId, SourceDocument] | None = None
     ) -> list[PlannedChange]:
@@ -242,6 +319,10 @@ class IngestionPipeline:
         )
         keys = self.stage_keys()
         plan: list[PlannedChange] = []
+        family = _Family(current)
+        readers_of_related = tuple(
+            f"enrich:{e.name}" for e in self.enrichers if _reads_related(e) and self.enrich_enabled
+        )
 
         for doc_id, doc in current.items():
             prior = self.ledger.get(doc_id)
@@ -270,6 +351,17 @@ class IngestionPipeline:
                         ChangeKind.RESTAGED,
                         tuple(stale),
                         f"{what}: {', '.join(sorted(stale))}",
+                        prior,
+                    )
+                )
+                continue
+            if prior.related_hash != self._related_signature(doc, family):
+                plan.append(
+                    PlannedChange(
+                        doc_id,
+                        ChangeKind.RESTAGED,
+                        readers_of_related,
+                        "a document it is read with changed",
                         prior,
                     )
                 )
@@ -310,6 +402,7 @@ class IngestionPipeline:
         scanned = {d.document_id: d for d in self.scanner.scan()}
         work = list(plan if plan is not None else self.plan(scanned=scanned))
         by_id = scanned
+        family = _Family(scanned)
         stats = CorpusStats(documents_total=len(by_id))
         failures: list[DocumentError] = []
         confidences: list[float] = []
@@ -343,7 +436,7 @@ class IngestionPipeline:
             if progress:
                 progress(f"{change.kind.value:>9} {doc.source_uri}")
             try:
-                parsed, _units, enriched, keys_used, incomplete = self._process(doc, ctx)
+                parsed, _units, enriched, keys_used, incomplete = self._process(doc, ctx, family)
             except DocumentError as exc:
                 failures.append(exc)
                 stats.documents_failed += 1
@@ -416,6 +509,7 @@ class IngestionPipeline:
                     build_id=manifest.build_id,
                     updated_at=datetime.now(UTC).isoformat(timespec="seconds"),
                     metadata_hash=metadata_hash(doc),
+                    related_hash=self._related_signature(doc, family),
                 )
             )
             pending.refs.append((doc.document_id, keys_used))
@@ -537,7 +631,7 @@ class IngestionPipeline:
         return len(unit_ids)
 
     def _process(
-        self, doc: SourceDocument, ctx: StageContext
+        self, doc: SourceDocument, ctx: StageContext, family: _Family | None = None
     ) -> tuple[ParsedDocument, list[Unit], list[EnrichedUnit], set[str], dict[str, int]]:
         """Run the stages for one document. Also returns the cache keys it used,
         so that removing the document later can remove what it left behind, and
@@ -546,7 +640,8 @@ class IngestionPipeline:
         incomplete: dict[str, int] = {}
         parsed = with_document_facts(self._parse(doc, ctx, keys))
         units = self._segment(parsed, ctx, keys)
-        enriched = self._enrich(parsed, units, ctx, keys, incomplete)
+        related = self._related(doc, family, ctx) if self.enrich_enabled else []
+        enriched = self._enrich(parsed, units, ctx, keys, incomplete, related)
         return parsed, units, enriched, keys, incomplete
 
     def _record_keys(self, incomplete: Mapping[str, int]) -> dict[str, str]:
@@ -666,6 +761,7 @@ class IngestionPipeline:
         ctx: StageContext,
         used: set[str] | None = None,
         incomplete: dict[str, int] | None = None,
+        related: Sequence[RelatedDocument] = (),
     ) -> list[EnrichedUnit]:
         enriched = [EnrichedUnit(unit=u) for u in units]
         if not self.enrich_enabled:
@@ -673,11 +769,12 @@ class IngestionPipeline:
 
         prior: dict[Any, dict[str, Enrichment]] = {}
         for enricher in self.enrichers:
-            keys = self._enrich_keys(enricher, parsed, enriched, prior)
+            mine = _related_for(enricher, related)
+            keys = self._enrich_keys(enricher, parsed, enriched, prior, mine)
             if used is not None:
                 used.update(keys)
             results, failed = self._run_enricher(
-                enricher, parsed, units, enriched, keys, prior, ctx
+                enricher, parsed, units, enriched, keys, prior, ctx, mine
             )
             if failed and incomplete is not None:
                 incomplete[enricher.name] = incomplete.get(enricher.name, 0) + failed
@@ -692,15 +789,22 @@ class IngestionPipeline:
         parsed: ParsedDocument,
         enriched: Sequence[EnrichedUnit],
         prior: Mapping[Any, Mapping[str, Enrichment]],
+        related: Sequence[RelatedDocument] = (),
     ) -> list[str]:
         """One cache key per unit. The key covers what the enricher reads: by
         default the whole unit (metadata and section path included), the parent
-        document for a wider scope, and earlier enrichers' output. A unit-scoped
-        enricher still survives edits elsewhere in its document, which is what
-        keeps an edit's blast radius proportional to the edit."""
+        document for a wider scope, the related documents for ``RELATED``, and
+        earlier enrichers' output. A unit-scoped enricher still survives edits
+        elsewhere in its document, which is what keeps an edit's blast radius
+        proportional to the edit."""
         fp = enricher.fingerprint()
         return [
-            cache_key(fp, enrich_input_hash(enricher, eu.unit, parsed, prior.get(eu.unit_id, {})))
+            cache_key(
+                fp,
+                enrich_input_hash(
+                    enricher, eu.unit, parsed, prior.get(eu.unit_id, {}), related=related
+                ),
+            )
             for eu in enriched
         ]
 
@@ -713,6 +817,7 @@ class IngestionPipeline:
         keys: Sequence[str],
         prior: Mapping[Any, Mapping[str, Enrichment]],
         ctx: StageContext,
+        related: Sequence[RelatedDocument] = (),
     ) -> tuple[dict[int, Enrichment], int]:
         """One enricher over one document: cached results, then the rest in
         batches. Returns the enrichments by unit position, and how many units
@@ -746,6 +851,7 @@ class IngestionPipeline:
             stage=ctx,
             prior=dict(prior),
             max_concurrency=self.enrich_max_concurrency,
+            related=tuple(related),
         )
         failed: set[int] = set()
         for start in range(0, len(reps), self.enrich_batch_size):
@@ -838,13 +944,16 @@ class IngestionPipeline:
         ]
         done: set[str] = set()
         asked: set[tuple[str, str]] = set()
+        family = _Family(scanned)
         for _ in range(max_rounds):
             pending: list[_BatchWork] = []
             for change in work:
                 if change.document_id in done:
                     continue
                 try:
-                    item = self._next_model_call(scanned[change.document_id], ctx, enrichers)
+                    item = self._next_model_call(
+                        scanned[change.document_id], ctx, enrichers, family
+                    )
                 except DocumentError:
                     done.add(change.document_id)
                     report.documents_failed += 1
@@ -883,16 +992,22 @@ class IngestionPipeline:
         return report
 
     def _next_model_call(
-        self, doc: SourceDocument, ctx: StageContext, only: Sequence[str] | None
+        self,
+        doc: SourceDocument,
+        ctx: StageContext,
+        only: Sequence[str] | None,
+        family: _Family | None = None,
     ) -> _BatchWork | None:
         """The first model-backed enrichment this document still needs, as batch
         requests. Enrichers before it run as the build would run them."""
         parsed = with_document_facts(self._parse(doc, ctx))
         units = self._segment(parsed, ctx)
+        related = self._related(doc, family, ctx)
         enriched = [EnrichedUnit(unit=u) for u in units]
         prior: dict[Any, dict[str, Enrichment]] = {}
         for enricher in self.enrichers:
-            keys = self._enrich_keys(enricher, parsed, enriched, prior)
+            mine = _related_for(enricher, related)
+            keys = self._enrich_keys(enricher, parsed, enriched, prior, mine)
             missing = [i for i, k in enumerate(keys) if ctx.cache.get(k) is None]
             batchable = callable(getattr(enricher, "requests_for", None)) and (
                 only is None or enricher.name in only
@@ -902,7 +1017,12 @@ class IngestionPipeline:
                 for i in missing:
                     first.setdefault(keys[i], i)
                 context = EnrichContext(
-                    document=parsed, units=units, stage=ctx, prior=dict(prior), max_concurrency=1
+                    document=parsed,
+                    units=units,
+                    stage=ctx,
+                    prior=dict(prior),
+                    max_concurrency=1,
+                    related=tuple(mine),
                 )
                 reps = list(first.values())
                 work = _BatchWork(enricher=enricher, context=context)
@@ -922,7 +1042,9 @@ class IngestionPipeline:
                 # A model-backed enricher left out of this prefill: what follows
                 # may read its output, so the chain stops here for this document.
                 return None
-            results, _ = self._run_enricher(enricher, parsed, units, enriched, keys, prior, ctx)
+            results, _ = self._run_enricher(
+                enricher, parsed, units, enriched, keys, prior, ctx, mine
+            )
             for i, e in results.items():
                 enriched[i] = enriched[i].with_enrichment(e)
                 prior.setdefault(enriched[i].unit_id, {})[e.enricher] = e
@@ -948,6 +1070,67 @@ class IngestionPipeline:
                 ctx.cache.put(key, json.dumps(encode_enrichment(e)).encode("utf-8"))
                 report.cached += 1
                 report.by_enricher[enricher.name] = report.by_enricher.get(enricher.name, 0) + 1
+
+
+class _Family:
+    """Which document came in which, from one scan: the relations
+    ``ContextScope.RELATED`` reads, derived from ``PARENT_KEY``."""
+
+    def __init__(self, docs: Mapping[DocumentId, SourceDocument]) -> None:
+        self.docs = docs
+        self.children: dict[str, list[SourceDocument]] = {}
+        for d in docs.values():
+            parent = d.metadata.get(PARENT_KEY)
+            if parent:
+                self.children.setdefault(str(parent), []).append(d)
+
+    def related(
+        self, doc: SourceDocument, relations: Sequence[str]
+    ) -> list[tuple[str, SourceDocument]]:
+        """``doc``'s linked documents, in ``RELATIONS`` order then scan order."""
+        parent = str(doc.metadata.get(PARENT_KEY) or "")
+        out: list[tuple[str, SourceDocument]] = []
+        for relation in RELATIONS:
+            if relation not in relations:
+                continue
+            if relation == "container" and parent:
+                container = self.docs.get(DocumentId(parent))
+                if container is not None:
+                    out.append((relation, container))
+            elif relation == "sibling" and parent:
+                out.extend(
+                    (relation, d)
+                    for d in self.children.get(parent, ())
+                    if d.document_id != doc.document_id
+                )
+            elif relation == "attachment":
+                out.extend((relation, d) for d in self.children.get(str(doc.document_id), ()))
+        return out
+
+
+def _reads_related(enricher: Any) -> bool:
+    return str(getattr(enricher, "scope", "")) == ContextScope.RELATED
+
+
+def _relations_of(enricher: Any) -> tuple[str, ...]:
+    return tuple(str(r) for r in getattr(enricher, "relations", ()) or ())
+
+
+def _related_for(enricher: Any, related: Sequence[RelatedDocument]) -> list[RelatedDocument]:
+    """The related documents one enricher reads: those of the relations it
+    asked for, and none for an enricher of any other scope."""
+    if not _reads_related(enricher):
+        return []
+    wanted = set(_relations_of(enricher))
+    return [r for r in related if r.relation in wanted]
+
+
+def _readers(doc: SourceDocument, key: str) -> tuple[str, ...] | None:
+    value = content_metadata(doc.metadata).get(key)
+    if value is None:
+        return None
+    values = value if isinstance(value, (list, tuple, set, frozenset)) else (value,)
+    return tuple(sorted(str(v) for v in values))
 
 
 @dataclass(slots=True)

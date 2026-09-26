@@ -151,7 +151,7 @@ class EnricherSpec(ImplSpec):
     #: the implementation's declared scope; the loader checks and refuses a
     #: config that claims a narrower scope than the code takes, because that
     #: combination serves stale results after an edit.
-    scope: Literal["unit", "neighbors", "document", "corpus"] | None = None
+    scope: Literal["unit", "neighbors", "document", "related", "corpus"] | None = None
 
 
 class EnrichConfig(_Base):
@@ -338,6 +338,12 @@ class ShapeConfig(_Base):
     #: Attach the text of this many units before and after each hit, so a
     #: reader gets the passage around a chunk without another call.
     expand_neighbors: int = 0
+    #: Enrichers whose context is part of what a passage says, named as they
+    #: write their enrichments. Two passages with the same text are then one
+    #: only when those contexts agree too: "03.02.002 Idem c.s., ma per
+    #: vuotatoi" in two specifications refers to two different items above it,
+    #: and collapsing them would hide one. Empty compares the text alone.
+    distinguish_by: list[str] = Field(default_factory=list)
 
 
 class QueryConfig(_Base):
@@ -513,6 +519,16 @@ class Config(_Base):
         misspelled = set(self.query.fuse.weights) - all_index_names
         if misspelled:
             raise ValueError(f"fuse.weights names indexes that do not exist: {sorted(misspelled)}")
+
+        # The same rule for enrichers: one disabled by an ablation arm leaves the
+        # setting inert, one that is not configured at all makes it a typo.
+        enrichers = {e.impl for e in self.ingestion.enrich.enrichers}
+        unknown_enrichers = set(self.query.shape.distinguish_by) - enrichers
+        if unknown_enrichers:
+            raise ValueError(
+                f"query.shape.distinguish_by names enrichers that are not configured: "
+                f"{sorted(unknown_enrichers)}"
+            )
 
         return self
 

@@ -15,8 +15,16 @@
 #   indexer check   configs/it-enterprise.yaml
 #   indexer prefill configs/it-enterprise.yaml   # first build's model calls by batch, half price
 #   indexer build   configs/it-enterprise.yaml
-#   indexer review  configs/it-enterprise.yaml   # extracted values held back for a human
+#   indexer review  configs/it-enterprise.yaml   # values and readings held back for a human
 #   indexer mcp     configs/it-enterprise.yaml --principal group:amministrazione
+#
+# A passage is found by its words, and many mean more than they say: "idem
+# c.s.", "il suddetto impianto", "l'Appaltatore", "ai sensi dell'art. 12", "va
+# bene, procediamo con la seconda", a test report whose site is named only in
+# the email it came with. The resolver below writes such statements out as
+# they read, checked against the texts they name. The rest of the file keeps
+# what it needs: entries as units, reply history as context, the message an
+# attachment came with.
 #
 # Data protection: the model-backed stages send document text to the Claude
 # API, and the dense index's model is downloaded once and runs locally. Both
@@ -81,6 +89,9 @@ ingestion:
       # failures; route such folders elsewhere if the archive holds them.
       - when: { media_type: application/xml }
         impl: fatturapa
+      # A reply's quoted history is kept as context: in no unit, so a thread
+      # does not match every query its first message matches, but read by the
+      # resolver, which is what "va bene, procediamo" is agreeing to.
       - when: { media_type: message/rfc822 }
         impl: email
         params: { labels: it }
@@ -91,9 +102,12 @@ ingestion:
       #   params: { labels: it }
       - when: { media_type: application/pdf }
         impl: pdf_text
+        # Line breaks kept: a numbered entry opens a line, and the segmenter
+        # reads line starts.
+        params: { keep_line_breaks: true }
         # A scan has no text layer. With Docling installed (`pip install
         # docling`), OCR it instead of indexing its metadata alone:
-        # params: { fallback: { impl: docling, params: { ocr: true } } }
+        # params: { keep_line_breaks: true, fallback: { impl: docling, params: { ocr: true } } }
       - when: { media_type: application/vnd.openxmlformats-officedocument.wordprocessingml.document }
         impl: docx
       - when: { media_type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet }
@@ -106,8 +120,13 @@ ingestion:
       impl: text
     on_error: skip
 
+  # A document made of numbered entries -- a specification, a price list, a
+  # bill of quantities, a numbered procedure -- gets one unit per entry,
+  # however short: a ten-word "Idem, diametro 26x3 mm" is an entry, and
+  # merging it into its neighbour decides it is not worth finding. Every other
+  # document is cut at its sections, as `structural` would.
   segment:
-    impl: structural
+    impl: items
     max_tokens: 400
     min_tokens: 48
     params:
@@ -130,12 +149,18 @@ ingestion:
       # their check digit holds. `find_entity` searches them.
       - impl: entities
 
-      # The year in the folder path, as a field the router can name.
+      # The year in the folder path, as a field the router can name; the code
+      # a numbered entry opens with (03.02.002, B.72.14.0013), for filters and
+      # `query_records`.
       - impl: regex_fields
         params:
           locale: it
           date_order: dmy
           from_metadata: [anno]
+          fields:
+            codice_voce:
+              pattern: '^\s*(?:(?:pos|art|voce|nr)\.?\s*)?((?:[A-Z]{1,3}\.?)?\d{1,3}[A-Z]?(?:\.\d{1,4}[A-Z]?){2,5}\*?(?:\.[a-z0-9]{1,2})?|[A-Z]\.\d{1,3}[A-Z]?(?:\.\d{1,3}[A-Z]?){1,3})'
+              type: str
 
       # Link identifiers to the company's own registers -- the customer and
       # supplier exports from the ERP, ";"-separated is fine. Uncomment with
@@ -251,6 +276,40 @@ ingestion:
             Il documento proviene dall'archivio di un'azienda italiana. Nomina
             tipo di documento, controparte, data e numero quando ci sono.
 
+      # Statements whose meaning is written elsewhere, written out as they
+      # read: "idem", "come sopra", a pronoun, a defined term, "ai sensi
+      # dell'art. 12", a reply to the message it quotes, an attachment whose
+      # subject is in its email. Each reading is checked against the texts it
+      # names -- every figure and name must be theirs -- or it goes to
+      # `indexer review`. One that passes joins every index's retrieval
+      # surface; the passage's own text is never changed.
+      #
+      # The most careful reader, because a statement it misses is never found.
+      # Instructions are cached across calls and each document is sent once, so
+      # the cost is about the archive's size in tokens, at Opus 5's price, plus
+      # the readings; half through `indexer prefill`. The arms below measure
+      # what it is worth and what a cheaper model loses.
+      - impl: llm_resolver
+        scope: related
+        params:
+          model: claude-opus-5
+          effort: medium
+          # Read an attachment beside the message it came in.
+          relations: [container]
+          # An electronic invoice is exact data, already read by its parser.
+          skip_when: { formato: FatturaPA }
+          instructions: >-
+            I documenti sono di un'azienda italiana: contratti, capitolati,
+            elenchi prezzi e computi, offerte, verbali, procedure,
+            corrispondenza. Oltre ai rimandi generali, sono frequenti "idem",
+            "c.s." (come sopra), "come voce precedente", "stesse
+            caratteristiche di", "il suddetto", "il predetto", "di cui al punto",
+            "ai sensi dell'art.", "vedi allegato", "come da accordi" e, nei testi
+            tedeschi, "wie vor", "dto.", "siehe". Una voce che riporta solo ciò
+            che cambia (un diametro, una potenza, l'apparecchio servito) prende
+            tutto il resto dalla voce a cui si riferisce. Riporta sigle, codici
+            e misure esattamente come sono scritti.
+
   index:
     batch_size: 128
     indexes:
@@ -349,11 +408,14 @@ query:
     missing: deny
 
   # What an agent reads: at most three passages per document, the same
-  # passage filed in three folders shown once, a neighbour on each side.
+  # passage filed in three folders shown once, a neighbour on each side. Two
+  # passages with the same words are one only if they also read the same:
+  # "Idem c.s." under two different items is two.
   shape:
     enabled: true
     max_per_document: 3
     collapse_duplicates: true
+    distinguish_by: [llm_resolver]
     expand_neighbors: 1
 
 cache:
@@ -400,6 +462,27 @@ eval:
       description: Heading trail only. What the LLM contexts are worth.
       overrides:
         ingestion.enrich.enrichers[llm_contextualizer].enabled: false
+    # The resolver's arms need a golden set that asks for what passages mean
+    # and do not say: a generated one draws each query from the passage's own
+    # words. Put statements like "idem", "va bene, procediamo" and the
+    # attachments of your emails in it by hand.
+    - name: senza-risolutore
+      description: Passages as written. What reading out references is worth.
+      overrides:
+        ingestion.enrich.enrichers[llm_resolver].enabled: false
+    - name: risolutore-senza-allegati
+      description: Each document read alone, not beside the message it came in.
+      overrides:
+        ingestion.enrich.enrichers[llm_resolver].scope: document
+        ingestion.enrich.enrichers[llm_resolver].params.relations: []
+    - name: risolutore-sonnet
+      description: The resolver on Sonnet 5, at 40% of the price. What the careful reader is worth.
+      overrides:
+        ingestion.enrich.enrichers[llm_resolver].params.model: claude-sonnet-5
+    - name: segmenti-per-sezione
+      description: Sections filled up to their size, numbered entries or not.
+      overrides:
+        ingestion.segment.impl: structural
     - name: router-a-regole
       description: The rules router alone. What the model router is worth.
       overrides:

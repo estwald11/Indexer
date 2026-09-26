@@ -96,6 +96,7 @@ def test_every_arm_of_the_italian_preset_assembles(
     # The router's vocabulary covers what the parser, the extractors and the
     # classifier write -- the reason declares_fields exists.
     assert {"importo_totale", "data_documento", "doc_type", "piva", "iban", "anno"} <= set(names)
+    assert "codice_voce" in names
     assert types["importo_totale"] == "float" and types["data_documento"] == "date"
     for arm in cfg.eval.ablations:
         a = assemble(path, overrides=arm.overrides)

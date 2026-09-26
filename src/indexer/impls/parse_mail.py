@@ -6,6 +6,13 @@ before it, which otherwise makes each message of a thread match every query
 the thread matches -- and the names of its attachments. The attachments
 themselves are documents of their own when the scanner expands emails.
 
+The history is not thrown away, though. "Va bene, procediamo con la seconda"
+means the second of the options in the message it answers, and says none of
+it. The history stays in the document as ``BlockKind.QUOTED`` blocks, after
+the message's own text: no segmenter makes a unit of it, so it matches
+nothing, but an enricher reads it, and a reference resolver can write the
+reply out as what it agrees to.
+
 Scanner and parser agree on the facts (``email_subject``, ``email_from`` ...)
 through ``indexer.impls.containers.parse_email``; the parser adds a typed
 ``sent_date`` so "emails since March" is a date comparison, not a string one.
@@ -26,7 +33,7 @@ from indexer.impls.containers import EmailInfo, parse_email
 from indexer.impls.parse import _Builder
 from indexer.plugin import StageImpl, dataclass_params
 
-__all__ = ["EmailParser", "MsgParser", "strip_quoted"]
+__all__ = ["EmailParser", "MsgParser", "split_quoted", "strip_quoted"]
 
 _LABELS = {
     "it": {
@@ -61,23 +68,44 @@ _QUOTE_MARKERS = re.compile(
 )
 
 
+def split_quoted(body: str) -> tuple[list[tuple[str, bool]], str]:
+    """The message's own text as runs of lines, each marked quoted (``>``
+    lines answered inline) or not, and the history below the reply.
+
+    A bare forward -- nothing of its own above the history -- is all the
+    sender's: the "quoted" part is what they meant to send.
+    """
+    m = _QUOTE_MARKERS.search(body)
+    own, history = (body[: m.start()], body[m.start() :]) if m else (body, "")
+    runs: list[tuple[str, bool]] = []
+    for line in own.splitlines():
+        quoted = line.lstrip().startswith(">")
+        if runs and runs[-1][1] == quoted:
+            runs[-1] = (f"{runs[-1][0]}\n{line}", quoted)
+        else:
+            runs.append((line, quoted))
+    if not any(text.strip() for text, quoted in runs if not quoted):
+        return [(body, False)], ""
+    return runs, history.strip()
+
+
 def strip_quoted(body: str) -> tuple[str, bool]:
     """The message's own text, and whether quoted history was removed."""
-    m = _QUOTE_MARKERS.search(body)
-    own = body[: m.start()] if m else body
-    lines = [ln for ln in own.splitlines() if not ln.lstrip().startswith(">")]
-    stripped = "\n".join(lines).rstrip()
-    if not stripped.strip():
-        # A bare forward: the "quoted" part is the whole message, and it is
-        # what the sender meant to send.
-        return body, False
-    return stripped, (m is not None or len(lines) != len(own.splitlines()))
+    runs, history = split_quoted(body)
+    own = "\n".join(text for text, quoted in runs if not quoted).rstrip()
+    return own, bool(history) or any(quoted for _, quoted in runs)
 
 
 @dataclass(frozen=True, slots=True)
 class EmailParams:
-    #: Remove the quoted history of replies and forwards.
+    #: Keep the quoted history of replies and forwards out of the indexed text.
     strip_quoted: bool = True
+    #: Keep that history in the document as quoted context -- read by
+    #: enrichers, never a unit -- instead of dropping it.
+    quoted_context: bool = True
+    #: How much of it: the message answered comes first, and a long thread
+    #: repeats every earlier message below it.
+    max_quoted_chars: int = 8000
     #: Language of the header labels written into the text: it or en.
     labels: str = "en"
 
@@ -85,17 +113,17 @@ class EmailParams:
 @register(
     "parse",
     "email",
-    version="1",
+    version="2",
     params_model=dataclass_params(EmailParams),
-    summary="RFC 822 email and PEC: subject, participants, date, body without quoted "
-    "history, attachment names. Standard library.",
+    summary="RFC 822 email and PEC: subject, participants, date, body, attachment names; "
+    "quoted history kept as context, not indexed. Standard library.",
 )
 def _make_email(params: dict[str, Any], **_: Any) -> EmailParser:
     return EmailParser(params)
 
 
 class EmailParser(StageImpl):
-    STAGE, IMPL, VERSION = "parse", "email", "1"
+    STAGE, IMPL, VERSION = "parse", "email", "2"
 
     def can_parse(self, doc: SourceDocument) -> float:
         return 0.95 if doc.media_type == "message/rfc822" else 0.0
@@ -123,18 +151,27 @@ def _render(doc: SourceDocument, info: EmailInfo, params: dict[str, Any]) -> Par
             f"{k}: {v if not isinstance(v, list) else ', '.join(v)}" for k, v in info.pec.items()
         )
         b.add(f"{labels['pec']} -- {facts}", BlockKind.PARAGRAPH, attrs={"role": "pec"})
-    body, quoted = (
-        strip_quoted(info.body) if params.get("strip_quoted", True) else (info.body, False)
-    )
-    for para in re.split(r"\n\s*\n", body):
-        para = para.strip()
-        if para:
-            b.add(para, BlockKind.PARAGRAPH)
+    strip = bool(params.get("strip_quoted", True))
+    keep = strip and bool(params.get("quoted_context", True))
+    runs, history = split_quoted(info.body) if strip else ([(info.body, False)], "")
+    quoted = bool(history) or any(q for _, q in runs)
+    for text, is_quoted in runs:
+        if is_quoted:
+            if keep and text.strip():
+                b.add(text.strip(), BlockKind.QUOTED, attrs={"role": "quoted"})
+            continue
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip()
+            if para:
+                b.add(para, BlockKind.PARAGRAPH)
     names = [
         a.name for a in info.attachments if a.name.lower() not in ("daticert.xml", "smime.p7s")
     ]
     if names:
         b.add(f"{labels['attachments']}: {', '.join(names)}", BlockKind.PARAGRAPH)
+    limit = int(params.get("max_quoted_chars", 8000))
+    if keep and history and limit > 0:
+        b.add(_head(history, limit), BlockKind.QUOTED, attrs={"role": "quoted_history"})
 
     meta: dict[str, Any] = dict(doc.metadata)
     added = {
@@ -159,6 +196,14 @@ def _render(doc: SourceDocument, info: EmailInfo, params: dict[str, Any]) -> Par
     return b.finish(doc.content_hash, metadata=meta)
 
 
+def _head(text: str, limit: int) -> str:
+    """At most ``limit`` characters of ``text``, cut at a line end."""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    return text[: cut if cut > 0 else limit].rstrip()
+
+
 def _sent_at(value: str) -> datetime | None:
     if not value:
         return None
@@ -176,7 +221,7 @@ def _sent_at(value: str) -> datetime | None:
 @register(
     "parse",
     "msg",
-    version="1",
+    version="2",
     params_model=dataclass_params(EmailParams),
     summary="Outlook .msg via extract-msg (GPL-3.0: check it fits your distribution).",
     requires=("extract-msg",),
@@ -193,7 +238,7 @@ class MsgParser(StageImpl):
     choice in config rather than a default.
     """
 
-    STAGE, IMPL, VERSION = "parse", "msg", "1"
+    STAGE, IMPL, VERSION = "parse", "msg", "2"
 
     def can_parse(self, doc: SourceDocument) -> float:
         return 0.95 if doc.media_type == "application/vnd.ms-outlook" else 0.0

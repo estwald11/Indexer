@@ -17,13 +17,14 @@ import pytest
 
 from indexer.core.accounting import InMemoryAccountant
 from indexer.core.cache import NullCache
-from indexer.core.document import SourceDocument
+from indexer.core.document import BlockKind, SourceDocument
 from indexer.core.ids import DocumentId, hash_bytes
 from indexer.core.query import RoutePath
 from indexer.core.stages import StageContext
 from indexer.eval.checks import check_parsed_document
 from indexer.impls.parse_fatturapa import FatturaPAParser, read_fatturapa
 from indexer.impls.parse_mail import EmailParser, strip_quoted
+from indexer.impls.segment import StructuralSegmenter
 from indexer.pipeline import assemble
 
 CTX = StageContext(cache=NullCache(), accountant=InMemoryAccountant())
@@ -169,8 +170,12 @@ class TestEmailParser:
         assert parsed.blocks[0].text == "Re: Offerta 2025"
         assert "Da: Anna Bianchi <anna@azienda.it>" in parsed.text
         assert "Allegati: offerta.pdf" in parsed.text
-        # The quoted request is the previous message's text, not this one's.
-        assert "Potete mandarci" not in parsed.text
+        # The quoted request is the previous message's text, not this one's:
+        # kept for an enricher to read what the reply answers, in no unit.
+        (quoted,) = [b for b in parsed.blocks if b.kind == BlockKind.QUOTED]
+        assert quoted.text.endswith("> Potete mandarci l'offerta?")
+        units = StructuralSegmenter({}).segment(parsed, CTX)
+        assert units and not any("Potete mandarci" in u.text for u in units)
         assert parsed.metadata["quoted_removed"] is True
         assert parsed.metadata["sent_date"] == date(2025, 3, 3)
         assert parsed.metadata["attachment_names"] == ["offerta.pdf"]

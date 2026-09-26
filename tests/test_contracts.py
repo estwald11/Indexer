@@ -222,7 +222,13 @@ class TestRankedListDiscipline:
 class TestScopeDeclaration:
     def test_scopes_are_ordered_by_blast_radius(self) -> None:
         assert ContextScope.UNIT != ContextScope.DOCUMENT
-        assert {s.value for s in ContextScope} == {"unit", "neighbors", "document", "corpus"}
+        assert [s.value for s in ContextScope] == [
+            "unit",
+            "neighbors",
+            "document",
+            "related",
+            "corpus",
+        ]
 
 
 class TestContextSpecificity:

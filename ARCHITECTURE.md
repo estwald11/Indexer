@@ -151,7 +151,9 @@ makes them individually disableable.
 and the cache key includes exactly that. A `UNIT`-scoped enricher survives edits
 elsewhere in its document; a `DOCUMENT`-scoped one — contextualisation, by
 nature — does not. This is the honest cost of document-level context, stated in
-config rather than discovered during a rebuild.
+config rather than discovered during a rebuild. A `RELATED`-scoped one also
+reads the documents linked to its own (an attachment's message), and an edit
+to any of them restages it (Round 3).
 
 *Enrichers receive batches, not units.* `Enricher.enrich` takes a sequence and
 `EnrichContext` carries the whole parent document, because the reference
@@ -633,6 +635,91 @@ one enricher's params, so entity fields, FatturaPA facts and anything a model
 extracted were fields no question could reach. Implementations now declare the
 fields they write (`Registration.declares_fields`), and the router, the
 config check and the agent's schema read that one list.
+
+### Round 3: passages whose meaning is elsewhere
+
+Round 3 found that invariant 3 had been read too narrowly. It also found seven
+defects around it, several in the frame's own choices.
+
+The trigger was one item of a building-services specification: "03.02.002
+Idem c.s., ma per vuotatoi", the washbasin frame of the item above, for slop
+sinks. An agent could not find it. The item was only an example of a problem
+found everywhere, and the fix was made general:
+
+* a reply that agrees to an option listed in the message it quotes;
+* a clause whose party is named in the definitions and whose penalty is set
+  eight articles away;
+* a paragraph that opens with "Esso";
+* a test report whose site is named only in the email it came with.
+
+**Context can situate a chunk and still leave it unreadable.** The invariant
+was implemented as situating context: what the document is, and where the
+chunk sits in it. A statement that says "idem", "the latter" or "va bene,
+procediamo" is not missing its place in the document. It is missing its
+meaning, which is in other text, and no embedder can supply words a text does
+not contain. Resolving that reference is a separate enrichment
+(`llm_resolver`), with its own output: which statements depend on which
+texts, and how they read with those filled in. It is checked the way extracted
+fields are checked: the sources must be quoted, and every figure, name and
+acronym must be found in them.
+
+**The agent was handed the first 600 characters of a chunk.** On 25 chunkings
+of a synthetic specification, the chunk holding the item ranked first 21 times.
+The agent saw the item zero times, because it sat past the clip. The neighbour
+text that `shape.expand_neighbors` attaches to every hit was computed and then
+dropped by the agent's payload. Retrieval metrics scored all of this as
+success. The metric to add beside fail@k: is the answer in what the reader is
+given?
+
+**Size thresholds decided that short entries were not worth finding.**
+`merge_below_tokens` folds a short run into its neighbour on the grounds that
+it is "too small to retrieve on". A ten-token entry is exactly as findable as
+its reading makes it. So `items` never merges entries, and the size rules apply
+only where size forced a cut. A document without numbered entries gets the
+section rules unchanged, so one configuration serves an archive of both.
+
+**The email parser threw away what replies answer.** It removed quoted history
+so that a thread would not match every query its first message matches. That
+was right for the index and wrong for the reader: "va bene, procediamo con la
+seconda" lost the only text that says what the second option is. History is
+now a `BlockKind.QUOTED` block. It stays in the document, and no segmenter may
+make a unit of it or run a unit across it. So enrichers read it, and nothing
+matches it.
+
+**What an attachment means can be in another document, and one document's key
+and ledger record could not say so.** An enricher that reads a second document
+must key on it, and a change to that document must reach the first. Neither was
+possible, because both the cache key and the ledger saw one document. Now:
+
+* `ContextScope.RELATED` declares the dependency;
+* `EnrichContext.related` supplies the linked documents, derived from the
+  scanner's `PARENT_KEY`;
+* the frame adds those documents to the enricher's key, whatever its own
+  `input_hash` says;
+* `DocumentRecord.related_hash` restages an attachment whose message changed
+  while its bytes did not;
+* a document is never read beside one with other readers, because a reading
+  would carry that document's text to them.
+
+**A resolver reads position, so its key must hold position.** "Idem c.s." means
+whatever stands above it. Keyed on its text and document, two identical lines
+under two different items shared one cache key. The pipeline makes one call
+per distinct key, so both got the first line's reading. The key now includes
+the span. The texts a reading draws on are stored as document offsets, not
+unit ids, because offsets stay true when the document is segmented differently.
+
+**Duplicates were decided on text alone.** The same "Idem c.s." line in two
+specifications refers to two different items, but shaping collapsed the pair
+into one hit. `shape.distinguish_by` names the enrichers whose context is part
+of what a passage says.
+
+**The first design sent every passage twice.** Each call carried the document,
+then the batch's passages again, so an archive of short documents (most
+emails, letters and invoices) paid about twice its size in input. Now the
+passages are marked where they stand and named by position, so one marked-up
+document serves every batch and is cached once. The instructions are a system
+prompt that is the same for every call, so they are cached too. A document's
+cache is written only when a later batch will read it.
 
 ---
 

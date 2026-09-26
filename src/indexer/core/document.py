@@ -31,6 +31,7 @@ from indexer.core.provenance import Provenance
 
 __all__ = [
     "LOCATOR_KEYS",
+    "PARENT_KEY",
     "Block",
     "BlockKind",
     "MediaRef",
@@ -48,6 +49,12 @@ __all__ = [
 #: while appearing to work. Scanners keep them for ``load()``; nothing else
 #: should read them.
 LOCATOR_KEYS = frozenset({"path"})
+
+#: Scanner metadata naming the document a document came in: the message an
+#: attachment was attached to. A scanner that opens containers sets it, and the
+#: frame derives from it which documents an enricher may read beside its own
+#: (``ContextScope.RELATED``).
+PARENT_KEY = "parent_document_id"
 
 
 def content_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -80,6 +87,11 @@ class BlockKind(StrEnum):
     PAGE_HEADER = "page_header"
     PAGE_FOOTER = "page_footer"
     TOC_ENTRY = "toc_entry"
+    #: Text the document quotes from another: the history below a reply. It
+    #: is what the reply answers, so an enricher reads it; no segmenter makes a
+    #: unit of it, or every message of a thread would match every query the
+    #: thread matches.
+    QUOTED = "quoted"
     OTHER = "other"
 
 
