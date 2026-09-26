@@ -412,6 +412,10 @@ class PdfTextParams:
     #: A parser spec ({impl, params}) for PDFs without a text layer. Without
     #: one, a scan is indexed as its metadata alone and flagged.
     fallback: dict[str, Any] | None = None
+    #: Keep the text layer's line breaks inside a paragraph instead of joining
+    #: its lines with spaces. A segmenter that reads line starts -- the item
+    #: codes of a specification (``items``) -- needs them; search reads the same.
+    keep_line_breaks: bool = False
 
 
 @register(
@@ -483,8 +487,9 @@ class PdfTextParser(StageImpl):
             parsed: ParsedDocument = self._fallback.parse(doc, ctx)
             return parsed
         b = _Builder(doc.document_id, doc.source_uri)
+        keep = bool(self.param("keep_line_breaks", False))
         for page_no, text in pages:
-            for para in _paragraphs(text):
+            for para in _paragraphs(text, keep_line_breaks=keep):
                 block = b.add(para, BlockKind.PARAGRAPH)
                 b.blocks[-1] = _with_page(block, page_no)
         meta = dict(doc.metadata)
@@ -502,12 +507,14 @@ class PdfTextParser(StageImpl):
         )
 
 
-def _paragraphs(text: str) -> Iterator[str]:
+def _paragraphs(text: str, *, keep_line_breaks: bool = False) -> Iterator[str]:
     """Paragraphs from a page's extracted text: blank lines separate them, and
-    lines hyphenated at the margin are rejoined."""
+    lines hyphenated at the margin are rejoined. A paragraph's lines are joined
+    with spaces, or kept on their own lines with ``keep_line_breaks``."""
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    sep = "\n" if keep_line_breaks else " "
     for para in re.split(r"\n\s*\n", text):
-        joined = " ".join(line.strip() for line in para.splitlines() if line.strip())
+        joined = sep.join(line.strip() for line in para.splitlines() if line.strip())
         if joined:
             yield joined
 

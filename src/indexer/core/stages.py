@@ -48,6 +48,7 @@ from indexer.core.results import RankedList, RecordSet
 from indexer.core.unit import ContextScope, EnrichedUnit, Enrichment, Unit
 
 __all__ = [
+    "RELATIONS",
     "CorpusScanner",
     "EnrichContext",
     "Enricher",
@@ -59,6 +60,7 @@ __all__ = [
     "IndexStatsView",
     "IndexWriteReceipt",
     "Parser",
+    "RelatedDocument",
     "Reranker",
     "Retriever",
     "Router",
@@ -69,6 +71,7 @@ __all__ = [
     "enrich_input_hash",
     "parse_cache_scope",
     "prior_hash",
+    "related_hash",
     "unit_input_hash",
 ]
 
@@ -249,6 +252,9 @@ class Segmenter(Protocol):
         *Coverage.* Units cover the document's content blocks. Deliberate
         omissions (running headers, page numbers) are allowed and must be
         recorded in the returned units' absence, not silently merged.
+        ``BlockKind.QUOTED`` blocks are never a unit's text: they are what the
+        document quotes (the history below a reply), there for enrichers to
+        read. A unit's span must not run across one.
 
     Minimal implementation
         One unit per leaf section; if a section exceeds the token limit, split
@@ -267,6 +273,22 @@ class Segmenter(Protocol):
 # --------------------------------------------------------------------------- #
 # enrich                                                                       #
 # --------------------------------------------------------------------------- #
+
+
+#: The relations ``ContextScope.RELATED`` knows, from ``PARENT_KEY``: the
+#: document a document came in, the others that came with it, and the ones it
+#: holds.
+RELATIONS = ("container", "sibling", "attachment")
+
+
+@dataclass(frozen=True, slots=True)
+class RelatedDocument:
+    """A document an enricher reads beside its own, and how the two are linked
+    (one of ``RELATIONS``): an attachment's meaning is often in the message it
+    came with -- which project, which revision, what changed."""
+
+    relation: str
+    document: ParsedDocument
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +312,11 @@ class EnrichContext:
     #: How many model calls an enricher may have in flight for this batch
     #: (``enrich.max_concurrency``). An enricher that makes no calls ignores it.
     max_concurrency: int = 1
+    #: For a ``RELATED``-scoped enricher, the documents linked to this one
+    #: that it asked for (its ``relations``) and may read: only those with the
+    #: same readers, so nothing it writes carries text from a document someone
+    #: who can see this one cannot. Empty for every other scope.
+    related: Sequence[RelatedDocument] = ()
 
 
 @runtime_checkable
@@ -381,6 +408,7 @@ def enrich_input_hash(
     unit: Unit,
     document: ParsedDocument,
     prior: Mapping[str, Enrichment],
+    related: Sequence[RelatedDocument] = (),
 ) -> str:
     """The cache input for one enricher on one unit.
 
@@ -390,17 +418,32 @@ def enrich_input_hash(
     ``reads_prior = False``. Third-party enrichers that say nothing get the
     widest key, because a needless cache miss costs a call and a missing input
     costs a wrong answer served from cache indefinitely.
+
+    The related documents of a ``RELATED``-scoped enricher are added whatever
+    its own ``input_hash`` says: the frame chose them, so the frame keys them.
     """
     custom = getattr(enricher, "input_hash", None)
     if callable(custom):
-        return str(custom(unit, document, prior))
-    parts = [unit_input_hash(unit)]
-    if str(getattr(enricher, "scope", ContextScope.UNIT)) != ContextScope.UNIT:
-        parts.append(str(document.content_hash))
-        parts.append(hash_obj(content_metadata(document.metadata)))
-    if getattr(enricher, "reads_prior", True) and prior:
-        parts.append(prior_hash(prior))
-    return merge_hashes(*parts)
+        base = str(custom(unit, document, prior))
+    else:
+        parts = [unit_input_hash(unit)]
+        if str(getattr(enricher, "scope", ContextScope.UNIT)) != ContextScope.UNIT:
+            parts.append(str(document.content_hash))
+            parts.append(hash_obj(content_metadata(document.metadata)))
+        if getattr(enricher, "reads_prior", True) and prior:
+            parts.append(prior_hash(prior))
+        base = merge_hashes(*parts)
+    if str(getattr(enricher, "scope", ContextScope.UNIT)) == ContextScope.RELATED:
+        return merge_hashes(base, related_hash(related))
+    return base
+
+
+def related_hash(related: Sequence[RelatedDocument]) -> str:
+    """Hash of the related documents an enricher read: which, how linked, and
+    what they said."""
+    return hash_obj(
+        [[r.relation, str(r.document.document_id), str(r.document.content_hash)] for r in related]
+    )
 
 
 def prior_hash(prior: Mapping[str, Enrichment]) -> str:

@@ -273,6 +273,7 @@ class Assembly:
             cache_refs=self.cache_refs,
             purge_cache=c.cache.purge_unreferenced,
             manifest_dir=self.paths.manifests,
+            access_field=c.query.access.field if c.query.access.enabled else None,
         )
 
     def query_engine(self) -> QueryEngine:
@@ -309,6 +310,7 @@ class Assembly:
                 collapse_duplicates=c.query.shape.collapse_duplicates,
                 near_duplicate_bits=c.query.shape.near_duplicate_bits,
                 expand_neighbors=c.query.shape.expand_neighbors,
+                distinguish_by=tuple(c.query.shape.distinguish_by),
             ),
         )
 

@@ -84,6 +84,7 @@ class ShapePolicy:
     collapse_duplicates: bool = True
     near_duplicate_bits: int = 0
     expand_neighbors: int = 0
+    distinguish_by: tuple[str, ...] = ()
 
 
 class QueryEngine:
@@ -325,6 +326,15 @@ class QueryEngine:
         per_doc: dict[str, int] = {}
         for h in hits:
             text = h.unit.unit.text if h.unit else h.matched_text
+            if h.unit is not None and policy.distinguish_by:
+                # What the passage says includes what these enrichers read it
+                # as: the same "Idem c.s." under two different items is two.
+                readings = [
+                    h.unit.enrichments[name].context or ""
+                    for name in policy.distinguish_by
+                    if name in h.unit.enrichments
+                ]
+                text = "\n".join([text, *readings])
             norm = " ".join(text.split()).casefold()
             key = (str(hash_text(norm)), simhash64(norm) if policy.near_duplicate_bits else 0)
             dup = self._duplicate_of(key, keys) if policy.collapse_duplicates else None

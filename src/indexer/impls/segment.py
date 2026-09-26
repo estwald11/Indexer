@@ -1,11 +1,18 @@
-"""Segmenters: structural, fixed-window, and whole-document.
+"""Segmenters: structural, items, fixed-window, and whole-document.
 
-The contract says boundaries come from structure, not character counts. Three
+The contract says boundaries come from structure, not character counts. Four
 implementations make that testable rather than asserted:
 
 ``structural``
     Honours the contract. Sections are the unit; oversized sections split at
     block boundaries; tables split by row groups with headers repeated.
+
+``items``
+    For documents whose structure is below the section -- specifications,
+    price lists, bills of quantities, catalogues, procedures with numbered
+    points: one unit per numbered entry, however short. A document with fewer
+    entries than ``min_items`` is segmented as ``structural`` would, so one
+    segmenter can serve an archive that mixes both.
 
 ``fixed_window``
     Deliberately violates the spirit of it. It exists because "structure-aware
@@ -14,14 +21,19 @@ implementations make that testable rather than asserted:
 ``whole_document``
     One unit per document. The disabled-segment behaviour, and a real baseline:
     on short documents it sometimes wins.
+
+None of them makes a unit of a ``BlockKind.QUOTED`` block -- the history below
+an email reply -- or lets a unit run across one. It is in the document for
+enrichers to read, not to be found.
 """
 
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from indexer.core.document import Block, BlockKind, ParsedDocument, Table
 from indexer.core.ids import hash_text, make_unit_id
@@ -31,7 +43,14 @@ from indexer.core.stages import StageContext
 from indexer.core.unit import Unit, UnitKind
 from indexer.plugin import StageImpl, dataclass_params
 
-__all__ = ["FixedWindowSegmenter", "StructuralSegmenter", "WholeDocumentSegmenter"]
+__all__ = [
+    "DEFAULT_CHAPTER_PATTERN",
+    "DEFAULT_ITEM_PATTERN",
+    "FixedWindowSegmenter",
+    "ItemSegmenter",
+    "StructuralSegmenter",
+    "WholeDocumentSegmenter",
+]
 
 
 def estimate_tokens(text: str) -> int:
@@ -213,6 +232,7 @@ class StructuralSegmenter(StageImpl):
         overlap = int(self.param("overlap_tokens", 0))
         merge_below = int(self.param("merge_below_tokens", 32))
         b = _UnitBuilder(parsed)
+        quoted = [blk.provenance.span for blk in parsed.blocks if _is_quoted(blk)]
 
         for path, blocks in _sections(parsed):
             content = [blk for blk in blocks if str(blk.kind) != BlockKind.HEADING]
@@ -281,7 +301,13 @@ class StructuralSegmenter(StageImpl):
                     # Carried blocks are already in the previous unit; only what
                     # is new counts toward whether this piece stands on its own.
                     fresh = pending_tokens - carried_tokens
-                    if fresh < threshold and b.units:
+                    # Never folded across quoted text: the merged unit would
+                    # be a slice of the document that includes it.
+                    if (
+                        fresh < threshold
+                        and b.units
+                        and not _crosses(quoted, b.units[-1].provenance.span.end, pending[0])
+                    ):
                         # Too small to retrieve on and not worth an embedding, so
                         # fold it into the previous unit.
                         #
@@ -315,14 +341,31 @@ def _join(blocks: Sequence[Block]) -> str:
     return "\n\n".join(b.text for b in blocks)
 
 
+def _is_quoted(blk: Block) -> bool:
+    return str(blk.kind) == BlockKind.QUOTED
+
+
+def _crosses(quoted: Sequence[Span], start: int, blk: Block) -> bool:
+    """Whether quoted text lies between ``start`` and ``blk``."""
+    end = blk.provenance.span.start
+    return any(start <= q.start < end for q in quoted)
+
+
 def _sections(parsed: ParsedDocument) -> list[tuple[tuple[str, ...], list[Block]]]:
-    """Group blocks under their heading trail, preserving reading order."""
+    """Group blocks under their heading trail, preserving reading order. A
+    quoted block is left out and ends the group it interrupts, so no run of
+    blocks -- and no unit made of one -- spans it."""
     out: list[tuple[tuple[str, ...], list[Block]]] = []
     stack: list[tuple[int, str]] = []
     current: list[Block] = []
     path: tuple[str, ...] = ()
 
     for blk in parsed.blocks:
+        if _is_quoted(blk):
+            if current:
+                out.append((path, current))
+                current = []
+            continue
         if str(blk.kind) == BlockKind.HEADING:
             if current:
                 out.append((path, current))
@@ -472,6 +515,285 @@ def _sentence_pieces(text: str, max_tokens: int) -> list[tuple[int, int]]:
 
 
 # --------------------------------------------------------------------------- #
+# items -- specifications, price lists, bills of quantities                    #
+# --------------------------------------------------------------------------- #
+
+#: An item code opening a line: three or more levels (03.02.002, 13.01.11.05*.a,
+#: B.72.14.0013, 13E.201.01) or a letter and two (A.1C.4), optionally after
+#: "Pos.", "Art.", "Voce" or "Nr." -- and not a date or an amount written with
+#: thousands separators, which have the same shape.
+DEFAULT_ITEM_PATTERN = (
+    r"^[ \t]*(?:(?i:pos|art|voce|nr)\.?[ \t]*)?"
+    r"(?!\d{1,2}\.\d{1,2}\.(?:19|20)\d\d\b)"
+    r"(?!\d{1,3}(?:\.\d{3})+(?:,\d+)?(?![\w.]))"
+    r"(?:(?:[A-Z]{1,3}\.?)?\d{1,3}[A-Z]?(?:\.\d{1,4}[A-Za-z]?){2,5}\*?(?:\.[a-z0-9]{1,2})?"
+    r"|[A-Z]\.\d{1,3}[A-Z]?(?:\.\d{1,3}[A-Z]?){1,3})"
+    r"[.):]?(?=[ \t]|$)"
+)
+#: A chapter line, for documents whose parser finds no headings (a PDF's text
+#: layer): an optional code of one or two levels, then a title in capitals. The
+#: title is checked beyond the pattern -- all capitals, a word of four letters
+#: or more -- and a line without a code inside an item is read as part of it: a
+#: brand in capitals on a line of its own does not open a chapter.
+DEFAULT_CHAPTER_PATTERN = (
+    r"^[ \t]*(?P<code>\d{1,3}(?:\.\d{1,3})?)?[ \t.)\-]*"
+    r"(?P<title>[^\W\d_][^\n]{2,118}?)[ \t]*$"
+)
+#: The kind of a unit that is one item.
+ITEM_KIND = "item"
+
+
+@dataclass(frozen=True, slots=True)
+class ItemParams:
+    #: What opens an item, at the start of a line. See ``DEFAULT_ITEM_PATTERN``.
+    item_pattern: str = DEFAULT_ITEM_PATTERN
+    #: A document with fewer items than this is not a list of items -- a
+    #: letter, a report with two numbered paragraphs -- and is segmented as
+    #: ``structural`` segments it.
+    min_items: int = 3
+    #: ``structural``'s, for the documents segmented as it would.
+    merge_below_tokens: int = 32
+    #: What a chapter line looks like; the depth of its ``code`` group is its
+    #: level. Empty turns chapter lines off.
+    chapter_pattern: str = DEFAULT_CHAPTER_PATTERN
+    max_tokens: int = 512
+    min_tokens: int = 64
+    overlap_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.item_pattern:
+            raise ValueError("item_pattern: an item segmenter needs one")
+        if self.min_items < 1:
+            raise ValueError("min_items: at least 1")
+        for name in ("item_pattern", "chapter_pattern"):
+            pattern = getattr(self, name)
+            if pattern:
+                try:
+                    re.compile(pattern, re.M)
+                except re.error as exc:
+                    raise ValueError(f"{name}: {exc}") from exc
+
+
+@register(
+    "segment",
+    "items",
+    version="2",
+    params_model=dataclass_params(ItemParams),
+    summary=(
+        "One unit per numbered entry (specifications, price lists, bills of quantities, "
+        "numbered procedures), however short; chapter lines become headings. Documents "
+        "without enough entries are segmented as `structural` would."
+    ),
+)
+def _make_items(params: dict[str, Any], **_: Any) -> ItemSegmenter:
+    return ItemSegmenter(params)
+
+
+class ItemSegmenter(StageImpl):
+    """One unit per numbered entry of a document.
+
+    ``structural`` makes units of sections and caps them by size. Many
+    documents are structured below that: a specification's chapter is a list
+    of numbered items, each something to be supplied; so are a price list, a
+    bill of quantities, a catalogue, a procedure's numbered steps. A question
+    is about one entry. From a PDF's text layer, which has no headings,
+    ``structural`` could only fill units up to their size limit, so an item
+    shared its unit with six others and a question about it was answered with
+    the first 600 characters of whichever came first.
+
+    Here an item code at the start of a line opens a unit, which runs to the
+    next item, chapter line, heading or table -- across blocks, since a PDF puts
+    an item's continuation on the next page in a block of its own. Items are
+    never merged, however short: "Idem, diametro 26x3 mm" is an item, and giving
+    it words to be found by is the reference resolver's job (``llm_resolver``).
+    A size threshold that folded it into its neighbour would have decided it
+    was not worth finding. An item over ``max_tokens`` splits at sentence
+    boundaries, and its later pieces carry its first line as their last
+    heading, so each still says what it belongs to.
+
+    Text before a chapter's first item becomes units of its own; tables are
+    split as ``structural`` splits them. A document with fewer than
+    ``min_items`` items is not a list -- a letter that numbers two paragraphs
+    -- and is segmented by ``structural``'s rules, which is what lets one
+    configuration serve an archive of both.
+    """
+
+    STAGE, IMPL, VERSION = "segment", "items", "2"
+
+    def segment(self, parsed: ParsedDocument, ctx: StageContext) -> Sequence[Unit]:
+        items = re.compile(str(self.param("item_pattern", DEFAULT_ITEM_PATTERN)), re.M)
+        if not _has_items(parsed, items, int(self.param("min_items", 3))):
+            defaults = {"max_tokens": 512, "min_tokens": 0, "overlap_tokens": 0}
+            params = {k: self.param(k, v) for k, v in defaults.items()}
+            params["merge_below_tokens"] = self.param("merge_below_tokens", 32)
+            return StructuralSegmenter(params).segment(parsed, ctx)
+        pattern = str(self.param("chapter_pattern", DEFAULT_CHAPTER_PATTERN) or "")
+        chapters = re.compile(pattern, re.M) if pattern else None
+        max_tok = int(self.param("max_tokens", 512))
+        min_tok = int(self.param("min_tokens", 0))
+        overlap = int(self.param("overlap_tokens", 0))
+        starts = [blk.provenance.span.start for blk in parsed.blocks]
+        b = _UnitBuilder(parsed)
+
+        for piece in _item_pieces(parsed, items, chapters):
+            tblock = piece.table
+            if tblock is not None and tblock.table is not None:
+                chunks = _split_table(tblock.text, tblock.table, max_tok)
+                split = len(chunks) > 1
+                for ci, chunk_text in enumerate(chunks):
+                    b.add(
+                        chunk_text,
+                        [tblock],
+                        piece.path,
+                        kind=UnitKind.TABLE_ROWS if split else UnitKind.TABLE,
+                        table_ref=f"{tblock.block_id}#{ci}",
+                        verbatim=not split,
+                    )
+                continue
+            start, end = _trimmed(parsed.text, piece.start, piece.end)
+            text = parsed.text[start:end]
+            kind: UnitKind | str = ITEM_KIND if piece.kind == "item" else UnitKind.PROSE
+            if estimate_tokens(text) <= max_tok:
+                blocks = _covering(parsed, starts, start, end)
+                b.add(text, blocks, piece.path, kind=kind, span=Span(start, end))
+                continue
+            # Its first sentence: "03.02.001 Telaio per lavabo."
+            head = _SENT.split(text.split("\n", 1)[0].strip(), maxsplit=1)[0][:120]
+            pieces = _split_long_block(text, max_tok, min_tokens=min_tok, overlap_tokens=overlap)
+            for n, (rel_start, rel_end) in enumerate(pieces):
+                path = piece.path if n == 0 or piece.kind != "item" else (*piece.path, head)
+                b.add(
+                    text[rel_start:rel_end],
+                    _covering(parsed, starts, start + rel_start, start + rel_end),
+                    path,
+                    kind=kind,
+                    span=Span(start + rel_start, start + rel_end),
+                )
+        return b.finish()
+
+
+class _Piece(NamedTuple):
+    start: int
+    end: int
+    kind: str  # item | text | table
+    path: tuple[str, ...]
+    table: Block | None = None
+
+
+def _item_pieces(
+    parsed: ParsedDocument, items: re.Pattern[str], chapters: re.Pattern[str] | None
+) -> list[_Piece]:
+    """The document as items, the text between them, and tables, in order."""
+    pieces: list[_Piece] = []
+    heads: list[tuple[int, str]] = []
+    chaps: list[tuple[int, str]] = []
+    cur: list[Any] = []  # start, kind and path of the piece being read
+
+    def path() -> tuple[str, ...]:
+        return tuple(t for _, t in heads) + tuple(t for _, t in chaps)
+
+    def close(end: int) -> None:
+        if cur:
+            start, kind, p = cur
+            if parsed.text[start:end].strip():
+                pieces.append(_Piece(start, end, kind, p))
+            cur.clear()
+
+    for blk in parsed.blocks:
+        span = blk.provenance.span
+        if _is_quoted(blk):
+            close(span.start)
+            continue
+        if str(blk.kind) == BlockKind.HEADING:
+            close(span.start)
+            level = blk.level or 1
+            while heads and heads[-1][0] >= level:
+                heads.pop()
+            heads.append((level, blk.text))
+            chaps.clear()
+            continue
+        if str(blk.kind) == BlockKind.TABLE and blk.table is not None:
+            close(span.start)
+            pieces.append(_Piece(span.start, span.end, "table", path(), blk))
+            continue
+        marks: dict[int, tuple[str, Any]] = {}
+        if chapters is not None:
+            for m in chapters.finditer(blk.text):
+                found = _chapter(m)
+                if found is not None:
+                    marks[m.start()] = ("chapter", (m.end(), *found))
+        # A line that opens an item is an item, whatever else it looks like.
+        for m in items.finditer(blk.text):
+            marks[m.start()] = ("item", None)
+        if not cur:
+            cur.extend((span.start, "text", path()))
+        for rel in sorted(marks):
+            what, info = marks[rel]
+            if what == "item":
+                close(span.start + rel)
+                cur.extend((span.start + rel, "item", path()))
+                continue
+            line_end, level, title, coded = info
+            if not coded and cur and cur[1] == "item":
+                continue
+            close(span.start + rel)
+            while chaps and chaps[-1][0] >= level:
+                chaps.pop()
+            chaps.append((level, title))
+            cur.extend((span.start + line_end, "text", path()))
+    close(len(parsed.text))
+    return pieces
+
+
+def _has_items(parsed: ParsedDocument, items: re.Pattern[str], at_least: int) -> bool:
+    """Whether ``parsed`` opens at least ``at_least`` items."""
+    found = 0
+    for blk in parsed.blocks:
+        if str(blk.kind) in (BlockKind.HEADING, BlockKind.TABLE, BlockKind.QUOTED):
+            continue
+        for _ in items.finditer(blk.text):
+            found += 1
+            if found >= at_least:
+                return True
+    return False
+
+
+_TITLE_WORD = re.compile(r"[^\W\d_]{4,}")
+
+
+def _chapter(m: re.Match[str]) -> tuple[int, str, bool] | None:
+    """A chapter line's level, text and whether it has a code -- or None when
+    the line only matches the pattern: a title must be in capitals."""
+    groups = m.groupdict()
+    title = (groups.get("title") or m.group(0)).strip()
+    letters = [c for c in title if c.isalpha()]
+    if len(letters) < 6 or any(c.islower() for c in letters) or not _TITLE_WORD.search(title):
+        return None
+    code = groups.get("code") or ""
+    return (code.count(".") + 1 if code else 1), m.group(0).strip(), bool(code)
+
+
+def _trimmed(text: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _covering(parsed: ParsedDocument, starts: Sequence[int], start: int, end: int) -> list[Block]:
+    """The blocks a span of the canonical text overlaps, in reading order."""
+    first = max(0, bisect_left(starts, start + 1) - 1)
+    out: list[Block] = []
+    for blk in parsed.blocks[first:]:
+        if blk.provenance.span.start >= end:
+            break
+        if blk.provenance.span.end > start:
+            out.append(blk)
+    return out or [parsed.blocks[min(first, len(parsed.blocks) - 1)]]
+
+
+# --------------------------------------------------------------------------- #
 # fixed window -- the control arm                                              #
 # --------------------------------------------------------------------------- #
 
@@ -512,13 +834,12 @@ class FixedWindowSegmenter(StageImpl):
         step = max(1, window - overlap)
         b = _UnitBuilder(parsed)
         text = parsed.text
-        blocks_by_span = list(parsed.blocks)
+        blocks_by_span = [blk for blk in parsed.blocks if not _is_quoted(blk)]
 
-        for start in range(0, max(1, len(text)), step):
-            chunk = text[start : start + window]
+        for start, end in _windows(parsed, window, step):
+            chunk = text[start:end]
             if not chunk.strip():
                 continue
-            end = start + len(chunk)
             covering = [
                 blk for blk in blocks_by_span if blk.provenance.span.overlaps(Span(start, end))
             ]
@@ -545,6 +866,36 @@ class FixedWindowSegmenter(StageImpl):
                 )
             )
         return b.finish()
+
+
+def _regions(parsed: ParsedDocument) -> list[tuple[int, int]]:
+    """The stretches of the text between quoted blocks: all of it, if none."""
+    quoted = [blk.provenance.span for blk in parsed.blocks if _is_quoted(blk)]
+    if not quoted:
+        return [(0, len(parsed.text))]
+    out: list[tuple[int, int]] = []
+    start: int | None = None
+    end = 0
+    for blk in parsed.blocks:
+        if _is_quoted(blk):
+            if start is not None:
+                out.append((start, end))
+            start = None
+            continue
+        if start is None:
+            start = blk.provenance.span.start
+        end = blk.provenance.span.end
+    if start is not None:
+        out.append((start, end))
+    return out
+
+
+def _windows(parsed: ParsedDocument, window: int, step: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for lo, hi in _regions(parsed):
+        for start in range(lo, max(lo + 1, hi), step):
+            out.append((start, min(start + window, hi)))
+    return out
 
 
 def _path_for(parsed: ParsedDocument, offset: int) -> tuple[str, ...]:
@@ -588,5 +939,16 @@ class WholeDocumentSegmenter(StageImpl):
         if not parsed.blocks:
             return []
         b = _UnitBuilder(parsed)
-        b.add(parsed.text, list(parsed.blocks), ())
+        if not any(_is_quoted(blk) for blk in parsed.blocks):
+            b.add(parsed.text, list(parsed.blocks), ())
+            return b.finish()
+        # One unit per stretch of the document's own text.
+        starts = [blk.provenance.span.start for blk in parsed.blocks]
+        for start, end in _regions(parsed):
+            b.add(
+                parsed.text[start:end],
+                _covering(parsed, starts, start, end),
+                (),
+                span=Span(start, end),
+            )
         return b.finish()

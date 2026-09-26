@@ -70,11 +70,17 @@ class ContextScope(StrEnum):
     invariant 3) is invalidated by any edit to the parent. Declaring the scope
     lets the cache key include exactly what was read and nothing more, so the
     blast radius of an edit is a property of the config, not a surprise.
+
+    ``RELATED`` reads the document and the documents the scanner linked to it:
+    the message an attachment came in, that message's other attachments. It is
+    invalidated by an edit to any of them, and the plan restages a document
+    whose related documents changed while it did not.
     """
 
     UNIT = "unit"
     NEIGHBORS = "neighbors"
     DOCUMENT = "document"
+    RELATED = "related"
     CORPUS = "corpus"
 
 

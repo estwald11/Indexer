@@ -65,6 +65,11 @@ class DocumentRecord:
     #: content hash stays the same -- and the document was then skipped as
     #: unchanged, keeping the old ACL in every index.
     metadata_hash: str = ""
+    #: Hash of the documents linked to this one that its enrichers read
+    #: (``ContextScope.RELATED``). An attachment read beside the message it
+    #: came in is out of date when the message changes, though its own bytes
+    #: did not.
+    related_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)

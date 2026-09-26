@@ -32,7 +32,7 @@ names one.
 | `src/indexer/agent.py` | The archive as an agent's tool set; `mcp_server.py` serves it over MCP, `cli.py` is the `indexer` command. |
 | `configs/reference.yaml` | The deliberately simple path. Runs offline, no credentials. |
 | `configs/full.yaml` | Production-shaped choices, as an overlay — to show it is only config. |
-| `configs/it-enterprise.yaml` | An Italian company's archive: FatturaPA, PEC, Office, ACLs, Italian analysis, an agent's tools. |
+| `configs/it-enterprise.yaml` | An Italian company's archive: FatturaPA, PEC, Office, ACLs, Italian analysis, passages read out where their meaning is elsewhere, an agent's tools. |
 | `configs/pypi-docs.yaml` | The ablation corpus and its eight-arm ladder. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Which invariant drove which contract, and what implementing it changed. |
 | [`docs/ABLATION.md`](docs/ABLATION.md) | The ablation report on a real corpus, and what it does and does not establish. |
@@ -130,8 +130,9 @@ What it does with the archive:
 
 * **Opens what is stored.** Signed files (`.p7m`, CAdES), email and PEC with
   their attachments and `daticert.xml`, zip archives; FatturaPA read as exact,
-  typed facts; Word, Excel, HTML and text-layer PDF with their structure. Folder
-  rules and sidecar files set each document's ACL.
+  typed facts; Word, Excel, HTML and text-layer PDF with their structure, one
+  unit per numbered entry where a document is made of them. Folder rules and
+  sidecar files set each document's ACL.
 * **Reads Italian.** BM25 with accent folding, Italian stopwords, elisions and
   stemming, the document's language rather than a one-line unit's guess; numbers
   and dates as Italians write them ("1.250,00", "30/06/2025", "giugno 2025").
@@ -141,7 +142,8 @@ What it does with the archive:
 * **Uses a model where one earns it, and checks it.** A classifier (one call per
   document), a per-type field extractor whose every value must be quoted from
   the document or it goes to `indexer review`, LLM contexts written in the
-  document's language, and a router that lets the rules answer what they can.
+  document's language, a resolver for passages whose meaning is written
+  elsewhere (below), and a router that lets the rules answer what they can.
   Each is optional, priced in the manifest, and answered through the Message
   Batches API by `indexer prefill`.
 * **Serves an agent.** `search`, `query_records`, `describe_schema`,
@@ -149,6 +151,95 @@ What it does with the archive:
   build they reflect, the caller's access rights on every one, and archive text
   marked as data rather than instructions. Over MCP, or in-process through
   `indexer.agent.AgentTools`.
+
+## Passages whose meaning is written elsewhere
+
+A passage is indexed by its words, and many passages mean more than they say.
+They take their subject, their object or their whole content from other text:
+
+| Document | The passage says | What it means is in |
+|---|---|---|
+| Specification | "03.02.002 Idem c.s., ma per vuotatoi" | the item above: the washbasin frame, now for slop sinks |
+| Email reply | "va bene, procediamo con la seconda soluzione" | the message it quotes, which lists the two options |
+| Contract | "L'Appaltatore risponde dei ritardi nei termini dell'art. 12" | art. 1, which names the contractor, and art. 12, which sets the penalty |
+| Report | "Esso dovrà essere sottoposto a manutenzione semestrale" | the section before, which describes the 250 kW chiller |
+| Attachment | "La prova di tenuta è stata eseguita a 6 bar ... con esito positivo" | the email it came with, which names the site and the system |
+
+No index finds any of these by what it means, lexical or dense, however good
+the embedder, because the words are not in the passage. Invariant 3's situating
+context does not close the gap either: it says where a chunk sits, not what a
+statement refers to.
+
+What the frame does about it:
+
+* **A model reads such statements out** (`enrich: llm_resolver`). For each
+  passage it lists every statement that takes its meaning from outside the
+  passage, with the texts it takes it from, and writes the statement out as it
+  reads with those filled in. Every passage gets a verdict, so none is skipped
+  by omission.
+* **Each reading is checked before it is indexed.** The statement must be
+  quoted from its passage and each source from the document. Every figure,
+  name and acronym in the reading must occur in those sources, and nearly all
+  its other words too. A reading that fails goes to `indexer review`. One that
+  passes joins every index's retrieval surface. The passage's own text is never
+  changed.
+* **It reads what the statement reads.** That is the document, with its
+  passages marked where they stand, and the history a reply quotes. The email
+  parser keeps that history as quoted context: it is in no unit, so a thread
+  does not match every query its first message matches, but the resolver sees
+  it. With `relations: [container]` it also reads the message an attachment
+  came with (`ContextScope.RELATED`). A changed message restages its
+  attachments. A document is never read beside one with other readers.
+* **Entries are units** (`segment: items`). A document made of numbered entries
+  (a specification, a price list, a bill of quantities, a numbered procedure)
+  gets one unit per entry, however short. Every other document is cut at its
+  sections.
+* **The agent is shown the reading.** `search` and `expand` return it as
+  `resolved`, marked as a model's reading, beside the texts it draws on: a
+  passage, a quoted message, or another document. A reading is withheld when
+  the caller may not see one of those texts. Two passages with the same words
+  but different readings are no longer collapsed as duplicates
+  (`shape.distinguish_by`), and neighbouring text reaches the agent.
+
+Measured on the five documents above (`tests/test_resolver.py`), this is the
+rank of each passage for a query about what it means, under BM25:
+
+| Passage | Query | Before | After |
+|---|---|---|---|
+| Idem c.s., ma per vuotatoi | telaio autoportante per vuotatoio | 2 | 1 |
+| L'Appaltatore risponde ... art. 12 | penale per i ritardi di Rossi Impianti | 3 | 1 |
+| Esso dovrà essere sottoposto ... | manutenzione del gruppo frigorifero da 250 kW | 2 | 1 |
+| va bene, procediamo con la seconda | pompa di calore Mitsubishi | not found | 1 |
+| La prova di tenuta ... | prova di tenuta impianto idrico-sanitario Via Roma 10 | 2 | 1 |
+
+This shows the mechanism works when the readings are correct: those readings
+were written by hand. It does not show how good a model's readings are. That
+needs an API key, a real archive, and a golden set of such statements written
+by hand, since a generated set draws each query from the passage's own words
+and cannot ask for what a passage does not say. `it-enterprise.yaml` carries
+four arms to measure it:
+
+* `senza-risolutore`;
+* `risolutore-senza-allegati`;
+* `risolutore-sonnet`;
+* `segmenti-per-sezione`.
+
+What it costs: the model's instructions are cached across calls, and each
+document is sent once. A long document is split into batches, and its later
+batches read it from the cache at a tenth of the input price. The input is
+therefore close to the archive's own size in tokens, paid once per version of
+each document: at Opus 5's list price, $5 per million tokens, or roughly 1,500
+dense pages. `indexer prefill` halves it. Output depends on how many
+statements need reading and how much the model thinks, and the manifest
+reports both. Price a sample before a whole archive.
+
+Adapting it to a domain is configuration:
+
+* its ways of referring go in the resolver's `instructions`, for example "c.s.
+  vuol dire come sopra" or "wie vor";
+* its entry codes go in `segment.params.item_pattern` when the default does not
+  know them;
+* its documents that need no reading go in `skip_when`.
 
 ## The six invariants
 

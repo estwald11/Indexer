@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from indexer.core.document import SourceDocument
+from indexer.core.document import PARENT_KEY, SourceDocument
 from indexer.core.ids import DocumentId, hash_bytes, hash_obj, make_document_id
 from indexer.core.registry import register
 from indexer.impls.containers import (
@@ -235,7 +235,7 @@ class FilesystemScanner(StageImpl):
                 meta["name"] = d["name"]
                 parent = ids.get(d["parent"])
                 if parent is not None:
-                    meta["parent_document_id"] = parent
+                    meta[PARENT_KEY] = parent
             elif d["name"] != path.name:
                 meta["name"] = d["name"]  # an unwrapped envelope: x.pdf.p7m -> x.pdf
             yield _FileDocument(
